@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated test outputs (regenerable, and may contain private/real client
+# artwork used for local validation - never commit these).
+output/
+
+# OS cruft
+.DS_Store
+Thumbs.db
