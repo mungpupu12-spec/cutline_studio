@@ -50,7 +50,12 @@ except ImportError:
     ImageTk = None
 
 APP_TITLE = "CutLine Studio (prototype)"
-PREVIEW_MAX_SIDE = 640
+# 2026-08-27 피드백: "프로그램 실행화면의 이미지와 그래픽이 다 깨져 보여
+# 고화질로 만들고" -- 기존 640px 캡은 요즘 고해상도(HiDPI/레티나 배율)
+# 모니터에서는 미리보기가 눈에 띄게 흐릿/각져 보이는 원인이었음. 실제 처리
+# 해상도(내보내기용)는 그대로 두고, 화면에 "보여주기"용 미리보기 캡만
+# 큰 폭으로 올림.
+PREVIEW_MAX_SIDE = 1400
 
 
 def _resource_dir():
@@ -98,13 +103,13 @@ def _bumped(size):
     return round(size + FONT_SIZE_BUMP)
 
 
-# 2026-08-26 추가 피드백: "버튼도 더 라운딩 넣고 크기 10mm 키워" -- 일반적인
-# 모니터 기준(96dpi, 배율 100%)으로 10mm ≈ 37.8px 환산. 실제 클릭 대상인
-# 1차/2차 버튼(가이드 선택/이 영역 추가/SVG로 내보내기 등)에 적용하고, 둥근
-# 정도(corner_radius)도 함께 키움. +/- 스텝퍼처럼 작은 보조 컨트롤은 옆의
-# 입력창과 비례가 깨지지 않도록 더 작은 폭으로만 키움.
+# 2026-08-26 피드백으로 "버튼도 더 라운딩 넣고 크기 10mm 키워"(~38px)를
+# 적용했었으나, 2026-08-27 피드백: "처음 화면의 버튼이 너무 크고 굵어 ...
+# 모든 버튼 크기 줄여" -- 그 확대를 되돌리고 훨씬 절제된 값으로 축소.
+# 완전히 0으로 없애지 않고 아주 작은 값만 남긴 이유는 클릭 대상이 너무
+# 얇아지지 않도록 하기 위함("중간 길이" 요청과 맞춤).
 MM_TO_PX_AT_96DPI = 96.0 / 25.4
-BUTTON_SIZE_BUMP_PX = round(10 * MM_TO_PX_AT_96DPI)  # ~38px
+BUTTON_SIZE_BUMP_PX = round(1.5 * MM_TO_PX_AT_96DPI)  # ~6px, "중간" 크기
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -114,12 +119,11 @@ class CutLineApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        # 2026-08-26 피드백: "화면이 너무 크다" + "화면비율도 1:2로 맞춰"
-        # (확인 결과: 창 전체를 가로로 넓은 2:1 비율로, 지금의 좌/우
-        # 나란히 배치 구조는 그대로 유지) -- 기존 1180x800보다 작고 2:1
-        # 비율인 1000x500으로 축소.
-        self.geometry("1000x500")
-        self.minsize(900, 450)
+        # 2026-08-26 피드백으로 1000x500(2:1 비율)까지 축소했었으나,
+        # 2026-08-27 피드백: "화면 크기도 20% 키워" -- 2:1 비율은 그대로
+        # 유지하면서 가로/세로 모두 20% 확대(1000x500 -> 1200x600).
+        self.geometry("1200x600")
+        self.minsize(1080, 540)
         try:
             self.configure(fg_color=BG_APP)
         except Exception:  # noqa: BLE001 -- 팔레트 적용은 장식일 뿐, 실패해도 앱은 떠야 함
@@ -317,9 +321,12 @@ class CutLineApp(ctk.CTk):
         )
         status_label.pack(fill="x", pady=(0, 14))
 
+        # 2026-08-27 피드백: "가로 길이를 조금 넓이고" -- 입력창/버튼 모두
+        # 이 inner 프레임 폭을 기준으로 채워지므로(pack fill="x"), 입력창
+        # 폭을 340 -> 400으로 넓히면 버튼 가로 길이도 함께 넓어짐.
         ctk.CTkLabel(inner, text="라이선스 키", font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w").pack(fill="x")
         key_var = tk.StringVar(value=lic.get_cached_license_key())
-        key_entry = ctk.CTkEntry(inner, textvariable=key_var, width=340, height=36, corner_radius=10)
+        key_entry = ctk.CTkEntry(inner, textvariable=key_var, width=400, height=36, corner_radius=10)
         key_entry.pack(fill="x", pady=(2, 12))
 
         code_var = tk.StringVar()
@@ -328,7 +335,7 @@ class CutLineApp(ctk.CTk):
                 inner, text="재활성화 코드 (발급처에서 받은 코드)", font=self.font_caption,
                 text_color=TEXT_SECONDARY, anchor="w",
             ).pack(fill="x")
-            code_entry = ctk.CTkEntry(inner, textvariable=code_var, width=340, height=36, corner_radius=10)
+            code_entry = ctk.CTkEntry(inner, textvariable=code_var, width=400, height=36, corner_radius=10)
             code_entry.pack(fill="x", pady=(2, 12))
 
         def _on_submit():
@@ -381,23 +388,24 @@ class CutLineApp(ctk.CTk):
         return inner
 
     def _btn_primary(self, parent, text, command):
-        """핵심 동작(추가/미리보기, 내보내기)에만 쓰는 강조 버튼. 2026-08-26
-        피드백("버튼도 더 라운딩 넣고 크기 10mm 키워")에 맞춰 기존 44px
-        높이에 BUTTON_SIZE_BUMP_PX(~10mm)를 더하고, 더 둥글게 처리."""
+        """핵심 동작(추가/미리보기, 내보내기)에만 쓰는 강조 버튼.
+        2026-08-27 피드백("버튼이 너무 크고 굵어 ... 모든 버튼 크기 줄여"):
+        기존 corner_radius=24 + 10mm 확대를 되돌리고, Figma류 UI에서 흔히
+        쓰는 좀 더 절제된 라운드(16px)와 "중간" 높이로 축소."""
         return ctk.CTkButton(
             parent, text=text, command=command, font=self.font_button,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
-            corner_radius=24, height=44 + BUTTON_SIZE_BUMP_PX,
+            corner_radius=16, height=40 + BUTTON_SIZE_BUMP_PX,
         )
 
     def _btn_secondary(self, parent, text, command):
-        """나머지 보조 동작에 쓰는 아웃라인 버튼. 같은 이유로 기존 36px
-        높이에 BUTTON_SIZE_BUMP_PX를 더하고, 더 둥글게 처리."""
+        """나머지 보조 동작에 쓰는 아웃라인 버튼. 같은 이유로 라운드/높이를
+        축소(20 -> 12, 36 -> 32 + 소폭 bump)."""
         return ctk.CTkButton(
             parent, text=text, command=command, font=self.font_body,
             fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=20,
-            height=36 + BUTTON_SIZE_BUMP_PX,
+            border_width=1, border_color=BORDER, corner_radius=12,
+            height=32 + BUTTON_SIZE_BUMP_PX,
         )
 
     def _make_number_field(self, parent, label, var, unit="mm", from_=0.0, to=1000.0,
@@ -488,7 +496,7 @@ class CutLineApp(ctk.CTk):
     def _open_tutorial_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("CutLine Studio 사용법")
-        dialog.geometry("560x600")
+        dialog.geometry("672x720")  # 2026-08-27: 본창 20% 확대에 맞춰 비례 확대(560x600 -> 672x720)
         dialog.resizable(False, False)
         try:
             dialog.configure(fg_color=BG_APP)
@@ -553,7 +561,8 @@ class CutLineApp(ctk.CTk):
     # ------------------------------------------------------------------
     def _build_layout(self):
         # --- 상단 헤더 바 (브랜드 + 짧은 설명) ---------------------------------
-        header_bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=68)
+        # 2026-08-27: 창 크기 20% 확대에 맞춰 헤더 높이도 비례 확대(68 -> 82).
+        header_bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=82)
         header_bar.pack(side="top", fill="x")
         header_bar.pack_propagate(False)
         title_wrap = ctk.CTkFrame(header_bar, fg_color="transparent")
@@ -576,8 +585,9 @@ class CutLineApp(ctk.CTk):
         # 조작 패널을 CTkScrollableFrame으로 감싼 게 이번 개편의 핵심 -- 섹션이
         # 몇 개가 되든, 창 높이가 얼마든, 스크롤바가 항상 생기므로 버튼이
         # 화면 밖으로 잘려서 눌리지 않는 문제 자체가 구조적으로 사라진다.
+        # 2026-08-27: 창 크기 20% 확대에 맞춰 좌측 패널 폭도 비례 확대(380 -> 456).
         left_col = ctk.CTkScrollableFrame(
-            body, width=380, fg_color=BG_APP, corner_radius=0,
+            body, width=456, fg_color=BG_APP, corner_radius=0,
             scrollbar_button_color=BORDER, scrollbar_button_hover_color=TEXT_SECONDARY,
         )
         left_col.pack(side="left", fill="y", padx=(16, 8), pady=16)
@@ -922,7 +932,7 @@ class CutLineApp(ctk.CTk):
         else:
             self._source_image = None
             self.preview_canvas.delete("all")
-            self.preview_canvas.config(width=PREVIEW_MAX_SIDE, height=200)
+            self.preview_canvas.config(width=PREVIEW_MAX_SIDE, height=240)
             self.preview_canvas.create_text(
                 10, 10, anchor="nw", text="SVG는 영역 드래그 선택을 지원하지 않습니다.", fill=TEXT_SECONDARY
             )
@@ -965,7 +975,12 @@ class CutLineApp(ctk.CTk):
         scale = min(PREVIEW_MAX_SIDE / w, PREVIEW_MAX_SIDE / h, 1.0)
         self._display_scale = scale
         self._source_image = img
-        disp = img if scale >= 1.0 else img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        # 2026-08-27 피드백("이미지와 그래픽이 다 깨져 보여 고화질로"): 리사이즈
+        # 방식을 명시적으로 LANCZOS(고품질 다운샘플링)로 지정 -- 기본값보다
+        # 특히 칼선처럼 얇은 선/디테일이 있는 이미지를 축소할 때 뭉개짐이 덜함.
+        disp = img if scale >= 1.0 else img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS
+        )
         self._preview_photo = ImageTk.PhotoImage(disp)
         self.preview_canvas.delete("all")
         self.preview_canvas.config(width=disp.width, height=disp.height)
@@ -1191,7 +1206,9 @@ class CutLineApp(ctk.CTk):
             scale = min(PREVIEW_MAX_SIDE / w, PREVIEW_MAX_SIDE / h, 1.0)
             self._display_scale = scale
             if scale < 1.0:
-                img = img.resize((int(w * scale), int(h * scale)))
+                # 2026-08-27: 위 _load_source_preview()와 동일하게 LANCZOS로
+                # 고품질 다운샘플링 (기존엔 리샘플 방식을 지정하지 않았음).
+                img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
             self._preview_photo = ImageTk.PhotoImage(img)
             self.preview_canvas.delete("all")
             self.preview_canvas.config(width=img.width, height=img.height)
