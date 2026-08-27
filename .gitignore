@@ -7,6 +7,21 @@ venv/
 # artwork used for local validation - never commit these).
 output/
 
+# Ad-hoc analysis scratch space -- extracted real print images, real hand-
+# drawn cutline dumps, comparison overlays. Real-client-derived; never
+# commit any of this.
+scratch/
+
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# app runtime scratch files
+gui/_last_preview.png
+gui/_sheet_composite.png
+gui/_ai_source_raster.png
+
+# PyInstaller build output (exe_빌드.bat) -- regenerate locally, don't commit
+build/
+dist/
+*.spec

@@ -3,3 +3,7 @@ numpy>=1.24
 shapely>=2.0
 cairosvg>=2.7
 Pillow>=10.0
+PyMuPDF>=1.23
+customtkinter>=5.2
+requests>=2.31
+cryptography>=42.0
