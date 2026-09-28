@@ -2141,6 +2141,141 @@ def map_box_between_frames_px(box_px: tuple, from_frame_px: tuple, to_frame_px: 
     return (rx0, ry0, rx1, ry1)
 
 
+def detect_elements_by_background_flood_px(
+    image_path: str,
+    cell_px: tuple,
+    grad_threshold: float = 3.0,
+    flood_delta: int = 12,
+    min_area_ratio: float = 0.003,
+    _img=None,
+):
+    """2026-09-28 무테 "보조 탐지기"(멍푸: "1개로 해결되지 않으면 1차, 2차 ...
+    보조 보완 프로그램", "테스트 칼선 보면서 대조해"). 칸 안의 요소를 선(Canny)
+    이 아니라 "배경 채우기"로 찾는다: 칸 가장자리의 배경색(좌우 또는 위아래
+    양쪽 가장자리에 모두 나오는 색 -- 가로 줄무늬, 하늘 그러데이션, 잔디 등)
+    에서 출발해 이웃 픽셀 색이 조금씩만 변하는 곳을 따라 채우고(마술봉 방식,
+    그러데이션도 따라감), 색이 뚜렷하게 바뀌는 경계(블러 후 Lab 기울기)에서
+    멈춘다. 채워지지 않은 덩어리 = 요소(속 구멍은 메움).
+
+    왜 필요한가(실제 손 칼선 대조): 파스텔톤 시트 하나에서 기존 낱개 요소
+    탐지가 칸당 12개 중 5~6개만 찾아(병아리·잎·꽃·큰 캐릭터 누락) 실제 칼선
+    85개 중 16개만 맞았는데, 이 방식은 74개를 찾았다. 반대로 다른 시트들에서는
+    기존 GrabCut 경로가 더 정확해서, 이 탐지기는 *대체*가 아니라 기존 결과가
+    놓친 요소만 *추가*하는 보조로 쓴다(gui.app 참고).
+
+    한 가장자리에만 닿은 색(예: 칸 모서리에 걸친 캐릭터)은 배경 출발점으로
+    쓰지 않아, 칸 가장자리에 걸친 요소가 배경으로 채워지지 않게 한다.
+
+    Returns: 원본 이미지 좌표 Polygon 목록(요소 실루엣)."""
+    from shapely.geometry import Polygon as _Polygon
+
+    img = _img if _img is not None else cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+    H, W = img.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in cell_px]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return []
+    crop = img[y0:y1, x0:x1]
+    sm = cv2.medianBlur(crop, 3)
+    lab = cv2.cvtColor(sm, cv2.COLOR_BGR2LAB).astype(np.float32)
+    labg = cv2.GaussianBlur(lab, (0, 0), 1.5)
+    gx = cv2.Sobel(labg, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    gy = cv2.Sobel(labg, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    grad = np.sqrt((gx ** 2 + gy ** 2).sum(axis=2))
+    h, w = sm.shape[:2]
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    mask[1:-1, 1:-1] = (grad > grad_threshold).astype(np.uint8)
+
+    t = 4
+    ring_idx = np.zeros((h, w), bool)
+    ring_idx[:t, :] = ring_idx[-t:, :] = True
+    ring_idx[:, :t] = ring_idx[:, -t:] = True
+    ring = lab[ring_idx].reshape(-1, 3)
+    K = 8
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    cv2.setRNGSeed(42)
+    _, labels, _ = cv2.kmeans(ring, K, None, crit, 2, cv2.KMEANS_PP_CENTERS)
+    labels = labels.ravel()
+    share = np.bincount(labels, minlength=K) / max(1, len(labels))
+    ys, xs = np.where(ring_idx)
+    sides = {"L": xs < t, "R": xs >= w - t, "T": ys < t, "B": ys >= h - t}
+    good = set()
+    for k in range(K):
+        pres = {}
+        for nm, sel in sides.items():
+            tot = max(1, int(sel.sum()))
+            pres[nm] = (np.logical_and(sel, labels == k).sum() / tot) >= 0.03
+        if (pres["L"] and pres["R"]) or (pres["T"] and pres["B"]) or share[k] >= 0.25:
+            good.add(k)
+    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+    seed_ids = [i for i in range(len(labels)) if int(labels[i]) in good][::5]
+    for i in seed_ids:
+        sx, sy = int(xs[i]), int(ys[i])
+        if mask[sy + 1, sx + 1]:
+            continue
+        cv2.floodFill(sm, mask, (sx, sy), 0, (flood_delta,) * 3, (flood_delta,) * 3, flags)
+    # 2차: 한쪽 가장자리에만 보이는 색(예: 칸 한쪽 끝을 요소가 가려서 반대편엔
+    # 안 보이는 가로 줄무늬)도, 거기서 채운 영역이 칸 폭/높이의 80% 이상
+    # 길게 뻗으면 배경(줄무늬·띠)으로 인정한다. 칸 가장자리에 걸친 캐릭터는
+    # 이렇게 길게 뻗지 않아 요소로 남는다.
+    flags2 = 4 | cv2.FLOODFILL_MASK_ONLY | (128 << 8)
+    for i in range(0, len(labels), 5):
+        if int(labels[i]) in good:
+            continue
+        sx, sy = int(xs[i]), int(ys[i])
+        if mask[sy + 1, sx + 1]:
+            continue
+        trial = mask.copy()
+        cv2.floodFill(sm, trial, (sx, sy), 0, (flood_delta,) * 3, (flood_delta,) * 3, flags2)
+        region = trial == 128
+        if not region.any():
+            continue
+        rys, rxs = np.where(region)
+        if (rxs.max() - rxs.min()) >= 0.8 * w or (rys.max() - rys.min()) >= 0.8 * h:
+            mask[region] = 255
+        else:
+            mask[region] = 2  # 이 자리는 다시 시도하지 않음(요소로 남김)
+    bg = mask[1:-1, 1:-1] == 255
+    if not bg.any():
+        return []  # 배경을 못 찾음 -- 판단 보류(보조 탐지기라 아무것도 안 더함)
+    # 경계(기울기 장벽) 픽셀 자체는 채우기가 못 들어가므로, 배경끼리 만나는
+    # 줄무늬 경계선이 가는 "요소"로 남아 요소들을 서로 이어버린다. 배경 바로
+    # 옆의 장벽 픽셀은 배경으로 돌리고(요소 가장자리도 몇 px 깎임), 나중에
+    # 요소를 같은 만큼 되살린다.
+    barrier = mask[1:-1, 1:-1] == 1
+    kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    near_bg = cv2.dilate(bg.astype(np.uint8), kk) > 0
+    bg = bg | (barrier & near_bg)
+    obj = (~bg).astype(np.uint8) * 255
+    obj = cv2.morphologyEx(obj, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    obj = cv2.dilate(obj, kk)
+    cs, hier = cv2.findContours(obj, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(obj)
+    if cs:
+        for idx, c in enumerate(cs):
+            if hier[0][idx][3] == -1:
+                cv2.drawContours(filled, [c], -1, 255, -1)
+    n, lab2, stats, _ = cv2.connectedComponentsWithStats(filled, 8)
+    polys = []
+    min_area = min_area_ratio * w * h
+    for k in range(1, n):
+        if stats[k, cv2.CC_STAT_AREA] < min_area:
+            continue
+        m = (lab2 == k).astype(np.uint8) * 255
+        cc, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        c = max(cc, key=cv2.contourArea)
+        if len(c) < 3:
+            continue
+        p = _Polygon([(float(q[0][0]) + x0, float(q[0][1]) + y0) for q in c]).buffer(0)
+        if not p.is_empty:
+            if p.geom_type == "MultiPolygon":
+                p = max(p.geoms, key=lambda g: g.area)
+            polys.append(p.simplify(0.8))
+    return polys
+
+
 def group_content_cells_px(image_path: str, cell_boxes: list):
     """빈 칸(실제 내용 없음, `cell_has_content_px`)을 걸러내고, 남은 칸들
     중 완전히 같은 그림의 반복을 `group_identical_boxes_px`로 묶는다 --

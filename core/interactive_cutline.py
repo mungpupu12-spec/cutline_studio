@@ -284,52 +284,224 @@ def generate_cutline_by_style(
     )
 
 
-def generate_card_inset_cutline(
+_SHEET_BG_CACHE: dict = {}
+
+
+def _sheet_background_bgr(image_path: str, img=None):
+    """시트 여백(= 인쇄 안 된 종이/배경)의 색. 이미지 맨 바깥 둘레 몇 px의
+    중앙값으로 잰다 -- 실제 파일들은 격자 밖에 흰 여백과 재단 표시가 있다.
+    둘레 색이 제각각이면(그림이 이미지 끝까지 꽉 찬 파일) 흰색으로 본다."""
+    import numpy as np
+
+    import os
+    try:
+        st = os.stat(image_path)
+        key = (image_path, st.st_mtime_ns, st.st_size)  # 같은 작업 파일 이름에 다른 도안이 덮어써질 수 있음
+    except OSError:
+        key = None
+    if key is not None and key in _SHEET_BG_CACHE:
+        return _SHEET_BG_CACHE[key]
+    if img is None:
+        import cv2
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    t = max(3, min(img.shape[:2]) // 200)
+    ring = np.concatenate([
+        img[:t].reshape(-1, 3), img[-t:].reshape(-1, 3),
+        img[:, :t].reshape(-1, 3), img[:, -t:].reshape(-1, 3),
+    ]).astype(np.float32)
+    med = np.median(ring, axis=0)
+    spread = float(np.median(np.linalg.norm(ring - med, axis=1)))
+    bg = med if spread < 12.0 else np.array([255.0, 255.0, 255.0], dtype=np.float32)
+    if key is not None:
+        _SHEET_BG_CACHE[key] = bg
+    return bg
+
+
+def image_outer_region_px(image_path: str, rect_px: tuple, min_fill_ratio: float = 0.05):
+    """`rect_px`(칸/선택 영역) 안에서 실제로 인쇄된 이미지의 바깥 윤곽을
+    Polygon(원본 픽셀 좌표)으로 돌려준다. 없으면(배경뿐인 빈 칸) None.
+
+    2026-09-28 멍푸: "무테 ... 칼선이 이미지 외곽에 들어가야함. 배경색이
+    칼선으로 잡히면 안 됨". 칸 사각형을 그대로 믿으면, 칸이 실제 그림보다
+    크거나(흰 여백 포함) 아예 빈 칸일 때 배경색 위에 칼선이 생긴다(실제
+    파일로 확인: 배경뿐인 빈 칸에 사각형 칼선). 그래서 시트 배경색과
+    다른 픽셀을 "이미지"로 보고, 그 가장 큰 덩어리의 바깥 윤곽(안쪽 구멍은
+    메움)을 이미지 외곽으로 쓴다. 그림 안의 색 경계(줄무늬 등)는 전혀 보지
+    않는다 -- 바깥 윤곽만 쓰므로 배경색·무늬 경계가 칼선이 되지 않는다.
+    거의 사각형인 이미지(카드)는 그 bbox로 맞춰 모서리를 깔끔하게 한다."""
+    import cv2
+    import numpy as np
+
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    bg = _sheet_background_bgr(image_path, img)
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in rect_px]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    crop = img[y0:y1, x0:x1].astype(np.float32)
+    mask = (np.linalg.norm(crop - bg, axis=2) > 12.0).astype(np.uint8) * 255
+    k = max(3, (min(x1 - x0, y1 - y0) // 100) | 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < min_fill_ratio * (x1 - x0) * (y1 - y0) or len(c) < 3:
+        return None
+    poly = Polygon([(float(p[0][0]) + x0, float(p[0][1]) + y0) for p in c]).buffer(0)
+    if poly.is_empty:
+        return None
+    if isinstance(poly, MultiPolygon):
+        poly = max(poly.geoms, key=lambda g: g.area)
+    bx0, by0, bx1, by1 = poly.bounds
+    bbox_area = (bx1 - bx0) * (by1 - by0)
+    if bbox_area > 0 and poly.area / bbox_area >= 0.97:
+        return Polygon([(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)])
+    return Polygon(poly.exterior).simplify(1.0)
+
+
+def generate_borderless_cut_from_silhouette(
     image_path: str,
-    card_px: tuple,
+    silhouette_px,
     dpi: float,
     margin_mm: float = 1.2,
+    note: Optional[str] = None,
 ) -> CutlineResult:
-    """
-    무테 자동 인식 전용(2026-09-28 멍푸 결정 "무테는 칸 전체 한 장"): 칸(카드)
-    하나 = 스티커 한 장. 칸 이미지 가장자리(card_px 사각형)에서 margin_mm
-    만큼 *안쪽*에 사각형 칼선 하나만 만든다. 칸 안의 캐릭터/소품을 따로
-    오려내지 않으므로 배경 그림을 자르는 일이 없고, 칼선이 칸 밖(옆 칸과의
-    틈, 시트 여백)으로 나가는 일도 없다.
+    """이미 구한 요소 실루엣(원본 좌표 Polygon)으로 무테 칼선(그림 안쪽 margin_mm)
+    하나를 만든다 -- core.image_style._inset_inside_art와 같은 "그림 밖으로
+    절대 안 나감" 규칙. 너무 가늘어 안쪽 칼선이 사라지면 빈 결과."""
+    from .image_style import MIN_STYLE_MARGIN_MM, _inset_inside_art
 
-    margin_mm은 무테/유테 공통 최소값(MIN_STYLE_MARGIN_MM, 0.5mm) 아래로는
-    내려가지 않으며, 올린 경우 adjustments에 남긴다. 칸이 너무 작아 안쪽으로
-    줄이면 사라지는 경우(비정상 칸)는 예외를 던져 호출하는 쪽의 실패 목록에
-    올라가게 한다(조용히 빈 칼선을 만들지 않음).
-    """
-    from .image_style import MIN_STYLE_MARGIN_MM
-
-    notes: list = []
-    if margin_mm < MIN_STYLE_MARGIN_MM:
-        notes.append(
-            f"입력한 간격({margin_mm:g}mm)이 너무 좁아 인쇄/커팅 밀림에도 안전하도록 "
-            f"최소값 {MIN_STYLE_MARGIN_MM:g}mm로 자동 조정했습니다."
-        )
-        margin_mm = MIN_STYLE_MARGIN_MM
-    x0, y0, x1, y1 = card_px
-    card = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-    # join_style=2(mitre): 카드 모서리는 칸 모서리 그대로 각지게 유지.
-    line = card.buffer(-mm_to_px(margin_mm, dpi), join_style=2)
-    if line.is_empty:
-        raise ValueError(
-            f"칸이 너무 작아 {margin_mm:g}mm 안쪽으로 칼선을 넣을 수 없습니다."
-        )
-    notes.append(f"무테: 칸 한 장을 이미지 가장자리에서 {margin_mm:g}mm 안쪽으로 잘랐습니다.")
+    margin_mm = max(margin_mm, MIN_STYLE_MARGIN_MM)
     with Image.open(image_path) as im:
         w, h = im.size
-    line_mp = MultiPolygon([line]) if isinstance(line, Polygon) else line
+    line = _inset_inside_art(silhouette_px, mm_to_px(margin_mm, dpi))
+    if line is None or line.is_empty:
+        mp = MultiPolygon([])
+    else:
+        mp = MultiPolygon([line]) if isinstance(line, Polygon) else line
+    notes = [note] if note else []
+    return CutlineResult(
+        dpi=dpi, width_px=w, height_px=h, design=mp, offsets={"cut": mp},
+        offset_mm=OffsetSpec(safety_mm=margin_mm, cut_mm=margin_mm, bleed_mm=margin_mm),
+        adjustments=notes,
+    )
+
+
+def _inscribed_domusong_shape(inner, cutline_type: CutlineType):
+    """`inner`(이미지 외곽을 칼선 여유만큼 줄인 영역) 안에 완전히 들어가는
+    가장 큰 도무송 도형. 원은 영역에서 가장 깊은 점(polylabel)을 중심으로,
+    나머지는 영역의 bbox에 맞춘 뒤 영역 안에 다 들어갈 때까지 중심 기준으로
+    조금씩 줄인다. 완칼(FULL_CUT)은 영역 모양 그대로."""
+    from shapely.affinity import scale as _scale
+    from shapely.geometry import Point
+    from shapely.ops import polylabel
+
+    if cutline_type == CutlineType.FULL_CUT:
+        return inner
+    if cutline_type == CutlineType.CIRCLE:
+        # 가장 큰 원이 들어가는 점(polylabel). 다만 가로로 긴 카드처럼 그런
+        # 점이 한 줄로 여러 개면 한쪽으로 치우칠 수 있어, 이미지 가운데에서도
+        # 거의 같은 크기의 원이 들어가면 가운데를 쓴다(중심 정렬).
+        center = polylabel(inner, tolerance=1.0)
+        r = inner.exterior.distance(center)
+        bx0, by0, bx1, by1 = inner.bounds
+        mid = Point((bx0 + bx1) / 2.0, (by0 + by1) / 2.0)
+        if inner.contains(mid):
+            r_mid = inner.exterior.distance(mid)
+            if r_mid >= 0.98 * r:
+                center, r = mid, r_mid
+        return Point(center.x, center.y).buffer(r, resolution=64) if r > 0 else Polygon()
+    x0, y0, x1, y1 = inner.bounds
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    w, h = x1 - x0, y1 - y0
+    if cutline_type == CutlineType.SQUARE:
+        side = min(w, h)
+        shape = Polygon([(cx - side / 2, cy - side / 2), (cx + side / 2, cy - side / 2),
+                         (cx + side / 2, cy + side / 2), (cx - side / 2, cy + side / 2)])
+    elif cutline_type == CutlineType.ELLIPSE:
+        shape = _scale(Point(cx, cy).buffer(1.0, resolution=64), xfact=w / 2.0, yfact=h / 2.0)
+    else:  # RECTANGLE
+        shape = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    tol = inner.buffer(0.5)
+    for _ in range(80):
+        if tol.contains(shape):
+            return shape
+        shape = _scale(shape, xfact=0.98, yfact=0.98, origin=(cx, cy))
+    return shape if tol.contains(shape) else Polygon()
+
+
+def generate_domusong_inside_cutline(
+    image_path: str,
+    region_px: tuple,
+    cutline_type: CutlineType,
+    dpi: float,
+    offset_mm: OffsetSpec,
+) -> CutlineResult:
+    """
+    2026-09-28 멍푸: "도무송 직접 선택 후 칼선 종류에 따라 이미지 안쪽으로
+    칼선 생성" (9/7 "도무송은 모두 이미지 안쪽으로 칼선이 들어가야해", 9/9
+    "도무송은 칼선이 이미지 안에 있어야 해. 그게 정답이야"와 같은 방향).
+
+    예전 도무송은 내용(실루엣) bbox에 도형을 씌우고 바깥으로 여유를 밀어서,
+    카드형 시트에서는 도형이 카드 밖으로 나가거나 이웃 도형과 겹쳤다.
+    이제는 선택한 영역 안의 실제 이미지 외곽(`image_outer_region_px`)을
+    기준으로:
+      - 칼선: 이미지 외곽에서 블리딩 폭(bleed_mm, 최소 MIN_DOMUSONG_GAP_MM=
+        2.0mm)만큼 안쪽 영역에 들어가는 가장 큰 도형(원/타원/정사각/직사각,
+        완칼은 이미지 외곽 모양 그대로). 실제 테스트 파일에서 카드 칸의 손
+        칼선이 이미지 외곽 2.8~3.3mm 안쪽으로 실측됨 -- 기본 블리딩 3mm와 일치.
+      - 블리딩: 칼선에서 같은 폭만큼 바깥(= 이미지 외곽까지) -- 칼선 밖으로
+        인쇄가 이어지는 부분이 블리딩이라는 뜻 그대로.
+    세이프티 선은 도무송 화면 규칙대로 만들지 않는다. 모든 선이 이미지
+    안쪽에만 있다.
+    """
+    notes: list = []
+    inset_mm = float(offset_mm.bleed_mm)
+    if inset_mm < MIN_DOMUSONG_GAP_MM:
+        notes.append(
+            f"도무송 블리딩 폭 {inset_mm:g}mm가 최소 여유보다 작아 {MIN_DOMUSONG_GAP_MM:g}mm로 "
+            f"맞췄습니다(이미지 외곽에서 칼선까지)."
+        )
+        inset_mm = MIN_DOMUSONG_GAP_MM
+
+    with Image.open(image_path) as im:
+        w, h = im.size
+    region = image_outer_region_px(image_path, region_px)
+    if region is None:
+        x0, y0, x1, y1 = region_px
+        region = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        notes.append("⚠ 도무송: 이 영역에서 이미지 외곽을 찾지 못해 선택 영역 사각형을 기준으로 했습니다.")
+    inner = region.buffer(-mm_to_px(inset_mm, dpi), join_style=2)
+    if isinstance(inner, MultiPolygon):
+        inner = max(inner.geoms, key=lambda g: g.area)
+    if inner.is_empty:
+        raise ValueError(f"이미지가 너무 작아 {inset_mm:g}mm 안쪽에 도무송 칼선을 넣을 수 없습니다.")
+    shape = _inscribed_domusong_shape(inner, cutline_type)
+    if shape is None or shape.is_empty:
+        raise ValueError("이미지 안쪽에 들어가는 도무송 도형을 만들지 못했습니다.")
+    join = 1 if cutline_type in (CutlineType.CIRCLE, CutlineType.ELLIPSE, CutlineType.FULL_CUT) else 2
+    bleed = shape.buffer(mm_to_px(inset_mm, dpi), join_style=join).intersection(region)
+    if isinstance(bleed, MultiPolygon):
+        bleed = max(bleed.geoms, key=lambda g: g.area)
+    notes.append(
+        f"도무송({cutline_type.value}): 이미지 외곽에서 {inset_mm:g}mm 안쪽에 칼선, "
+        f"그 바깥(이미지 외곽까지)이 블리딩 -- 모든 선이 이미지 안쪽입니다."
+    )
+    shape_mp = MultiPolygon([shape])
     return CutlineResult(
         dpi=dpi,
         width_px=w,
         height_px=h,
-        design=line_mp,
-        offsets={"cut": line_mp},
-        offset_mm=OffsetSpec(safety_mm=margin_mm, cut_mm=margin_mm, bleed_mm=margin_mm),
+        design=shape_mp,
+        offsets={"cut": shape_mp, "bleed": MultiPolygon([bleed])},
+        offset_mm=OffsetSpec(safety_mm=inset_mm, cut_mm=inset_mm, bleed_mm=inset_mm),
         adjustments=notes,
     )
 
@@ -445,6 +617,68 @@ def generate_cutline_from_known_silhouette(
             "(GrabCut/색상거리 3가지 방법 모두 이 종류 요소에서 실패 확인됨)"
         ],
     )
+
+
+def has_white_or_black_border(image_path: str, silhouette_px, dpi: float) -> bool:
+    """요소 실루엣 가장자리에 흰색(또는 검은색) *테두리 선*이 있는지 -- 유테의
+    정의(docs/개념정리.md: "캐릭터 몸 바깥에 일정한 두께의 흰색/검은색
+    테두리 선"). 가장자리 띠(0~0.6mm)가 대부분 흰색/검은색이고, 그보다 안쪽
+    띠(2.5~3.5mm)는 그렇지 않을 때 True -- 몸 전체가 흰 꽃처럼 속까지
+    흰색인 요소는 테두리가 아니라 그 그림 자체라 False. 실루엣이 테두리
+    안쪽에서 잡힌 경우는 바깥 띠로 확인한다(아래)."""
+    import cv2
+    import numpy as np
+
+    if silhouette_px is None or silhouette_px.is_empty:
+        return False
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return False
+    px = mm_to_px(1.0, dpi)
+    rim = silhouette_px.difference(silhouette_px.buffer(-0.6 * px))
+    inner = silhouette_px.buffer(-2.5 * px).difference(silhouette_px.buffer(-3.5 * px))
+
+    def frac_bw(geom):
+        if geom is None or geom.is_empty:
+            return None
+        x0, y0, x1, y1 = [int(v) for v in geom.bounds]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(img.shape[1], x1 + 1), min(img.shape[0], y1 + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+        for p in polys:
+            if p.is_empty or p.geom_type != "Polygon":
+                continue
+            ext = np.array([[int(x - x0), int(y - y0)] for x, y in p.exterior.coords], np.int32)
+            cv2.fillPoly(mask, [ext], 255)
+            for hole in p.interiors:
+                hh = np.array([[int(x - x0), int(y - y0)] for x, y in hole.coords], np.int32)
+                cv2.fillPoly(mask, [hh], 0)
+        pix = img[y0:y1, x0:x1][mask > 0].astype(np.int32)
+        if len(pix) < 20:
+            return None
+        mx, mn = pix.max(axis=1), pix.min(axis=1)
+        white = (mn >= 225) & (mx - mn <= 25)
+        black = mx <= 60
+        return float((white | black).mean())
+
+    rim_f = frac_bw(rim)
+    if rim_f is not None and rim_f >= 0.5:
+        inner_f = frac_bw(inner)
+        return inner_f is None or inner_f < 0.5
+    # 실루엣이 흰 테두리 *안쪽* 그림 가장자리에서 잡힌 경우(흰 테두리가
+    # 실루엣에서 빠짐 -- 실제 흰 테두리 스티커 시트에서 확인): 바로 바깥 띠가
+    # 흰색/검은색이고 그보다 더 바깥(2.5~3.5mm)은 아니면 = 얇은 테두리 선.
+    # (흰 종이 위에 그냥 놓인 그림은 더 바깥도 흰색이라 테두리로 안 봄.)
+    outer = silhouette_px.buffer(0.8 * px).difference(silhouette_px)
+    far = silhouette_px.buffer(3.5 * px).difference(silhouette_px.buffer(2.5 * px))
+    outer_f = frac_bw(outer)
+    if outer_f is None or outer_f < 0.5:
+        return False
+    far_f = frac_bw(far)
+    return far_f is None or far_f < 0.5
 
 
 def generate_cutline_auto(
@@ -577,10 +811,27 @@ def generate_cutline_auto(
         supersample=supersample, note_sink=classify_notes,
     )
     classification = classify_style(content, threshold=threshold, selection_px=selection_px)
+    style = classification.style
+    border_note = None
+    # 2026-09-28(테스트 폴더 실제 손 칼선 대조): "사방에 여백이 있으면 유테"
+    # (할로 우선) 판정만으로는, 테두리 없이 그린 무테 캐릭터(배경 위에 떠 있는
+    # 요소)도 전부 유테(바깥 칼선)로 판정됐다 -- 실제 무테 시트에서 칼선이
+    # 요소 1mm 안쪽인데 우리는 바깥으로 잘라 경계가 약 2.9mm 어긋남(IoU 0.64).
+    # 유테의 정의("테두리 외곽선이 있는 이미지" -- 흰색/검은색 테두리 선)대로,
+    # 실루엣 가장자리 띠가 흰색/검은색 테두리일 때만 유테로 두고 아니면 무테
+    # (안쪽)로 한다. 실측: 흰 테두리 스티커 시트는 유테 쪽이 실제와 더 맞고
+    # (IoU 0.91), 무테 시트는 무테 쪽이 맞음(IoU 0.90).
+    if classification.halo_detected and style == ImageStyle.LINE_ART:
+        if not has_white_or_black_border(image_path, content, dpi):
+            style = ImageStyle.BORDERLESS
+            border_note = (
+                "자동 감지: 무테 (배경 위에 떠 있지만 흰색/검은색 테두리 선이 없어, "
+                "요소 안쪽으로 자름)"
+            )
 
     result = generate_cutline_by_style(
         image_path,
-        classification.style,
+        style,
         dpi,
         selection_px=selection_px,
         bounds_px=bounds_px,
@@ -589,7 +840,9 @@ def generate_cutline_auto(
         supersample=supersample,
         sibling_boxes_px=sibling_boxes_px,
     )
-    if classification.halo_detected:
+    if border_note is not None:
+        note = border_note
+    elif classification.halo_detected:
         note = (
             f"자동 감지: {classification.style.value} "
             f"(사각형도 {classification.rectangularity:.2f}지만, 선택 영역 사방에 실제 여백이 있어 "

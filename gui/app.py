@@ -71,10 +71,13 @@ from core.cutline_core import generate_cutlines, OffsetSpec, px_to_mm
 from core.cutline_types import CutlineType
 from core.image_style import ImageStyle, DEFAULT_STYLE_MARGIN_MM, _measure_content_bbox_px
 from core.interactive_cutline import (
-    generate_card_inset_cutline,
+    image_outer_region_px,
+    generate_borderless_cut_from_silhouette,
+    generate_domusong_inside_cutline,
     generate_cutline_auto,
     generate_cutline_by_style,
     generate_cutline_for_selection,
+    has_white_or_black_border,
     is_silhouette_undersized,
 )
 from core.segmentation import segment_design_with_hints
@@ -82,6 +85,7 @@ from core.style_classify import rectangularity as _shape_rectangularity
 from core.multi_design import (
     cell_has_content_px,
     detect_design_bboxes_px,
+    detect_elements_by_background_flood_px,
     detect_repeat_aware_sub_element_boxes_px,
     group_content_cells_px,
     expand_box_to_neighbor_midpoint_px,
@@ -2953,7 +2957,8 @@ class CutLineApp(ctk.CTk):
             rep_box = self._hint_new_box_px
             margin_mm = self.style_margin_mm.get()
             dpi = self.dpi.get()
-            style_name = "LINE_ART"  # 힌트 보정은 유테/마스킹테이프(실루엣 추적) 전용
+            # 무테 작업이면 새 도안도 그림 안쪽으로(배경 포함 금지).
+            style_name = "BORDERLESS" if self.job_type.get() == "BORDERLESS" else "LINE_ART"
         else:
             meta = self._grabcut_hint_meta.get(self._hint_target_index)
             if meta is None:
@@ -3864,6 +3869,7 @@ class CutLineApp(ctk.CTk):
         ]
         neighbor_boxes_for_bounds = list(fine_boxes) + domusong_cell_boxes
 
+        rest_start_index = len(self._accumulated)
         added = 0
         errors = []
         n_fine = len(fine_groups)
@@ -3933,6 +3939,15 @@ class CutLineApp(ctk.CTk):
                 except Exception as e:  # noqa: BLE001
                     self._report_exception_to_server("반복 도안 복제 처리 중")
                     errors.append(f"{other_idx + 1}번째 조각(반복 복제): {self._friendly_error_text(str(e))}")
+
+        # 2026-09-28: ③에도 보조 탐지 자동 적용(놓친 요소만 추가, 흰/검은
+        # 테두리가 있으면 유테, 없으면 무테 안쪽) -- 실제 손 칼선 대조 결과.
+        try:
+            added += self._supplement_missing_elements(
+                path, rest_start_index, remaining_flat, auto_style=True,
+            )
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
 
         for gi in cell_indices:
             self._mixed_processed.add(gi)
@@ -4034,15 +4049,15 @@ class CutLineApp(ctk.CTk):
                             getattr(self, "_mixed_cell_boxes_px", None) or boxes,
                             _im.size,
                         )
-                    item_result = generate_cutline_for_selection(
+                    # 2026-09-28: 표시한 칸의 이미지 안쪽에 도형(위 수동 도무송과
+                    # 같은 규칙) -- domusong_bounds_px는 더 이상 필요 없지만
+                    # (칼선이 이미지 밖으로 안 나감) 계산은 그대로 둔다.
+                    item_result = generate_domusong_inside_cutline(
                         image_path=path,
-                        selection_px=self._selection_px,
+                        region_px=self._selection_px,
                         cutline_type=cutline_type,
                         dpi=self.dpi.get(),
                         offset_mm=offset_mm,
-                        use_grabcut=self.use_grabcut.get(),
-                        supersample=self.precision.get(),
-                        bounds_px=domusong_bounds_px,
                     )
                     # 2026-09-10(34차) 피드백과 동일: 도무송 직접 표시는
                     # 칼선/블리딩 두 선만 있으면 되고 세이프티(초록)는 화면/
@@ -4383,15 +4398,16 @@ class CutLineApp(ctk.CTk):
         if not self.cutline_type.get():
             raise ValueError("먼저 '재단 도형'을 선택하세요.")
         cutline_type = CutlineType[self.cutline_type.get()]
-        result = generate_cutline_for_selection(
+        # 2026-09-28 멍푸: "도무송 직접 선택 후 칼선 종류에 따라 이미지 안쪽으로
+        # 칼선 생성" -- 선택한 영역 안 실제 이미지 외곽을 기준으로, 고른
+        # 도형을 이미지 *안쪽*에 넣는다(칼선·블리딩 모두 이미지 안).
+        # 수동 드래그와 자동 인식 둘 다 이 경로를 탄다.
+        result = generate_domusong_inside_cutline(
             image_path=path,
-            selection_px=self._selection_px,
+            region_px=self._selection_px,
             cutline_type=cutline_type,
             dpi=self.dpi.get(),
             offset_mm=offset_mm,
-            use_grabcut=self.use_grabcut.get(),
-            supersample=self.precision.get(),
-            bounds_px=bounds_px_override,
         )
         # 2026-09-10 피드백("안쪽의 초록 선은 필요없어"): 사용자가 화면에서
         # 직접 "재단 도형 선택"으로 도무송을 만들 때는 칼선/블리딩 두 선만
@@ -4573,6 +4589,7 @@ class CutLineApp(ctk.CTk):
                 selection_px=self._selection_px,
                 margin_mm=self.style_margin_mm.get(),
                 supersample=self.precision.get(),
+                sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
             )
             x0, y0, x1, y1 = self._selection_px
             cell_area_px = max(0.0, (x1 - x0) * (y1 - y0))
@@ -4594,27 +4611,17 @@ class CutLineApp(ctk.CTk):
             return result
 
         if job == "BORDERLESS":
-            # 2026-09-28(멍푸: "무테는 이미지 안쪽에 칼선이 들어간다고 수 회
-            # 말했어. 배경이미지를 같이 자르면 상품 가치가 없어" -> 비교
-            # 이미지로 "A: 칸 전체 한 장" 확정): 예전(9/7)엔 자동 인식된
-            # 요소가 사각형으로 잘리는 걸 막으려고 무테를 골라도 유테처럼
-            # 요소 실루엣을 바깥으로 밀어(배경까지 포함) 잘랐다. 무테는 칸
-            # (카드) 하나가 스티커 한 장이므로, 그 칸 이미지 가장자리에서
-            # 여백만큼 안쪽에 칼선 하나만 둔다 -- 배경 그림은 자르지 않는다.
+            # 2026-09-28(멍푸: "무테는 이미지 안쪽에 칼선이 들어간다", "배경색이
+            # 칼선으로 잡히면 안 됨", "테스트 칼선 보면서 대조해"): 예전(9/7)엔
+            # 무테를 골라도 요소를 유테처럼 바깥으로 밀어 배경까지 잘랐다.
+            # 테스트 폴더의 실제 손 칼선을 읽어 대조해보니, 무테 시트는 칸 안
+            # 요소(캐릭터·소품)마다 칼선이 따로 있고 모두 요소 실루엣에서 약
+            # 0.7~1.5mm *안쪽*이었다. 그래서 요소마다 GrabCut 실루엣을 찾아
+            # 그림 안쪽으로 여백만큼 줄인다(core.image_style의
+            # _borderless_inward_from_silhouette -- sibling_boxes_px가 이
+            # 경로의 신호). 배경은 절대 스티커에 들어가지 않는다.
             if self._selection_px is None:
                 raise ValueError("자동 인식된 영역이 없습니다.")
-            if self._real_grid_cells_px:
-                # 작가가 그린 실제 재단선 격자의 칸 = 카드 가장자리 그 자체.
-                return generate_card_inset_cutline(
-                    image_path=path,
-                    card_px=self._selection_px,
-                    dpi=self.dpi.get(),
-                    margin_mm=self.style_margin_mm.get(),
-                )
-            # 격자가 없는 파일: 찾은 박스가 카드인지(박스를 꽉 채움) 자유
-            # 모양 그림인지 모르므로, 수동 무테와 같은 판정(색 경계 추적 ->
-            # 박스를 거의 채우면 사각형, 아니면 그 모양 안쪽)을 쓴다 -- 둥근
-            # 그림의 박스 모서리(흰 배경)를 사각형으로 자르지 않도록.
             return generate_cutline_by_style(
                 image_path=path,
                 style=ImageStyle.BORDERLESS,
@@ -4622,6 +4629,7 @@ class CutLineApp(ctk.CTk):
                 selection_px=self._selection_px,
                 margin_mm=self.style_margin_mm.get(),
                 supersample=self.precision.get(),
+                sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
             )
 
         if job in ("LINE_ART", "MASKING_TAPE"):
@@ -5194,15 +5202,24 @@ class CutLineApp(ctk.CTk):
         # 적용해") 그대로 유지, 격자 없는 파일용 대체 경로(else)는 그대로.
         suspicious_regions_px: list = []
         try:
-            if self._real_grid_cells_px and self.job_type.get() == "BORDERLESS":
-                # 2026-09-28 멍푸 결정("무테는 칸 전체 한 장" -- 비교 이미지로
-                # 확인): 무테는 칸(카드) 하나가 스티커 한 장이다. 칸 안을 요소로
-                # 쪼개면 배경 그림에서 캐릭터를 오려내게 되어 상품 가치가 없다.
+            if self._real_grid_cells_px:
+                # 2026-09-28: 배경색뿐인 칸(이웃 칸 테두리 선이 살짝 걸친 빈 칸
+                # 포함 -- 실제 파일로 확인)은 어떤 작업이든 칼선 대상에서 뺀다
+                # ("배경색이 칼선으로 잡히면 안 됨").
+                grid_cells = [
+                    c for c in self._real_grid_cells_px
+                    if image_outer_region_px(path, c) is not None
+                ]
+            if self._real_grid_cells_px and self.job_type.get() == "DOMUSONG":
+                # 2026-09-28: 도무송은 칸(카드) 단위(9/26 "카드 하나 = 도무송
+                # 하나") -- 칸 이미지 안쪽에 도형 하나("도무송 직접 선택 후 칼선
+                # 종류에 따라 이미지 안쪽으로"). 실제 테스트 파일의 카드 칸 손
+                # 칼선도 칸 하나에 도형 하나, 이미지 외곽 약 3mm 안쪽으로 실측됨.
                 # 빈 칸만 거르고 같은 그림 반복만 묶는다(쪼개기 없음).
-                cell_boxes = list(self._real_grid_cells_px)
+                cell_boxes = grid_cells
                 boxes, groups = group_content_cells_px(path, cell_boxes)
             elif self._real_grid_cells_px:
-                cell_boxes = list(self._real_grid_cells_px)
+                cell_boxes = grid_cells
                 boxes, groups = detect_repeat_aware_sub_element_boxes_px(
                     path, cell_boxes, suspicious_regions=suspicious_regions_px,
                 )
@@ -5240,12 +5257,12 @@ class CutLineApp(ctk.CTk):
         self._auto_detect_all_boxes_px = cell_boxes
 
         # 2026-09-28(GrabCut 보조 기능): 이 실행에서 힌트 보정 대상으로 삼을
-        # 수 있는 job_type인지 미리 판단해둔다. 유테/마스킹테이프만 대상 --
-        # 무테는 칸 한 장을 사각형으로 안쪽에 자르므로(실루엣 추적 없음)
-        # 힌트로 고칠 실루엣 자체가 없다. AUTO_STYLE/DOMUSONG/FULL_CUT은
-        # 아직 연결 안 됨.
-        hint_eligible_job = self.job_type.get() in ("LINE_ART", "MASKING_TAPE")
-        hint_style = "LINE_ART"
+        # 수 있는 job_type인지 미리 판단해둔다. 무테는 보정된 실루엣을
+        # 안쪽으로, 유테/마스킹테이프는 바깥으로 오프셋한다(hint_style).
+        # AUTO_STYLE/DOMUSONG/FULL_CUT은 아직 연결 안 됨.
+        run_start_index = len(self._accumulated)
+        hint_eligible_job = self.job_type.get() in ("BORDERLESS", "LINE_ART", "MASKING_TAPE")
+        hint_style = "BORDERLESS" if self.job_type.get() == "BORDERLESS" else "LINE_ART"
 
         # 각 도안은 사람이 직접 드래그한 것처럼 self._selection_px를 그때그때
         # 채워서 기존 _generate_one_item을 그대로 재사용 -- 개별 항목 하나가
@@ -5255,6 +5272,11 @@ class CutLineApp(ctk.CTk):
             primary_idx = group[0]
             x0, y0, x1, y1 = boxes[primary_idx]
             self._selection_px = (x0, y0, x1, y1)
+            # 같은 시트의 나머지 요소 박스 -- 무테 경로가 옆 요소를 자기
+            # 실루엣으로 끌어오지 않게 막는 데 쓴다.
+            self._auto_detect_sibling_boxes_px = [
+                b for j, b in enumerate(boxes) if j != primary_idx
+            ]
             self.after(
                 0, self.status.set,
                 f"자동 인식 처리 중... (그룹 {gi}/{len(groups)}, 반복 {len(group)}개)",
@@ -5262,6 +5284,10 @@ class CutLineApp(ctk.CTk):
             group_hint_indices: list = []  # 이 그룹의 self._accumulated 인덱스들(힌트 보정 대상일 때만 채움)
             try:
                 item_result = self._generate_one_item_for_auto_detect(path)
+                if item_result.design is None or item_result.design.is_empty:
+                    # 2026-09-28: 배경뿐인 칸(무테 "배경색이 칼선으로 잡히면
+                    # 안 됨") -- 칼선을 만들지 않고, 같은 그림 반복 칸도 건너뜀.
+                    continue
                 template_results = [item_result]
                 # 2026-09-07 다중선택 기능: 자동 인식 배치 처리에서도 동일하게,
                 # 도무송+무테 동시 적용이 켜져 있으면 이 도안 영역에 무테
@@ -5352,6 +5378,20 @@ class CutLineApp(ctk.CTk):
                     errors.append(f"{other_idx + 1}번째 도안(반복 복제): {self._friendly_error_text(str(e))}")
         self._selection_px = None
 
+        if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE") and self._real_grid_cells_px:
+            try:
+                added += self._supplement_missing_elements(
+                    path, run_start_index, list(self._real_grid_cells_px),
+                    auto_style=self.job_type.get() == "AUTO_STYLE",
+                )
+            except Exception:  # noqa: BLE001 -- 보조 탐지 실패해도 기존 결과는 그대로
+                traceback.print_exc()
+        if self.job_type.get() == "BORDERLESS":
+            try:
+                self._merge_overlapping_borderless_cuts(run_start_index)
+            except Exception:  # noqa: BLE001 -- 합치기 실패해도 개별 칼선은 그대로 남음
+                traceback.print_exc()
+
         if added == 0:
             self.after(
                 0, self._on_error,
@@ -5380,6 +5420,170 @@ class CutLineApp(ctk.CTk):
             return
 
         self.after(0, self._show_auto_detect_result, preview_png, added, n_total, errors)
+
+    def _supplement_missing_elements(self, path, start_idx, cell_boxes, auto_style=False):
+        """무테 자동 인식 보조(자동 적용): 기존 경로(선 기반 낱개 탐지 +
+        GrabCut)가 놓친 요소만 배경 채우기 탐지기
+        (detect_elements_by_background_flood_px)로 찾아 더한다. 이미 칼선이
+        있는 요소와 30% 이상 겹치면 더하지 않는다(이중 칼선 방지). 칸 단위
+        반복 그룹의 대표 칸에서만 찾고, 같은 그림의 다른 칸에는 복제한다.
+        실측(실제 손 칼선 대조): 파스텔톤 시트에서 맞은 칼선 16개 -> 이 보조로
+        크게 늘어남(병아리·잎·꽃·큰 캐릭터), 다른 시트는 거의 그대로."""
+        from shapely.ops import unary_union
+        from core.cutline_core import mm_to_px as _mm_to_px
+
+        margin = self.style_margin_mm.get()
+        dpi = self.dpi.get()
+        inset = _mm_to_px(margin, dpi)
+        existing = []
+        for i in range(start_idx, len(self._accumulated)):
+            cut = self._accumulated[i].offsets.get("cut")
+            if cut is not None and not cut.is_empty:
+                existing.append(cut.buffer(inset))
+        covered = unary_union(existing) if existing else None
+        cells, groups = group_content_cells_px(path, [
+            c for c in cell_boxes if image_outer_region_px(path, c) is not None
+        ])
+        added = 0
+        note = "무테 보조 탐지: 기존 인식에서 빠진 요소를 배경 채우기로 찾아 그림 안쪽으로 잘랐습니다."
+        for grp in groups:
+            prim = cells[grp[0]]
+            cell_area = max(1.0, (prim[2] - prim[0]) * (prim[3] - prim[1]))
+            for el in detect_elements_by_background_flood_px(path, prim):
+                # 칸 넓이의 1% 미만은 더하지 않는다: 실측으로 배경 건물의 창문
+                # 칸 같은 무늬 조각(약 5mm)이 여기 걸렸고, 실제로 빠져 있던
+                # 요소(병아리·잎 등, 칸의 1.5% 이상)는 모두 이보다 컸다.
+                if el.area < 0.01 * cell_area:
+                    continue
+                if covered is not None and el.intersection(covered).area / el.area >= 0.3:
+                    continue
+                el_style = "BORDERLESS"
+                if auto_style and has_white_or_black_border(path, el, dpi):
+                    # 무테+유테 자동: 흰색/검은색 테두리 선이 있으면 유테(바깥)
+                    el_style = "LINE_ART"
+                    res = generate_cutline_by_style(
+                        image_path=path, style=ImageStyle.LINE_ART, dpi=dpi,
+                        selection_px=tuple(el.bounds), margin_mm=margin,
+                        supersample=self.precision.get(), precomputed_content_px=el,
+                    )
+                    res.adjustments = [note.replace("그림 안쪽으로", "테두리 바깥으로")] + list(res.adjustments or [])
+                else:
+                    res = generate_borderless_cut_from_silhouette(path, el, dpi, margin, note=note)
+                if res.offsets["cut"].is_empty:
+                    continue
+                self._accumulated.append(res)
+                rep_index = len(self._accumulated) - 1
+                group_indices = [rep_index]
+                bx = tuple(el.bounds)
+                self._grabcut_hint_meta[rep_index] = {
+                    "box_px": bx, "margin_mm": margin, "dpi": dpi,
+                    "group_indices": group_indices, "style": el_style,
+                    "is_representative": True,
+                }
+                for other in grp[1:]:
+                    ocell = cells[other]
+                    self._accumulated.append(
+                        fit_cutline_result_to_box(res, prim, ocell, note=(
+                            "동일 도안이 반복되는 것으로 감지되어, 대표 칸의 칼선을 그 칸 크기에 맞춰 복제했습니다."
+                        ))
+                    )
+                    sib = len(self._accumulated) - 1
+                    group_indices.append(sib)
+                    px0, py0, px1, py1 = prim
+                    ox0, oy0, ox1, oy1 = ocell
+                    sx = (ox1 - ox0) / (px1 - px0) if px1 != px0 else 1.0
+                    sy = (oy1 - oy0) / (py1 - py0) if py1 != py0 else 1.0
+                    self._grabcut_hint_meta[sib] = {
+                        "box_px": (ox0 + (bx[0] - px0) * sx, oy0 + (bx[1] - py0) * sy,
+                                   ox0 + (bx[2] - px0) * sx, oy0 + (bx[3] - py0) * sy),
+                        "margin_mm": margin, "dpi": dpi,
+                        "group_indices": group_indices, "style": el_style,
+                        "is_representative": False,
+                    }
+                added += 1
+        return added
+
+    def _merge_overlapping_borderless_cuts(self, start_idx):
+        """이번 무테 자동 인식에서 만든 칼선들 중 서로 *겹치는* 것을 한 조각으로
+        합친다 -- 따로 두면 두 칼선이 교차해 실제로 자를 수 없다. 겹치지 않는
+        요소는 합치지 않는다(9/14 "요소마다 개별 칼선"). 합친 칼선도 그림 안쪽
+        규칙을 지킨다(각 칼선을 여백만큼 되돌려 합친 뒤 다시 여백만큼 안쪽)."""
+        from shapely.geometry import MultiPolygon, Polygon
+        from shapely.ops import unary_union
+        from shapely.strtree import STRtree
+        from core.cutline_core import mm_to_px as _mm_to_px
+
+        idxs = []
+        for i in range(start_idx, len(self._accumulated)):
+            cut = self._accumulated[i].offsets.get("cut")
+            if cut is not None and not cut.is_empty:
+                idxs.append(i)
+        if len(idxs) < 2:
+            return 0
+        geoms = [self._accumulated[i].offsets["cut"] for i in idxs]
+        parent = list(range(len(idxs)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        inset = _mm_to_px(self.style_margin_mm.get(), self.dpi.get())
+        # 칼선끼리 실제로 겹칠 때만 합친다. (맞닿기만 한 요소까지 합치는
+        # 것도 실제 손 칼선과 대조해 봤지만, 한 파일에서는 실제로 따로 잘린
+        # 요소들이 합쳐져 오히려 틀어져서 되돌림.)
+        tree = STRtree(geoms)
+        for k, g in enumerate(geoms):
+            for m in tree.query(g):
+                m = int(m)
+                if m <= k:
+                    continue
+                if g.intersection(geoms[m]).area > 1.0:
+                    parent[find(m)] = find(k)
+        comps = {}
+        for k in range(len(idxs)):
+            comps.setdefault(find(k), []).append(k)
+        merged_count = 0
+        for members in comps.values():
+            if len(members) < 2:
+                continue
+            keep = idxs[min(members)]
+            # 각 칼선을 여백만큼 되돌려(= 원래 그림 윤곽 근사) 합친 뒤 다시
+            # 여백만큼 안쪽으로 -- 합친 칼선도 그림 밖으로 나가지 않는다.
+            merged = unary_union([geoms[k].buffer(inset, join_style=1) for k in members])
+            merged = merged.buffer(-inset, join_style=1)
+            if merged.geom_type == "MultiPolygon":
+                merged = max(merged.geoms, key=lambda q: q.area) if len(merged.geoms) == 1 else merged
+            mp = MultiPolygon([merged]) if isinstance(merged, Polygon) else merged
+            res = self._accumulated[keep]
+            res.offsets["cut"] = mp
+            res.design = mp
+            res.adjustments = list(res.adjustments or []) + [
+                f"무테: 서로 겹쳐 그려진 요소 {len(members)}개는 칼선이 교차하지 않도록 한 조각으로 합쳤습니다."
+            ]
+            keep_meta = self._grabcut_hint_meta.get(keep)
+            boxes = [keep_meta["box_px"]] if keep_meta else []
+            for k in members:
+                i = idxs[k]
+                if i == keep:
+                    continue
+                other = self._accumulated[i]
+                other.offsets = {"cut": MultiPolygon([])}
+                other.design = MultiPolygon([])
+                meta = self._grabcut_hint_meta.pop(i, None)
+                if meta is not None:
+                    boxes.append(meta["box_px"])
+                    grp = meta.get("group_indices")
+                    if grp is not None and i in grp:
+                        grp.remove(i)
+            if keep_meta is not None and boxes:
+                keep_meta["box_px"] = (
+                    min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[2] for b in boxes), max(b[3] for b in boxes),
+                )
+            merged_count += 1
+        return merged_count
 
     def _show_auto_detect_result(self, preview_png, added, n_total, errors):
         self._show_preview(preview_png, item_result=None)

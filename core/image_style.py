@@ -121,6 +121,151 @@ def _rect_from_bounds(bounds_px) -> Polygon:
     return Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
 
 
+def _drop_tiny_parts(geom, min_frac: float = 0.02):
+    """가장 큰 조각 대비 min_frac 미만인 극미세 조각(buffer/intersection이
+    만드는 잔부스러기)을 버린다 -- 이 모듈의 무테 경로가 원래 쓰던 것과
+    같은 기준(2%)."""
+    if geom is None or geom.is_empty:
+        return geom
+    if isinstance(geom, Polygon):
+        return geom
+    parts = [g for g in getattr(geom, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
+    if not parts:
+        return Polygon()
+    largest = max(g.area for g in parts)
+    kept = [g for g in parts if g.area >= max(1e-6, min_frac * largest)]
+    return kept[0] if len(kept) == 1 else MultiPolygon(kept)
+
+
+def _drop_uncuttable_slivers(geom, dpi: float, min_width_mm: float = 0.5, keep_largest: bool = True):
+    """여러 조각 중 평균 폭(2x넓이/둘레)이 min_width_mm 미만인 실 같은 조각을
+    버린다. keep_largest면 가장 큰 조각은 항상 남기고, 아니면 전부 가늘 때
+    빈 Polygon을 돌려준다."""
+    if geom is None or geom.is_empty:
+        return geom
+    if isinstance(geom, Polygon):
+        parts = [geom]
+    else:
+        parts = [g for g in getattr(geom, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
+    if not parts:
+        return geom
+    largest = max(parts, key=lambda g: g.area)
+    min_w = mm_to_px(min_width_mm, dpi)
+    kept = [
+        g for g in parts
+        if (keep_largest and g is largest) or (g.length > 0 and 2.0 * g.area / g.length >= min_w)
+    ]
+    if not kept:
+        return Polygon()
+    return kept[0] if len(kept) == 1 else MultiPolygon(kept)
+
+
+def _inset_inside_art(content, inset_px: float, open_factor: float = 2.5, cap_factor: float = 0.4):
+    """무테 칼선 = "항상 그림 안쪽"을 수학적으로 보장하면서 매끄럽게 만드는
+    안쪽 오프셋(2026-09-28, 멍푸: "무테는 이미지 안쪽에 칼선이 들어간다",
+    "배경색이 칼선으로 잡히면 안 됨" -- 실제 테스트 파일의 손 칼선도 요소
+    실루엣 안쪽 약 0.7~1.5mm로 실측됨).
+
+    매끄럽게 하는 데 "닫기"(buffer(+R)->(-R), 오목한 곳을 원호로 메움)를
+    쓰면 R이 여백보다 클 때 원호가 요소 밖 배경 위로 지나간다(실제 파일로
+    확인). 안쪽 칼선에는 반대인 "열기"(buffer(-R)->(+R))가 맞다: 톱니·털끝
+    같은 작은 요철의 끝만 깎아서 결과가 항상 원래 그림 안에 있다(열기 ⊆
+    원본). R은 여백의 2.5배(폭 약 6mm 미만의 뾰족한 끝만 둥글게)로 하되
+    조각 크기의 0.4배를 넘지 않게 해 작은 요소가 사라지지 않게 한다. 그다음
+    여백만큼 줄이고, 오목한 모서리는 여백 이하 반지름으로만 둥글게 한다
+    (이 크기의 닫기는 그림 밖으로 나갈 수 없다)."""
+    if content is None or content.is_empty:
+        return content
+    parts = list(content.geoms) if hasattr(content, "geoms") else [content]
+    opened = []
+    for g in parts:
+        if g is None or g.is_empty:
+            continue
+        equiv_radius = (g.area / 3.141592653589793) ** 0.5 if g.area > 0 else 0.0
+        R = min(open_factor * inset_px, cap_factor * equiv_radius)
+        o = g
+        if R > 0:
+            o = g.buffer(-R, join_style=1).buffer(R, join_style=1)
+            if o.is_empty:
+                o = g
+        opened.append(o)
+    if not opened:
+        return content
+    line = unary_union(opened).buffer(-inset_px, join_style=1)
+    r = 0.95 * inset_px
+    if not line.is_empty and r > 0:
+        line = line.buffer(r, join_style=1).buffer(-r, join_style=1)
+    return _drop_tiny_parts(line)
+
+
+def _borderless_inward_from_silhouette(
+    image_path: str,
+    selection_px: tuple,
+    inset_px: float,
+    grabcut_margin_px: int,
+    supersample: int,
+    note_sink: Optional[list],
+    sibling_boxes_px: Optional[list],
+    precomputed_content_px=None,
+):
+    """자동 인식으로 찾은 낱개 요소(또는 힌트로 보정한 실루엣)의 무테 칼선.
+
+    실제 테스트 파일(작가 손 칼선)과 대조한 결과: 무테 시트는 칸 안의
+    캐릭터/소품마다 칼선이 따로 있고, 그 칼선은 요소 실루엣에서 약 0.7~1.5mm
+    *안쪽*에 있다(배경은 스티커에 안 들어감). 요소 실루엣은 유테가 이미
+    실제 파일로 다듬어 온 GrabCut 경로(옆 요소 침범 조각 제거 + 저대비 번짐
+    편입)를 그대로 쓰고 방향만 안쪽(`_inset_inside_art`)으로 한다. Canny 색
+    경계 추적은 줄무늬 같은 배경 색 경계까지 그림으로 잡아 쓰지 않는다.
+
+    요소가 영역을 거의 꽉 채우면(카드형) 사각형을 안쪽으로 줄인다. 안쪽으로
+    줄이면 사라질 만큼 가는 요소(선 장식 등)는 배경을 자르지 않도록 칼선을
+    만들지 않고(빈 도형) 알린다. GrabCut 자체가 실패하면 None(기존 경로로)."""
+    rect = _rect_from_bounds(selection_px)
+    if precomputed_content_px is not None:
+        design = precomputed_content_px
+        if note_sink is not None:
+            note_sink.append(
+                "사람이 직접 확인/보정한 실루엣(트라이맵 힌트)을 기준으로 안쪽으로 줄였습니다."
+            )
+    else:
+        try:
+            design = segment_design_in_region(
+                image_path, selection_px, margin_px=grabcut_margin_px,
+                supersample=supersample, note_sink=note_sink,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        design = _drop_sibling_spillover_fragments(design, sibling_boxes_px)
+        design = _grow_design_into_low_contrast_halo_px(
+            image_path, design, note_sink=note_sink, sibling_boxes_px=sibling_boxes_px,
+            own_box_px=selection_px,
+        )
+    if design is None or design.is_empty:
+        return None
+    design = design.intersection(rect)
+    ratio = design.area / rect.area if rect.area > 0 else 0.0
+    if ratio >= MAX_TRUSTED_TRACE_RATIO and precomputed_content_px is None:
+        if note_sink is not None:
+            note_sink.append(
+                "무테 칼선: 요소가 영역을 거의 꽉 채워(카드형) 사각형 자체를 기준으로 안쪽으로 줄였습니다."
+            )
+        return rect.buffer(-inset_px, join_style=2)
+    line = _inset_inside_art(design, inset_px)
+    if line is None or line.is_empty:
+        if note_sink is not None:
+            note_sink.append(
+                "⚠ 무테: 너무 가는 요소(선·테두리 장식 등)라 그림 안쪽으로 칼선을 넣을 "
+                "수 없어, 배경을 자르지 않도록 이 요소는 칼선을 만들지 않았습니다. "
+                "필요하면 유테로 따로 추가하세요."
+            )
+        return Polygon()
+    if note_sink is not None:
+        note_sink.append(
+            "무테 칼선: 요소 실루엣을 따라 그림 안쪽으로 줄였습니다(배경은 자르지 않음)."
+        )
+    return line
+
+
 def _drop_sibling_spillover_fragments(design, sibling_boxes_px, min_spillover_ratio: float = 0.3):
     """2026-09-26 피드백("포들은 얼굴에 칼선이 여러개 중첩되어 있고 이
     문제는 지금 한달째 못 고치고 있어"): 실제 파일(너구리+꽃+푸들 시트)로
@@ -1148,8 +1293,8 @@ def generate_style_cutline(
     (형제 스필오버 제거, 저대비 헤일로 확장, 안내선 감지, 매끄럽게 다듬기,
     margin_mm 바깥 오프셋)는 기존과 완전히 동일하게 이어서 적용되므로,
     "사람이 검증한 실루엣이 항상 이 프로젝트의 다른 모든 안전장치를 그대로
-    통과한다"는 것이 보장된다. BORDERLESS(무테)는 GrabCut을 쓰지 않으므로
-    이 값을 무시한다(무테 자동 인식은 칸 한 장을 사각형으로 안쪽에 자름).
+    통과한다"는 것이 보장된다. BORDERLESS(무테)에 주어지면 그 실루엣을
+    그림 안쪽으로 줄인다(_borderless_inward_from_silhouette).
     """
     if margin_mm < MIN_STYLE_MARGIN_MM:
         if note_sink is not None:
@@ -1166,6 +1311,31 @@ def generate_style_cutline(
             with Image.open(image_path) as im:
                 rect_px = (0, 0, im.width, im.height)
         inset_px = mm_to_px(margin_mm, dpi)
+
+        # 2026-09-28: 자동 인식 낱개 요소(sibling_boxes_px가 함께 온다 --
+        # 이 맥락의 신호) 또는 힌트로 보정한 실루엣이면, GrabCut 실루엣을
+        # 그림 안쪽으로 줄이는 경로를 먼저 쓴다(_borderless_inward_from_
+        # silhouette 문서 -- 실제 테스트 파일 손 칼선과 대조해 정함).
+        # 빈 도형 = "너무 가늘어 건너뜀". None이면 아래 기존 경로.
+        if selection_px is not None and (
+            sibling_boxes_px is not None or precomputed_content_px is not None
+        ):
+            silhouette_line = _borderless_inward_from_silhouette(
+                image_path, selection_px, inset_px, grabcut_margin_px,
+                supersample, note_sink, sibling_boxes_px, precomputed_content_px,
+            )
+            if silhouette_line is not None:
+                if not silhouette_line.is_empty and bounds_px is not None:
+                    silhouette_line = _drop_tiny_parts(
+                        silhouette_line.intersection(_rect_from_bounds(bounds_px))
+                    )
+                if not silhouette_line.is_empty:
+                    # 칼로 자를 수 없는 폭 0.5mm 미만 조각(실측: 9x6px 점 2개만
+                    # 남은 항목)은 버리고, 전부 그렇다면 칼선을 만들지 않는다.
+                    silhouette_line = _drop_uncuttable_slivers(silhouette_line, dpi, keep_largest=False)
+                    if silhouette_line.is_empty and note_sink is not None:
+                        note_sink.append("⚠ 무테: 너무 작거나 가는 요소라 칼선을 만들지 않았습니다.")
+                return silhouette_line
 
         # 2026-09-08(11차) 피드백("무테 칼선은 요소의 외곽 색을 기준으로
         # 라인을 생성하고 생성한 라인을 축소 및 재배치해 칼선을 생성해"):
@@ -1501,4 +1671,7 @@ def generate_style_cutline(
                 line = line.difference(forbidden)
         except Exception:  # noqa: BLE001
             pass
+        # 옆 요소 박스를 빼고 나면 폭 0.3mm 안팎의 실 같은 조각이 남을 수 있다
+        # (실측: 격자 파일에서 35x4px 조각) -- 칼로 자를 수 없는 조각이므로 버린다.
+        line = _drop_uncuttable_slivers(line, dpi)
     return line
