@@ -74,15 +74,25 @@ def test_gui_wiring_filters_blank_cells_using_cell_has_content_px():
     src = open("/root/cutline_studio/core/multi_design.py", encoding="utf-8").read()
     assert "cell_has_content_px" in src, "core/multi_design.py가 cell_has_content_px를 아예 안 씀"
     tree = ast.parse(src)
-    found_call_inside_fn = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "detect_repeat_aware_sub_element_boxes_px":
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Call):
-                    func = sub.func
-                    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                    if name == "cell_has_content_px":
-                        found_call_inside_fn = True
+
+    def _calls(fn_name):
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        func = sub.func
+                        names.add(func.id if isinstance(func, ast.Name) else getattr(func, "attr", None))
+        return names
+
+    # 2026-09-28: 빈 칸 거르기 + 반복 칸 묶기를 group_content_cells_px로
+    # 뽑아냈다(무테 자동 인식도 같은 함수를 씀) -- 직접 호출이든 그 함수를
+    # 거치든, 빈 칸 거르기가 실제로 연결돼 있는지 확인.
+    repeat_calls = _calls("detect_repeat_aware_sub_element_boxes_px")
+    found_call_inside_fn = "cell_has_content_px" in repeat_calls or (
+        "group_content_cells_px" in repeat_calls
+        and "cell_has_content_px" in _calls("group_content_cells_px")
+    )
     assert found_call_inside_fn, (
         "detect_repeat_aware_sub_element_boxes_px 안에서 cell_has_content_px를 호출하지 않음"
     )

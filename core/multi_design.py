@@ -1948,9 +1948,44 @@ def split_cell_into_sub_elements_px(
     `suspicious_regions`: `detect_sub_element_boxes_px`와 동일(기본 None=
     동작 변화 없음, 진단용 리스트를 넘기면 그대로 이어받아 기록)."""
     raw_boxes = detect_sub_element_boxes_px(image_path, cell_px, suspicious_regions=suspicious_regions)
+    raw_boxes = [b for b in raw_boxes if not _is_uncuttable_sliver_box(b, cell_px)]
     if len(raw_boxes) < min_clusters:
         return [tuple(cell_px)]
     return _reading_order_sort(raw_boxes)
+
+
+def _is_uncuttable_sliver_box(
+    box_px: tuple,
+    cell_px: tuple,
+    min_short_side_ratio: float = 0.02,
+    min_short_side_px: float = 12.0,
+    min_aspect_ratio: float = 4.0,
+) -> bool:
+    """2026-09-28(멍푸 피드백 "이중 칼선에 배경까지 칼선이 들어간게 왜
+    해결이지", "무테는 이미지 안쪽에 칼선이 들어간다고 수 회 말했어.
+    배경이미지를 같이 자르면 상품 가치가 없어"): 실제 10칸 시트 파일에서
+    두 칸 사이의 얇은 배경 틈(실측 폭 7px x 높이 745px, 가로세로비 약
+    106:1)이 칸 안 낱개 요소 분리 단계에서 "요소 하나"로 잡혀, 그 위에
+    배경만 자르는 길쭉한 알약 모양 칼선이 생긴 것을 확인했다.
+
+    `_is_gradient_sliver_box`(시트 전체용)는 "훨씬 큰 이웃과 맞닿음" 조건이
+    필요하고 칸 가장자리에 붙은 정상 요소 때문에 낱개 분리 경로에서는
+    의도적으로 안 쓰므로, 여기서는 그와 별개로 "물리적으로 따로 잘라낼 수
+    없을 만큼 얇은가"만 본다: 짧은 변이 칸 짧은 변의 2%(실측 칸 945px
+    기준 약 19px, 300dpi에서 약 1.6mm -- 최소 칼선 간격 2mm보다도 좁아
+    독립된 스티커 조각이 될 수 없음) 미만 *이면서* 가로세로비가 4:1
+    이상일 때만 버린다. 작은 점/원 같은 진짜 작은 요소는 가로세로비
+    조건에 안 걸리고(게다가 이미 면적 기준 필터가 따로 있음), 길쭉하더라도
+    폭이 충분한 진짜 장식(리본 등)은 짧은 변 조건에 안 걸린다."""
+    x0, y0, x1, y1 = box_px
+    bw, bh = float(x1 - x0), float(y1 - y0)
+    short_side, long_side = min(bw, bh), max(bw, bh)
+    if short_side <= 0:
+        return True
+    cx0, cy0, cx1, cy1 = cell_px
+    cell_short = float(min(cx1 - cx0, cy1 - cy0))
+    threshold = max(min_short_side_px, min_short_side_ratio * cell_short)
+    return short_side < threshold and (long_side / short_side) >= min_aspect_ratio
 
 
 def find_design_bbox_at_point_px(image_path: str, point_px, boxes_px=None, **kwargs):
@@ -2106,6 +2141,34 @@ def map_box_between_frames_px(box_px: tuple, from_frame_px: tuple, to_frame_px: 
     return (rx0, ry0, rx1, ry1)
 
 
+def group_content_cells_px(image_path: str, cell_boxes: list):
+    """빈 칸(실제 내용 없음, `cell_has_content_px`)을 걸러내고, 남은 칸들
+    중 완전히 같은 그림의 반복을 `group_identical_boxes_px`로 묶는다 --
+    칸 안을 낱개로 쪼개지는 않는다. `detect_repeat_aware_sub_element_boxes_px`의
+    앞 단계를 그대로 뽑아낸 것(순수 리팩터링)이고, 2026-09-28부터 무테 자동
+    인식("칸 전체가 스티커 한 장" -- 멍푸 결정)이 이것만 쓴다.
+
+    Returns: (filtered_cells, groups) -- groups는 filtered_cells 인덱스
+    리스트들의 리스트, 각 그룹의 첫 원소가 대표."""
+    filtered = []
+    for box in cell_boxes:
+        try:
+            has_content = cell_has_content_px(image_path, box)
+        except Exception:  # noqa: BLE001
+            has_content = True
+        if has_content:
+            filtered.append(tuple(box))
+
+    if not filtered:
+        return [], []
+
+    try:
+        cell_groups = group_identical_boxes_px(image_path, filtered)
+    except Exception:  # noqa: BLE001
+        cell_groups = [[i] for i in range(len(filtered))]
+    return filtered, cell_groups
+
+
 def detect_repeat_aware_sub_element_boxes_px(image_path: str, cell_boxes: list, suspicious_regions: list = None):
     """2026-09-11(51차) 피드백("똑같은 도안 여러 개일 때 하나는 섬세하게
     작업하고 나머지에 복붙하라고 했는데 아예 각각 엉망으로 인식하고 있어",
@@ -2148,22 +2211,9 @@ def detect_repeat_aware_sub_element_boxes_px(image_path: str, cell_boxes: list, 
     넘기면 시트 전체에서 "내용은 있는데 끝내 못 찾은" 큰 영역들을 원본 이미지
     좌표로 모아준다(각 대표 칸 처리마다 그대로 누적) -- gui.app이 자동 인식
     완료 후 "이 부분 확인해 보세요" 안내를 띄우는 용도."""
-    filtered = []
-    for box in cell_boxes:
-        try:
-            has_content = cell_has_content_px(image_path, box)
-        except Exception:  # noqa: BLE001
-            has_content = True
-        if has_content:
-            filtered.append(tuple(box))
-
+    filtered, cell_groups = group_content_cells_px(image_path, cell_boxes)
     if not filtered:
         return [], []
-
-    try:
-        cell_groups = group_identical_boxes_px(image_path, filtered)
-    except Exception:  # noqa: BLE001
-        cell_groups = [[i] for i in range(len(filtered))]
 
     boxes = []
     groups = []

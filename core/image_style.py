@@ -1085,6 +1085,7 @@ def generate_style_cutline(
     supersample: int = 4,
     note_sink: Optional[list] = None,
     sibling_boxes_px: Optional[list] = None,
+    precomputed_content_px=None,
 ) -> Polygon:
     """
     Returns a single Polygon -- the one cutline this style calls for. No
@@ -1136,6 +1137,19 @@ def generate_style_cutline(
     `_bridge_into_one_shape`가 여러 색 영역으로 이루어진 캐릭터(예: 몸통
     색과 옷 색이 크게 다른 경우)의 전체 실루엣을 놓치지 않는지부터 실제
     파일로 검증해야 한다.
+
+    `precomputed_content_px`: 2026-09-28 "갬뱃(GrabCut)을 지원하는 보조
+    기능"(트라이맵 힌트 보정 도구, core.segmentation.segment_design_with_hints)
+    연동용. 기본값 None(동작 변화 없음)이면 지금까지와 완전히 동일하게 이
+    함수 안에서 직접 segment_design_in_region을 호출한다. 값이 주어지면
+    (사람이 힌트를 찍어 이미 다시 계산해둔 실루엣, 원본 이미지 절대 픽셀
+    좌표의 Polygon/MultiPolygon) LINE_ART(유테) 분기에서 그 값을 그대로
+    실루엣으로 쓰고 GrabCut 재계산은 건너뛴다 -- 이후의 모든 후처리
+    (형제 스필오버 제거, 저대비 헤일로 확장, 안내선 감지, 매끄럽게 다듬기,
+    margin_mm 바깥 오프셋)는 기존과 완전히 동일하게 이어서 적용되므로,
+    "사람이 검증한 실루엣이 항상 이 프로젝트의 다른 모든 안전장치를 그대로
+    통과한다"는 것이 보장된다. BORDERLESS(무테)는 GrabCut을 쓰지 않으므로
+    이 값을 무시한다(무테 자동 인식은 칸 한 장을 사각형으로 안쪽에 자름).
     """
     if margin_mm < MIN_STYLE_MARGIN_MM:
         if note_sink is not None:
@@ -1362,10 +1376,18 @@ def generate_style_cutline(
     # LINE_ART (유테)
     if selection_px is None:
         raise ValueError("유테(LINE_ART) 스타일은 캐릭터 하나를 가리키는 selection_px가 필요합니다.")
-    design = segment_design_in_region(
-        image_path, selection_px, margin_px=grabcut_margin_px,
-        supersample=supersample, note_sink=note_sink,
-    )
+    if precomputed_content_px is not None:
+        design = precomputed_content_px
+        if note_sink is not None:
+            note_sink.append(
+                "사람이 직접 확인/보정한 실루엣(트라이맵 힌트)을 사용해 실루엣 추적을 "
+                "다시 하지 않았습니다."
+            )
+    else:
+        design = segment_design_in_region(
+            image_path, selection_px, margin_px=grabcut_margin_px,
+            supersample=supersample, note_sink=note_sink,
+        )
     # 2026-09-26("포들 얼굴 이중 칼선", 한 달째 미해결): GrabCut이 옆
     # sibling 요소의 일부를 내 것으로 잘못 집어와 서로 안 붙은 별개 조각을
     # 만드는 경우, 기존 "내 selection_px 안은 무조건 보존" 안전장치 때문에

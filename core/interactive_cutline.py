@@ -224,6 +224,7 @@ def generate_cutline_by_style(
     grabcut_margin_px: int = 40,
     supersample: int = 4,
     sibling_boxes_px: Optional[list] = None,
+    precomputed_content_px=None,
 ) -> CutlineResult:
     """
     The real, everyday case (core.image_style): 유테 (line-art character on
@@ -240,6 +241,10 @@ def generate_cutline_by_style(
     Wraps core.image_style.generate_style_cutline into a full CutlineResult
     so it's a drop-in for the same render_preview()/export_svg() calls the
     multi-tier workflow uses.
+
+    `precomputed_content_px`: core.image_style.generate_style_cutline로 그대로
+    전달되는 통과 인자 -- 트라이맵 힌트로 이미 보정된 실루엣을 재사용할 때만
+    쓴다(그 함수 문서 참고). 기본값 None은 기존과 동일하게 동작.
     """
     notes: list = []
     line = generate_style_cutline(
@@ -253,6 +258,7 @@ def generate_cutline_by_style(
         supersample=supersample,
         note_sink=notes,
         sibling_boxes_px=sibling_boxes_px,
+        precomputed_content_px=precomputed_content_px,
     )
     if isinstance(line, Polygon):
         line_mp = MultiPolygon([line]) if not line.is_empty else MultiPolygon([])
@@ -274,6 +280,56 @@ def generate_cutline_by_style(
         offset_mm=OffsetSpec(
             safety_mm=effective_margin_mm, cut_mm=effective_margin_mm, bleed_mm=effective_margin_mm
         ),
+        adjustments=notes,
+    )
+
+
+def generate_card_inset_cutline(
+    image_path: str,
+    card_px: tuple,
+    dpi: float,
+    margin_mm: float = 1.2,
+) -> CutlineResult:
+    """
+    무테 자동 인식 전용(2026-09-28 멍푸 결정 "무테는 칸 전체 한 장"): 칸(카드)
+    하나 = 스티커 한 장. 칸 이미지 가장자리(card_px 사각형)에서 margin_mm
+    만큼 *안쪽*에 사각형 칼선 하나만 만든다. 칸 안의 캐릭터/소품을 따로
+    오려내지 않으므로 배경 그림을 자르는 일이 없고, 칼선이 칸 밖(옆 칸과의
+    틈, 시트 여백)으로 나가는 일도 없다.
+
+    margin_mm은 무테/유테 공통 최소값(MIN_STYLE_MARGIN_MM, 0.5mm) 아래로는
+    내려가지 않으며, 올린 경우 adjustments에 남긴다. 칸이 너무 작아 안쪽으로
+    줄이면 사라지는 경우(비정상 칸)는 예외를 던져 호출하는 쪽의 실패 목록에
+    올라가게 한다(조용히 빈 칼선을 만들지 않음).
+    """
+    from .image_style import MIN_STYLE_MARGIN_MM
+
+    notes: list = []
+    if margin_mm < MIN_STYLE_MARGIN_MM:
+        notes.append(
+            f"입력한 간격({margin_mm:g}mm)이 너무 좁아 인쇄/커팅 밀림에도 안전하도록 "
+            f"최소값 {MIN_STYLE_MARGIN_MM:g}mm로 자동 조정했습니다."
+        )
+        margin_mm = MIN_STYLE_MARGIN_MM
+    x0, y0, x1, y1 = card_px
+    card = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    # join_style=2(mitre): 카드 모서리는 칸 모서리 그대로 각지게 유지.
+    line = card.buffer(-mm_to_px(margin_mm, dpi), join_style=2)
+    if line.is_empty:
+        raise ValueError(
+            f"칸이 너무 작아 {margin_mm:g}mm 안쪽으로 칼선을 넣을 수 없습니다."
+        )
+    notes.append(f"무테: 칸 한 장을 이미지 가장자리에서 {margin_mm:g}mm 안쪽으로 잘랐습니다.")
+    with Image.open(image_path) as im:
+        w, h = im.size
+    line_mp = MultiPolygon([line]) if isinstance(line, Polygon) else line
+    return CutlineResult(
+        dpi=dpi,
+        width_px=w,
+        height_px=h,
+        design=line_mp,
+        offsets={"cut": line_mp},
+        offset_mm=OffsetSpec(safety_mm=margin_mm, cut_mm=margin_mm, bleed_mm=margin_mm),
         adjustments=notes,
     )
 

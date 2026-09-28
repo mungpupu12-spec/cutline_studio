@@ -49,11 +49,16 @@ def test_tutorial_slide3_lines_fit_without_rewrapping():
     check("튜토리얼 슬라이드가 최소 3개 이상 존재", len(TUTORIAL_SLIDES) >= 3)
     _fname, caption = TUTORIAL_SLIDES[2]
     check("3번 슬라이드 캡션에 어색한 이중 띄어쓰기('진행 하면')가 더 이상 없음", "진행 하면" not in caption)
-    check("3번 슬라이드 캡션이 여러 줄로 미리 나뉘어 있음(자동 줄바꿈에만 의존하지 않음)", "\n" in caption)
-
     full = f"3. {caption}"
     font = app.font_body
     wraplength = 380  # 대화상자의 캡션 라벨에 실제로 쓰는 값 (gui/app.py 참고)
+    # 이후 디자인 수정으로 캡션이 한 줄짜리 짧은 문장으로 바뀌었다 -- 목적은
+    # "들쭉날쭉한 자동 줄바꿈이 안 생기는 것"이므로, 미리 나뉘어 있거나 애초에
+    # 한 줄에 다 들어가면 통과.
+    check(
+        "3번 슬라이드 캡션이 미리 나뉘어 있거나 한 줄에 다 들어감(자동 줄바꿈에 의존하지 않음)",
+        "\n" in caption or font.measure(full) <= wraplength,
+    )
     for line in full.split("\n"):
         w = font.measure(line)
         check(

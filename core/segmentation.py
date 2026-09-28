@@ -267,6 +267,30 @@ def segment_design_in_region(
     # clean alpha/near-white designs, applied here to GrabCut's mask edge --
     # keeps cutline fidelity consistent regardless of which path a design
     # came in through.
+    #
+    # 2026-09-28(67차, GrabCut 보조 기능 작업): 이 아래 "native_mask 확보 이후"
+    # 후처리 전체를 segment_design_with_hints(트라이맵 힌트 보정 도구)와 공유할
+    # 수 있도록 _polygons_from_native_mask로 뽑아냈다 -- 이 함수(기존, 이미
+    # 검증된 경로) 쪽은 그 헬퍼를 그대로 호출하기만 해서 동작이 한 글자도
+    # 바뀌지 않는다(순수 리팩터링, 전체 회귀 스위트로 확인).
+    return _polygons_from_native_mask(
+        native_mask, x0, y0, supersample, simplify_tol_px, min_area_px
+    )
+
+
+def _polygons_from_native_mask(
+    native_mask: np.ndarray,
+    x0: int,
+    y0: int,
+    supersample: int,
+    simplify_tol_px: float,
+    min_area_px: float,
+) -> MultiPolygon:
+    """`segment_design_in_region`의 "native_mask 확보 이후" 후처리(디노이즈 ->
+    서브픽셀 supersample -> 컨투어 추출 -> 작은 노이즈/내부 디테일 조각 판정
+    -> 크롭 로컬 좌표에서 원본 이미지 좌표로 이동 -> union)를 공유 함수로
+    뽑아둔 것 -- segment_design_in_region과 segment_design_with_hints(트라이맵
+    힌트 보정 도구) 둘 다 이 함수를 호출해서 완전히 동일한 후처리를 받는다."""
     kernel = np.ones((3, 3), np.uint8)
     native_mask = cv2.morphologyEx(native_mask, cv2.MORPH_OPEN, kernel)
     native_mask = cv2.morphologyEx(native_mask, cv2.MORPH_CLOSE, kernel)
@@ -354,6 +378,145 @@ def segment_design_in_region(
     if isinstance(design, Polygon):
         design = MultiPolygon([design])
     return design
+
+
+def segment_design_with_hints(
+    image_path: str,
+    rect_px: tuple,
+    fg_hints_px: list | None = None,
+    bg_hints_px: list | None = None,
+    hint_radius_px: float = 10.0,
+    margin_px: int = 40,
+    iterations: int = 5,
+    supersample: int = 4,
+    simplify_tol_px: float = 0.6,
+    min_area_px: float = 25.0,
+    note_sink: list | None = None,
+    max_grabcut_dim: int = 420,
+) -> MultiPolygon:
+    """2026-09-28 "갬뱃(GrabCut)을 지원하는 보조 기능" 1차: 저대비/약한 경계
+    때문에 GrabCut이 실루엣 일부(또는 전체)를 놓쳤을 때, 사람이 "여긴 확실히
+    캐릭터(전경)다" / "여긴 확실히 배경이다"라고 원본 이미지 위에 점 찍어
+    표시한 힌트를 실제로 GrabCut 재계산에 반영하는 트라이맵(trimap) 보정
+    도구.
+
+    자동으로 아무것도 고치지 않는다 -- 사람이 직접 확인하고 표시한 좌표만
+    받아서 그 지점 주변(hint_radius_px)만 "무조건 확정"으로 덮어쓴 뒤 다시
+    계산한다. segment_design_in_region(기존, 이미 검증된 자동 경로)은 이
+    함수 안에서 전혀 호출되지 않고 완전히 별도로 동작하므로, 이 기능을 새로
+    추가해도 기존 자동 인식 결과는 단 하나도 바뀌지 않는다(회귀 위험 없음).
+
+    동작 원리: 먼저 기존과 동일하게 rect_px 기반 GrabCut(GC_INIT_WITH_RECT)을
+    한 번 돌려 뼈대 마스크(GC_PR_FGD/GC_PR_BGD)를 얻는다. 힌트가 하나도 없으면
+    거기서 멈추고(기존 경로와 동등하게 저대비 실패 시 외곽선 폴백까지 적용),
+    힌트가 있으면 그 위에 사람이 준 점 주변만 GC_FGD/GC_BGD로 확정 표시해서
+    GC_INIT_WITH_MASK로 한 번 더 반복 -- OpenCV 문서가 설명하는 표준
+    트라이맵 보정 방식과 동일하다.
+
+    `rect_px`, `fg_hints_px`, `bg_hints_px`는 전부 원본 이미지의 절대 픽셀
+    좌표(GUI에서 이미 쓰고 있는 좌표계와 동일) -- 이 함수 내부에서만 크롭/
+    축소 좌표로 변환한다.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    h, w = img.shape[:2]
+
+    x0, y0, x1, y1 = [int(round(v)) for v in rect_px]
+    x0, y0 = max(0, x0 - margin_px), max(0, y0 - margin_px)
+    x1, y1 = min(w, x1 + margin_px), min(h, y1 + margin_px)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("Selection rectangle is empty/out of bounds.")
+
+    crop = img[y0:y1, x0:x1]
+    requested_supersample = supersample
+    supersample = auto_supersample(x1 - x0, y1 - y0, requested=requested_supersample)
+    if supersample != requested_supersample and note_sink is not None:
+        note_sink.append(
+            f"선택 영역({x1-x0}x{y1-y0}px)이 커서 정밀도를 {requested_supersample}x -> "
+            f"{supersample}x로 자동 조정했습니다 (처리 속도 보호)"
+        )
+
+    inner = (
+        max(0, int(round(rect_px[0])) - x0),
+        max(0, int(round(rect_px[1])) - y0),
+        min(crop.shape[1], int(round(rect_px[2])) - x0) - max(0, int(round(rect_px[0])) - x0),
+        min(crop.shape[0], int(round(rect_px[3])) - y0) - max(0, int(round(rect_px[1])) - y0),
+    )
+
+    crop_h, crop_w = crop.shape[:2]
+    gc_scale = 1.0
+    longest = max(crop_h, crop_w)
+    if max_grabcut_dim and longest > max_grabcut_dim:
+        gc_scale = max_grabcut_dim / float(longest)
+    if gc_scale < 1.0:
+        gc_crop = cv2.resize(
+            crop, (max(1, round(crop_w * gc_scale)), max(1, round(crop_h * gc_scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        gc_inner = tuple(max(0, int(round(v * gc_scale))) for v in inner)
+    else:
+        gc_crop = crop
+        gc_inner = inner
+
+    gc_mask = np.zeros(gc_crop.shape[:2], np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    cv2.setRNGSeed(GRABCUT_RNG_SEED)
+    cv2.grabCut(gc_crop, gc_mask, gc_inner, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_RECT)
+
+    fg_hints_px = fg_hints_px or []
+    bg_hints_px = bg_hints_px or []
+    any_hints = bool(fg_hints_px) or bool(bg_hints_px)
+    if any_hints:
+        gh, gw = gc_mask.shape[:2]
+        hint_radius_scaled = max(1, int(round(hint_radius_px * gc_scale)))
+
+        def _stamp_hints(points, label):
+            for (hx, hy) in points:
+                lx = (hx - x0) * gc_scale
+                ly = (hy - y0) * gc_scale
+                if not (0 <= lx < gw and 0 <= ly < gh):
+                    continue
+                cv2.circle(gc_mask, (int(round(lx)), int(round(ly))), hint_radius_scaled, label, -1)
+
+        # 배경 힌트를 먼저 찍고 전경 힌트를 나중에 찍어서, 만약 두 힌트가
+        # 실수로 겹치면 "확실히 전경"이라는 사람의 표시가 우선하게 한다.
+        _stamp_hints(bg_hints_px, cv2.GC_BGD)
+        _stamp_hints(fg_hints_px, cv2.GC_FGD)
+        cv2.setRNGSeed(GRABCUT_RNG_SEED)
+        cv2.grabCut(gc_crop, gc_mask, gc_inner, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_MASK)
+        if note_sink is not None:
+            note_sink.append(
+                f"사용자 힌트(전경 {len(fg_hints_px)}개 / 배경 {len(bg_hints_px)}개)를 반영해 "
+                f"실루엣을 다시 계산했습니다."
+            )
+
+    native_mask = np.where(
+        (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
+    if gc_scale < 1.0:
+        native_mask = cv2.resize(native_mask, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+        _, native_mask = cv2.threshold(native_mask, 127, 255, cv2.THRESH_BINARY)
+
+    # 힌트가 전혀 없을 때는 기존 segment_design_in_region과 동등하게 동작하도록
+    # (이 함수를 힌트 없이 호출해도 결과가 달라지지 않게) 같은 저대비 폴백을
+    # 적용한다.
+    inner_area = max(1, inner[2] * inner[3])
+    native_area = int((native_mask > 0).sum())
+    if native_area < 0.15 * inner_area and not any_hints:
+        edge_mask = _edge_outline_mask(crop, inner)
+        if edge_mask is not None and int((edge_mask > 0).sum()) > native_area:
+            native_mask = edge_mask
+            if note_sink is not None:
+                note_sink.append(
+                    "배경과 도안의 색 구분이 어려워, 도안에 그려진 외곽선을 기준으로 "
+                    "실루엣을 추적했습니다."
+                )
+
+    return _polygons_from_native_mask(
+        native_mask, x0, y0, supersample, simplify_tol_px, min_area_px
+    )
 
 
 def _drop_attached_fragments(

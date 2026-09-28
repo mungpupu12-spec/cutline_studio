@@ -71,16 +71,19 @@ from core.cutline_core import generate_cutlines, OffsetSpec, px_to_mm
 from core.cutline_types import CutlineType
 from core.image_style import ImageStyle, DEFAULT_STYLE_MARGIN_MM, _measure_content_bbox_px
 from core.interactive_cutline import (
+    generate_card_inset_cutline,
     generate_cutline_auto,
     generate_cutline_by_style,
     generate_cutline_for_selection,
     is_silhouette_undersized,
 )
+from core.segmentation import segment_design_with_hints
 from core.style_classify import rectangularity as _shape_rectangularity
 from core.multi_design import (
     cell_has_content_px,
     detect_design_bboxes_px,
     detect_repeat_aware_sub_element_boxes_px,
+    group_content_cells_px,
     expand_box_to_neighbor_midpoint_px,
     find_design_bbox_at_point_px,
     group_identical_boxes_px,
@@ -222,6 +225,37 @@ def _undersized_retry_note(ratio_pct: float, fallback_design) -> str:
 # 오탐이 적다.
 _SPLIT_WARNING_GAP_PX = 25.0  # 이 거리 이하로 붙어있으면 경고(segmentation.py의 20.0에 약간의 여유를 더함)
 _SPLIT_WARNING_MIN_AREA_PX = 200.0  # 이보다 작은 조각은 잡티/노이즈로 보고 무시
+
+
+def _collect_warning_notes(adjustments):
+    """combine_results가 만든 안내 문구 목록에서 사람이 확인해야 할 경고(⚠)만
+    골라 돌려준다. "[N번째 영역] ⚠ ..." 형태의 항목별 경고는 같은 문구끼리
+    묶어 "(3·5·9번째 영역, 총 3곳)"처럼 한 줄로 만든다. 반환:
+    (경고 문구 목록, {묶은 문구: 첫 번째 영역 번호})."""
+    import re as _re
+    top: list = []
+    grouped: dict = {}
+    order: list = []
+    for note in adjustments or []:
+        if note.startswith("⚠"):
+            top.append(note)
+            continue
+        m = _re.match(r"^\[(\d+)번째 영역\] (⚠.*)$", note)
+        if m:
+            msg = m.group(2)
+            if msg not in grouped:
+                grouped[msg] = []
+                order.append(msg)
+            grouped[msg].append(int(m.group(1)))
+    lines = list(top)
+    first_region: dict = {}
+    for msg in order:
+        nums = grouped[msg]
+        shown = "·".join(str(n) for n in nums[:8]) + ("…" if len(nums) > 8 else "")
+        line = f"{msg} ({shown}번째 영역, 총 {len(nums)}곳)"
+        lines.append(line)
+        first_region[line] = nums[0]
+    return lines, first_region
 
 
 def _split_overlap_warning_note(design) -> str | None:
@@ -614,6 +648,24 @@ class CutLineApp(ctk.CTk):
         self._nav_highlight_rect_id = None
         self._nav_highlight_halo_id = None
         self._last_suspicious_regions_px = []
+        # 2026-09-28(GrabCut 보조 기능 -- 트라이맵 힌트 보정 도구): 화면에서
+        # 직접 "여긴 확실히 전경/배경"이라고 점 찍어 GrabCut 실루엣을 다시
+        # 계산하는 수동 보정 모드의 상태. self._grabcut_hint_meta는
+        # self._accumulated의 각 인덱스가 "어느 실루엣 추적 결과인지"(원본
+        # 박스/margin_mm/dpi/같은 반복 그룹의 다른 인덱스들)를 기록해둔
+        # 것 -- _run_auto_detect_and_add_all에서 유테(LINE_ART) 실루엣
+        # 추적이 실제로 쓰인 항목만 채워 넣으므로, 이 정보가 있는 항목만
+        # 힌트 보정 대상으로 제안한다(다른 경로로 추가된 항목은 그대로 두고
+        # 아무 영향 없음).
+        self._hint_mode_active = False
+        self._hint_target_index = None
+        self._hint_new_box_px = None
+        self._hint_fg_points_px = []
+        self._hint_bg_points_px = []
+        self._hint_current_label = "fg"
+        self._hint_marker_ids = []
+        self._hint_panel = None
+        self._grabcut_hint_meta = {}
         # 2026-09-08 피드백("확대 축소 기능에 손바닥 모양의 이동할 수 있는
         # 기능 추가"): 확대했을 때 스크롤바만으로는 이동이 불편하다는 지적
         # -- "이동(패닝)" 버튼을 눌러 켜면 캔버스 위 마우스 커서가 손바닥
@@ -2597,6 +2649,427 @@ class CutLineApp(ctk.CTk):
         )
         self.preview_canvas.tag_raise(self._nav_highlight_rect_id, self._nav_highlight_halo_id)
 
+    # ---- 2026-09-28(GrabCut 보조 기능 -- 트라이맵 힌트 보정 도구): 화면에서
+    # 직접 "여긴 확실히 전경/배경"이라고 점을 찍어 GrabCut 실루엣을 다시
+    # 계산하는 수동 보정. 자동 수정이 아니라 사람이 확인/지정한 곳만
+    # 반영한다는 이 프로젝트의 기존 원칙을 그대로 따른다 -- 다만 한 칸에
+    # 준 힌트는(멍푸 요청 "반복 칸에 자동 적용") 같은 반복 그룹의 나머지
+    # 칸에도 자동으로 복제된다(이 복제 자체는 기존 fit_cutline_result_to_box
+    # 와 완전히 같은, 이미 검증된 메커니즘).
+    def _find_accumulated_index_for_box(self, box_px, min_iou=0.3):
+        """`box_px`(원본 이미지 좌표, 보통 의심 영역 경고의 좌표)와 가장 많이
+        겹치는 self._grabcut_hint_meta 항목의 self._accumulated 인덱스를
+        찾는다. IoU가 min_iou 미만이면 대응하는 항목이 없다고 보고 None."""
+        if not box_px:
+            return None
+        bx0, by0, bx1, by1 = box_px
+        b_area = max(1.0, (bx1 - bx0) * (by1 - by0))
+        best_idx, best_iou = None, 0.0
+        for idx, meta in self._grabcut_hint_meta.items():
+            if idx >= len(self._accumulated):
+                continue
+            mx0, my0, mx1, my1 = meta["box_px"]
+            ix0, iy0 = max(bx0, mx0), max(by0, my0)
+            ix1, iy1 = min(bx1, mx1), min(by1, my1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            m_area = max(1.0, (mx1 - mx0) * (my1 - my0))
+            union = b_area + m_area - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best_idx = iou, idx
+        return best_idx if best_iou >= min_iou else None
+
+    def _subtract_existing_cutlines(self, design, box_px):
+        """`design`(원본 좌표 실루엣)에서 이미 누적된 칼선 영역을 빼고, 새로
+        남은 의미 있는 조각만 돌려준다(없으면 None). 새 도안 추가 시 같은
+        요소에 칼선이 두 겹 생기는 것(이중 칼선)을 막는 용도."""
+        from shapely.geometry import MultiPolygon, box as _sbox
+        from shapely.ops import unary_union as _union
+
+        if design is None or design.is_empty:
+            return None
+        region = _sbox(*box_px)
+        existing = [
+            it.design for it in self._accumulated
+            if it.design is not None and not it.design.is_empty and it.design.intersects(region)
+        ]
+        remaining = design
+        if existing:
+            # 칼선 폭/경계 오차만큼 살짝 넓혀서 빼야 칼선 바로 바깥의 가는
+            # 띠가 "새 조각"으로 남지 않는다.
+            remaining = design.difference(_union(existing).buffer(6.0))
+        parts = list(remaining.geoms) if hasattr(remaining, "geoms") else [remaining]
+        bx0, by0, bx1, by1 = box_px
+        min_area = max(1500.0, 0.002 * (bx1 - bx0) * (by1 - by0))
+        kept = [p for p in parts if not p.is_empty and p.area >= min_area]
+        if not kept:
+            return None
+        # 빼는 과정에서 생긴 톱니 가장자리는 이후 유테 경로의 매끄럽게
+        # 다듬기가 정리한다(실제 요소 경계 쪽은 원래 실루엣 그대로).
+        return MultiPolygon(kept) if len(kept) > 1 else kept[0]
+
+    def _start_hint_correction(self, box_px):
+        """"힌트로 보정" 버튼 핸들러 -- 트라이맵 힌트 보정 도구 진입점.
+
+        2026-09-28 실제 파일로 검증하며 발견한 것: "의심 영역" 경고가 항상
+        "이미 인식된 도안인데 GrabCut이 잘못 잡은" 경우만은 아니었다 --
+        배경과 색이 비슷한 장식(실측: 10칸 시트의 양배추 장식 2개)은 애초에
+        낱개 요소 "박스" 탐지 단계에서부터 통째로 빠져서, 자동 인식 결과
+        어디에도 대응하는 항목 자체가 없는 경우가 실제로 있었다. 그래서
+        대응하는 기존 항목을 찾으면(match_idx) 그것을 고치고, 못 찾으면
+        이 좌표를 그대로 "새 도안"으로 다뤄서 처음부터 만든다 -- 두 경우
+        모두 사람이 힌트를 찍어야 하는 것은 같고, 차이는 재계산 후 기존
+        항목을 교체하느냐 새로 추가하느냐뿐이다."""
+        match_idx = self._find_accumulated_index_for_box(box_px)
+        self._hint_mode_active = True
+        self._hint_fg_points_px = []
+        self._hint_bg_points_px = []
+        self._hint_current_label = "fg"
+        if match_idx is not None:
+            meta = self._grabcut_hint_meta[match_idx]
+            self._hint_target_index = match_idx
+            self._hint_new_box_px = None
+            self._navigate_preview_to_original_box(meta["box_px"])
+        else:
+            self._hint_target_index = None
+            self._hint_new_box_px = tuple(box_px)
+            self._navigate_preview_to_original_box(box_px)
+        self._show_hint_correction_panel(is_new=match_idx is None)
+
+    def _show_hint_correction_panel(self, is_new=False):
+        """힌트 그리기 모드용 비모달 패널 -- 전경/배경 점 찍기 전환, 다시
+        계산, 초기화, 닫기(모드 종료) 버튼을 담는다. _show_suspicious_
+        regions_dialog와 같은 이유로 모달이 아니다(캔버스를 계속 봐야 함)."""
+        if self._hint_panel is not None:
+            try:
+                self._hint_panel.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._hint_panel = None
+
+        panel = ctk.CTkToplevel(self)
+        panel.title(APP_TITLE)
+        panel.resizable(False, False)
+        try:
+            panel.configure(fg_color=BG_APP)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            panel.transient(self)
+        except Exception:  # noqa: BLE001
+            pass
+
+        wrap = ctk.CTkFrame(
+            panel, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER,
+        )
+        wrap.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            wrap, text="힌트로 실루엣 보정", font=self.font_section, text_color=ACCENT,
+            anchor="w", justify="left", wraplength=320,
+        ).pack(fill="x", padx=18, pady=(16, 4))
+        desc = (
+            "미리보기에서 확실히 캐릭터(전경)인 곳과 확실히 배경인 곳을 "
+            "각각 클릭해 점을 찍은 뒤 '다시 계산'을 누르세요. 자동으로 "
+            "고치지 않고, 표시한 곳만 반영해 다시 계산합니다."
+        )
+        if is_new:
+            desc += (
+                " 이 위치는 자동 인식에서 아예 빠져 있던 자리라, 새 도안으로 "
+                "추가됩니다."
+            )
+        ctk.CTkLabel(
+            wrap, text=desc, font=self.font_caption, text_color=TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=320,
+        ).pack(fill="x", padx=18, pady=(0, 8))
+
+        self._hint_status_var = tk.StringVar(value="")
+        self._update_hint_status_text()
+        ctk.CTkLabel(
+            wrap, textvariable=self._hint_status_var, font=self.font_caption,
+            text_color=TEXT_PRIMARY, anchor="w", justify="left", wraplength=320,
+        ).pack(fill="x", padx=18, pady=(0, 8))
+
+        mode_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        mode_row.pack(fill="x", padx=18, pady=(0, 8))
+        self._hint_fg_btn = ctk.CTkButton(
+            mode_row, text="🟢 전경(캐릭터) 점", font=self.font_caption,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
+            corner_radius=8, width=150, height=28,
+            command=lambda: self._set_hint_label("fg"),
+        )
+        self._hint_fg_btn.pack(side="left")
+        self._hint_bg_btn = ctk.CTkButton(
+            mode_row, text="🔴 배경 점", font=self.font_caption,
+            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=8, width=110, height=28,
+            command=lambda: self._set_hint_label("bg"),
+        )
+        self._hint_bg_btn.pack(side="left", padx=(8, 0))
+
+        action_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        action_row.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkButton(
+            action_row, text="초기화", font=self.font_caption,
+            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=8, width=90, height=28,
+            command=self._clear_hint_points,
+        ).pack(side="left")
+
+        self._btn_primary(wrap, "다시 계산", self._recompute_with_hints).pack(
+            fill="x", padx=18, pady=(4, 4)
+        )
+        ctk.CTkButton(
+            wrap, text="닫기", font=self.font_caption,
+            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
+            border_width=1, border_color=BORDER, corner_radius=8,
+            command=self._exit_hint_mode,
+        ).pack(fill="x", padx=18, pady=(0, 16))
+
+        try:
+            panel.lift()
+        except Exception:  # noqa: BLE001
+            pass
+
+        self.update_idletasks()
+        try:
+            panel.update_idletasks()
+            px, py = self.winfo_rootx(), self.winfo_rooty()
+            panel.geometry(f"+{px + 24}+{py + 60}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._hint_panel = panel
+        self._update_hint_mode_buttons()
+
+    def _update_hint_status_text(self):
+        if not hasattr(self, "_hint_status_var"):
+            return
+        self._hint_status_var.set(
+            f"전경 점 {len(self._hint_fg_points_px)}개 / 배경 점 {len(self._hint_bg_points_px)}개"
+        )
+
+    def _update_hint_mode_buttons(self):
+        if not hasattr(self, "_hint_fg_btn"):
+            return
+        is_fg = self._hint_current_label == "fg"
+        self._hint_fg_btn.configure(
+            fg_color=ACCENT if is_fg else "transparent",
+            text_color="#FFFFFF" if is_fg else TEXT_PRIMARY,
+            border_width=0 if is_fg else 1,
+        )
+        self._hint_bg_btn.configure(
+            fg_color="#C0392B" if not is_fg else "transparent",
+            text_color="#FFFFFF" if not is_fg else TEXT_PRIMARY,
+            border_width=0 if not is_fg else 1,
+        )
+
+    def _set_hint_label(self, label):
+        self._hint_current_label = label
+        self._update_hint_mode_buttons()
+
+    def _on_hint_click_at_point(self, cx, cy):
+        """힌트 그리기 모드에서 캔버스 클릭 -- 캔버스 좌표를 원본 이미지
+        좌표로 되돌려 현재 선택된 라벨(전경/배경) 점 목록에 추가한다."""
+        scale = self._display_scale or 1.0
+        ox, oy = cx / scale, cy / scale
+        if self._hint_current_label == "fg":
+            self._hint_fg_points_px.append((ox, oy))
+        else:
+            self._hint_bg_points_px.append((ox, oy))
+        self._update_hint_status_text()
+        self._redraw_hint_markers()
+
+    def _redraw_hint_markers(self):
+        for marker_id in self._hint_marker_ids:
+            try:
+                self.preview_canvas.delete(marker_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._hint_marker_ids = []
+        scale = self._display_scale or 1.0
+        r = 5
+        for (ox, oy) in self._hint_fg_points_px:
+            cx, cy = ox * scale, oy * scale
+            mid = self.preview_canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r, fill="#2ECC71", outline="#FFFFFF", width=2,
+            )
+            self._hint_marker_ids.append(mid)
+        for (ox, oy) in self._hint_bg_points_px:
+            cx, cy = ox * scale, oy * scale
+            mid = self.preview_canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r, fill="#E74C3C", outline="#FFFFFF", width=2,
+            )
+            self._hint_marker_ids.append(mid)
+
+    def _clear_hint_points(self):
+        self._hint_fg_points_px = []
+        self._hint_bg_points_px = []
+        self._update_hint_status_text()
+        self._redraw_hint_markers()
+
+    def _exit_hint_mode(self):
+        self._hint_mode_active = False
+        self._hint_target_index = None
+        self._hint_new_box_px = None
+        self._hint_fg_points_px = []
+        self._hint_bg_points_px = []
+        for marker_id in self._hint_marker_ids:
+            try:
+                self.preview_canvas.delete(marker_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._hint_marker_ids = []
+        if self._hint_panel is not None:
+            try:
+                self._hint_panel.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._hint_panel = None
+
+    def _recompute_with_hints(self):
+        """"다시 계산" 버튼 핸들러 -- segment_design_with_hints로 대표
+        인스턴스의 실루엣만 다시 계산하고, 같은 반복 그룹의 나머지 칸에는
+        (멍푸 요청 "반복 칸에 자동 적용") fit_cutline_result_to_box로 그
+        보정된 모양을 그대로 복제한다.
+
+        `self._hint_target_index`가 있으면(기존 자동 인식 항목을 보정)
+        그 항목과 같은 반복 그룹 전체를 교체하고, 없으면(self._hint_new_box_px
+        -- 애초에 도안 박스로도 인식되지 못했던 자리, _start_hint_correction
+        문서 참고) 이 좌표를 새 도안으로 추가한다."""
+        is_new = self._hint_target_index is None
+        if is_new and self._hint_new_box_px is None:
+            return
+        if not self._hint_fg_points_px and not self._hint_bg_points_px:
+            self._show_note_dialog(
+                "점을 먼저 찍어주세요",
+                ["전경(캐릭터) 또는 배경 점을 하나 이상 찍은 뒤 다시 계산할 수 있습니다."],
+                kind="error",
+            )
+            return
+        if is_new:
+            rep_box = self._hint_new_box_px
+            margin_mm = self.style_margin_mm.get()
+            dpi = self.dpi.get()
+            style_name = "LINE_ART"  # 힌트 보정은 유테/마스킹테이프(실루엣 추적) 전용
+        else:
+            meta = self._grabcut_hint_meta.get(self._hint_target_index)
+            if meta is None:
+                return
+            rep_box = meta["box_px"]
+            margin_mm = meta["margin_mm"]
+            dpi = meta["dpi"]
+            style_name = meta.get("style", "LINE_ART")
+        path = self.input_path.get().strip()
+        if not path or not os.path.isfile(path):
+            self._show_note_dialog("파일을 찾을 수 없습니다", ["원본 도안 파일을 다시 확인해주세요."], kind="error")
+            return
+
+        self.status.set("힌트를 반영해 실루엣을 다시 계산하는 중...")
+        self.update_idletasks()
+        try:
+            note_sink: list = []
+            corrected = segment_design_with_hints(
+                path, rep_box,
+                fg_hints_px=list(self._hint_fg_points_px),
+                bg_hints_px=list(self._hint_bg_points_px),
+                supersample=self.precision.get(),
+                note_sink=note_sink,
+            )
+            if is_new:
+                # 2026-09-28(멍푸 "이중 칼선" 지적): 새 도안 추가 경로는 경고
+                # 영역 전체를 다시 추적하므로, 그 안에 이미 칼선이 있는 요소
+                # (예: 옆의 강아지들)까지 또 잡혀 같은 요소에 칼선이 두 겹이
+                # 된다. 이미 있는 칼선 영역을 빼고, 새로 생긴 조각(빠져 있던
+                # 요소)만 남긴다.
+                corrected = self._subtract_existing_cutlines(corrected, rep_box)
+                if corrected is None:
+                    self._show_note_dialog(
+                        "새로 추가할 도안이 없습니다",
+                        [
+                            "힌트로 다시 찾은 모양이 전부 이미 칼선이 있는 요소였습니다.",
+                            "빠진 요소 안쪽에 초록 점을 찍고 다시 계산해보세요.",
+                        ],
+                        kind="info",
+                    )
+                    self.status.set("새로 추가할 도안이 없습니다(이중 칼선 방지).")
+                    return
+            new_rep_result = generate_cutline_by_style(
+                image_path=path,
+                style=ImageStyle[style_name],
+                dpi=dpi,
+                selection_px=rep_box,
+                margin_mm=margin_mm,
+                supersample=self.precision.get(),
+                precomputed_content_px=corrected,
+            )
+            new_rep_result.adjustments = list(note_sink) + list(new_rep_result.adjustments or []) + [
+                "사람이 화면에서 직접 표시한 힌트(전경/배경 점)로 실루엣을 보정했습니다."
+            ]
+
+            if is_new:
+                self._accumulated.append(new_rep_result)
+                new_index = len(self._accumulated) - 1
+                self._grabcut_hint_meta[new_index] = {
+                    "box_px": rep_box,
+                    "margin_mm": margin_mm,
+                    "dpi": dpi,
+                    "group_indices": [new_index],
+                    "style": style_name,
+                    "is_representative": True,
+                }
+                updated = 1
+            else:
+                meta = self._grabcut_hint_meta[self._hint_target_index]
+                group_indices = meta.get("group_indices") or [self._hint_target_index]
+                rep_index = None
+                for idx in group_indices:
+                    if self._grabcut_hint_meta.get(idx, {}).get("is_representative"):
+                        rep_index = idx
+                        break
+                if rep_index is None:
+                    rep_index = self._hint_target_index
+
+                updated = 0
+                for idx in group_indices:
+                    if idx >= len(self._accumulated):
+                        continue
+                    if idx == rep_index:
+                        self._accumulated[idx] = new_rep_result
+                    else:
+                        other_meta = self._grabcut_hint_meta.get(idx)
+                        if other_meta is None:
+                            continue
+                        self._accumulated[idx] = fit_cutline_result_to_box(
+                            new_rep_result, rep_box, other_meta["box_px"],
+                            note=(
+                                "동일 도안이 반복되는 것으로 감지되어, 힌트로 보정된 "
+                                "실루엣을 그 칸 크기에 맞춰 복제했습니다."
+                            ),
+                        )
+                    updated += 1
+
+            combined = combine_results(self._accumulated)
+            preview_png = os.path.join(_work_file_dir(), "_last_preview.png")
+            render_preview(combined, preview_png, original_image_path=path)
+            self._last_result = combined
+        except Exception as e:  # noqa: BLE001
+            self._report_exception_to_server("힌트 보정 재계산 처리 중")
+            self._show_note_dialog(
+                "다시 계산 중 오류가 발생했습니다", [self._friendly_error_text(str(e))], kind="error",
+            )
+            self.status.set("힌트 보정 중 오류가 발생했습니다.")
+            return
+
+        self._clear_hint_points()
+        self._show_preview(preview_png, item_result=None)
+        if is_new:
+            self.status.set("힌트 보정 완료 -- 새 도안으로 1개 추가했습니다.")
+        else:
+            self.status.set(f"힌트 보정 완료 -- 같은 반복 그룹 {updated}개 칸에 반영했습니다.")
+
     def _load_source_preview(self, path):
         """Show the raw (not-yet-processed) image on the canvas so the
         artist can drag a selection rectangle over one design BEFORE
@@ -2860,6 +3333,10 @@ class CutLineApp(ctk.CTk):
             self._mixed_clear_hover()
 
     def _on_canvas_press(self, event):
+        if self._hint_mode_active:
+            # 힌트 그리기 모드에서는 클릭이 곧 힌트 점 하나이므로(드래그 X),
+            # 눌렀을 때는 아무 것도 하지 않고 뗄 때(_on_canvas_release)만 처리.
+            return
         if self._pan_mode:
             # 이동 모드: 영역 선택과는 완전히 별개로 취급 -- 원본/결과
             # 화면을 자동으로 다시 불러오는 등 선택 관련 로직을 전혀 거치지
@@ -2913,6 +3390,8 @@ class CutLineApp(ctk.CTk):
         self._draw_selection_rect(cx, cy, cx, cy)
 
     def _on_canvas_drag(self, event):
+        if self._hint_mode_active:
+            return
         if self._pan_mode:
             # gain=1: 마우스가 실제로 움직인 픽셀만큼 그대로(1:1) 화면을
             # 끈다 -- tk.Canvas의 scan_mark/scan_dragto 표준 사용법.
@@ -2930,6 +3409,11 @@ class CutLineApp(ctk.CTk):
         self.status.set(f"드래그 중: {w_mm:.1f} × {h_mm:.1f}mm (마우스를 놓으면 선택 완료)")
 
     def _on_canvas_release(self, event):
+        if self._hint_mode_active:
+            cx = self.preview_canvas.canvasx(event.x)
+            cy = self.preview_canvas.canvasy(event.y)
+            self._on_hint_click_at_point(cx, cy)
+            return
         if self._pan_mode:
             return
         if self._mixed_mode:
@@ -4109,7 +4593,38 @@ class CutLineApp(ctk.CTk):
                 return fallback
             return result
 
-        if job in ("BORDERLESS", "LINE_ART", "MASKING_TAPE"):
+        if job == "BORDERLESS":
+            # 2026-09-28(멍푸: "무테는 이미지 안쪽에 칼선이 들어간다고 수 회
+            # 말했어. 배경이미지를 같이 자르면 상품 가치가 없어" -> 비교
+            # 이미지로 "A: 칸 전체 한 장" 확정): 예전(9/7)엔 자동 인식된
+            # 요소가 사각형으로 잘리는 걸 막으려고 무테를 골라도 유테처럼
+            # 요소 실루엣을 바깥으로 밀어(배경까지 포함) 잘랐다. 무테는 칸
+            # (카드) 하나가 스티커 한 장이므로, 그 칸 이미지 가장자리에서
+            # 여백만큼 안쪽에 칼선 하나만 둔다 -- 배경 그림은 자르지 않는다.
+            if self._selection_px is None:
+                raise ValueError("자동 인식된 영역이 없습니다.")
+            if self._real_grid_cells_px:
+                # 작가가 그린 실제 재단선 격자의 칸 = 카드 가장자리 그 자체.
+                return generate_card_inset_cutline(
+                    image_path=path,
+                    card_px=self._selection_px,
+                    dpi=self.dpi.get(),
+                    margin_mm=self.style_margin_mm.get(),
+                )
+            # 격자가 없는 파일: 찾은 박스가 카드인지(박스를 꽉 채움) 자유
+            # 모양 그림인지 모르므로, 수동 무테와 같은 판정(색 경계 추적 ->
+            # 박스를 거의 채우면 사각형, 아니면 그 모양 안쪽)을 쓴다 -- 둥근
+            # 그림의 박스 모서리(흰 배경)를 사각형으로 자르지 않도록.
+            return generate_cutline_by_style(
+                image_path=path,
+                style=ImageStyle.BORDERLESS,
+                dpi=self.dpi.get(),
+                selection_px=self._selection_px,
+                margin_mm=self.style_margin_mm.get(),
+                supersample=self.precision.get(),
+            )
+
+        if job in ("LINE_ART", "MASKING_TAPE"):
             # 2026-09-08(9차): 마스킹테이프도 자동 인식에서는 유테와 완전히
             # 같은 방식(실루엣 추적)으로 처리한다 -- 아래 로직은 이미 항상
             # ImageStyle.LINE_ART를 쓰므로 이 조건에 추가하는 것만으로 충분.
@@ -4237,7 +4752,9 @@ class CutLineApp(ctk.CTk):
         self.export_btn.configure(state="normal")
 
     def _on_reset_accumulation(self):
+        self._exit_hint_mode()
         self._accumulated = []
+        self._grabcut_hint_meta = {}
         self._last_result = None
         self.accum_status.set("누적된 영역 없음")
         self.export_btn.configure(state="disabled")
@@ -4404,13 +4921,29 @@ class CutLineApp(ctk.CTk):
                 anchor="w", justify="left", wraplength=380,
             ).pack(fill="x", padx=18, pady=(0, 2 if box is not None else 4))
             if box is not None:
+                btn_row = ctk.CTkFrame(wrap, fg_color="transparent")
+                btn_row.pack(fill="x", padx=18, pady=(0, 8))
                 ctk.CTkButton(
-                    wrap, text="🔍 이 위치로 이동", font=self.font_caption,
+                    btn_row, text="🔍 이 위치로 이동", font=self.font_caption,
                     text_color=TEXT_PRIMARY, fg_color="transparent", hover_color=ACCENT_SOFT,
                     border_width=1, border_color=BORDER, corner_radius=8,
                     anchor="w", width=140, height=26,
                     command=lambda b=box: self._navigate_preview_to_original_box(b),
-                ).pack(anchor="w", padx=18, pady=(0, 8))
+                ).pack(side="left")
+                # 2026-09-28(GrabCut 보조 기능 -- 트라이맵 힌트 보정 도구):
+                # "이 위치로 이동" 바로 옆에, 같은 좌표를 화면에서 직접
+                # 전경/배경 점을 찍어 GrabCut을 다시 계산하는 보정 모드로
+                # 들어가는 버튼을 하나 더 둔다. 대응하는 자동 인식 결과를
+                # 못 찾으면(_find_accumulated_index_for_box) 버튼을 누른
+                # 뒤에야 안내하고 조용히 아무 것도 하지 않는다 -- 이 대화상자
+                # 자체는 좌표 유무만으로 버튼을 보여주므로.
+                ctk.CTkButton(
+                    btn_row, text="✏️ 힌트로 보정", font=self.font_caption,
+                    text_color=TEXT_PRIMARY, fg_color="transparent", hover_color=ACCENT_SOFT,
+                    border_width=1, border_color=BORDER, corner_radius=8,
+                    anchor="w", width=140, height=26,
+                    command=lambda b=box: self._start_hint_correction(b),
+                ).pack(side="left", padx=(8, 0))
 
         self._btn_primary(wrap, "닫기", dialog.destroy).pack(fill="x", padx=18, pady=(12, 16))
 
@@ -4661,7 +5194,14 @@ class CutLineApp(ctk.CTk):
         # 적용해") 그대로 유지, 격자 없는 파일용 대체 경로(else)는 그대로.
         suspicious_regions_px: list = []
         try:
-            if self._real_grid_cells_px:
+            if self._real_grid_cells_px and self.job_type.get() == "BORDERLESS":
+                # 2026-09-28 멍푸 결정("무테는 칸 전체 한 장" -- 비교 이미지로
+                # 확인): 무테는 칸(카드) 하나가 스티커 한 장이다. 칸 안을 요소로
+                # 쪼개면 배경 그림에서 캐릭터를 오려내게 되어 상품 가치가 없다.
+                # 빈 칸만 거르고 같은 그림 반복만 묶는다(쪼개기 없음).
+                cell_boxes = list(self._real_grid_cells_px)
+                boxes, groups = group_content_cells_px(path, cell_boxes)
+            elif self._real_grid_cells_px:
                 cell_boxes = list(self._real_grid_cells_px)
                 boxes, groups = detect_repeat_aware_sub_element_boxes_px(
                     path, cell_boxes, suspicious_regions=suspicious_regions_px,
@@ -4699,6 +5239,14 @@ class CutLineApp(ctk.CTk):
         # 단위 cell_boxes를 따로 저장한다.
         self._auto_detect_all_boxes_px = cell_boxes
 
+        # 2026-09-28(GrabCut 보조 기능): 이 실행에서 힌트 보정 대상으로 삼을
+        # 수 있는 job_type인지 미리 판단해둔다. 유테/마스킹테이프만 대상 --
+        # 무테는 칸 한 장을 사각형으로 안쪽에 자르므로(실루엣 추적 없음)
+        # 힌트로 고칠 실루엣 자체가 없다. AUTO_STYLE/DOMUSONG/FULL_CUT은
+        # 아직 연결 안 됨.
+        hint_eligible_job = self.job_type.get() in ("LINE_ART", "MASKING_TAPE")
+        hint_style = "LINE_ART"
+
         # 각 도안은 사람이 직접 드래그한 것처럼 self._selection_px를 그때그때
         # 채워서 기존 _generate_one_item을 그대로 재사용 -- 개별 항목 하나가
         # 실패해도(예: 너무 작거나 이상한 영역) 전체를 중단하지 않고 계속
@@ -4711,6 +5259,7 @@ class CutLineApp(ctk.CTk):
                 0, self.status.set,
                 f"자동 인식 처리 중... (그룹 {gi}/{len(groups)}, 반복 {len(group)}개)",
             )
+            group_hint_indices: list = []  # 이 그룹의 self._accumulated 인덱스들(힌트 보정 대상일 때만 채움)
             try:
                 item_result = self._generate_one_item_for_auto_detect(path)
                 template_results = [item_result]
@@ -4740,6 +5289,28 @@ class CutLineApp(ctk.CTk):
                 for t in template_results:
                     self._accumulated.append(t)
                 added += 1
+                # 힌트 보정 메타데이터 기록: 처음엔 "is_silhouette_undersized로
+                # 이미 안전한 사각형(무테)으로 대체된 항목은 대상에서 뺀다"고
+                # 생각했었는데, 실제 파일로 검증해보니 정반대였다 -- 하필
+                # 그 대체가 걸리는 항목(예: 실측 ratio=0.337, 기준 0.35 미만)
+                # 이 바로 "GrabCut이 심하게 실패해서 힌트 보정이 가장 필요한"
+                # 사례였다(실제 10칸 시트 파일, 캐릭터 6마리는 다 잡히고
+                # 양배추 장식 2개가 통째로 빠진 경우 -- 힌트 2점으로 실제
+                # 복구까지 확인함). 그래서 원래 어떤 스타일로 끝났는지와
+                # 무관하게, 이 job_type이면 항상 메타를 기록한다 -- 힌트
+                # 보정 자체는 항상 유테(LINE_ART) 실루엣 추적을 새로
+                # 시도하므로 원래 결과가 사각형 대체였든 아니든 상관없다.
+                if hint_eligible_job and len(template_results) == 1:
+                    rep_index = len(self._accumulated) - 1
+                    group_hint_indices.append(rep_index)
+                    self._grabcut_hint_meta[rep_index] = {
+                        "box_px": (x0, y0, x1, y1),
+                        "margin_mm": self.style_margin_mm.get(),
+                        "dpi": self.dpi.get(),
+                        "group_indices": group_hint_indices,
+                        "style": hint_style,
+                        "is_representative": True,
+                    }
             except Exception as e:  # noqa: BLE001
                 self._report_exception_to_server("템플릿 기반 배치 생성 처리 중")
                 errors.append(f"{primary_idx + 1}번째 도안: {self._friendly_error_text(str(e))}")
@@ -4765,6 +5336,17 @@ class CutLineApp(ctk.CTk):
                             )
                         )
                     added += 1
+                    if group_hint_indices:
+                        sib_index = len(self._accumulated) - 1
+                        group_hint_indices.append(sib_index)
+                        self._grabcut_hint_meta[sib_index] = {
+                            "box_px": (ox0, oy0, ox1, oy1),
+                            "margin_mm": self.style_margin_mm.get(),
+                            "dpi": self.dpi.get(),
+                            "group_indices": group_hint_indices,
+                            "style": hint_style,
+                            "is_representative": False,
+                        }
                 except Exception as e:  # noqa: BLE001
                     self._report_exception_to_server("반복 도안 복제 처리 중")
                     errors.append(f"{other_idx + 1}번째 도안(반복 복제): {self._friendly_error_text(str(e))}")
@@ -4813,10 +5395,14 @@ class CutLineApp(ctk.CTk):
         # 확인해야 하는 항목(_split_overlap_warning_note)이 있으면 별도
         # 대화상자로 따로 알린다 -- errors 대화상자와 섞으면 "생성 실패"로
         # 오해할 수 있어 분리함.
-        warnings = [
-            note for note in (self._last_result.adjustments if self._last_result else [])
-            if note.startswith("⚠")
-        ]
+        # 2026-09-28 발견: combine_results는 각 항목의 안내 문구 앞에
+        # "[N번째 영역] "을 붙여 합치는데, 여기서는 "⚠"로 *시작하는* 문구만
+        # 골라서 -- 항목별 경고(겹치는 조각 경고 등)가 자동 인식 경로에서는
+        # 한 번도 화면에 뜨지 않고 있었다. 이제 앞머리 번호를 떼고 같은
+        # 문구끼리 묶어서(몇 번째 영역들인지 함께) 보여준다.
+        warnings, first_region_by_warning = _collect_warning_notes(
+            self._last_result.adjustments if self._last_result else []
+        )
         if warnings:
             # 2026-09-28(멍푸 요청 "수동 기능 추가"): 이 경고들 중 "몸통 실루엣
             # 누락 의심"류(_missing_body_warning_notes)는 self.
@@ -4828,6 +5414,11 @@ class CutLineApp(ctk.CTk):
             # 일반 문구로 표시된다.
             known_notes = _missing_body_warning_notes(self._last_suspicious_regions_px or [])
             box_by_note = dict(zip(known_notes, self._last_suspicious_regions_px or []))
+            # 항목별 경고는 그 항목(첫 번째 영역)의 원래 박스로 이동/보정할 수 있게.
+            for note, region_no in first_region_by_warning.items():
+                meta = self._grabcut_hint_meta.get(region_no - 1)
+                if meta is not None:
+                    box_by_note[note] = meta["box_px"]
             self._show_suspicious_regions_dialog(warnings, box_by_note)
 
     def _on_auto_detect_none(self):

@@ -1,4 +1,8 @@
 """
+(2026-09-28 갱신: 53차 인쇄소 가이드 실측에 따라 도무송 최소 여유가 15mm ->
+2.0mm로 확정됨 -- 멍푸 확인. 아래 원래 설명은 40차 당시 그대로 두고, 검사는
+"상수 값만큼은 반드시 밀려난다"는 규칙 자체를 확인한다.)
+
 Regression test for 2026-09-10(40차) 피드백("도무송 칼선은 다른 칼선보다
 중심 기준을 두고 최소 15mm는 외부에서 안 쪽으로 들어와야해. 저렇게 얇게
 칼선이 들어가면 무조건 파손돼"): 도무송(CIRCLE/ELLIPSE/SQUARE/RECTANGLE)은
@@ -53,7 +57,7 @@ def _innermost_gap_mm(result, design_bounds_px, dpi):
     return px_to_mm(min(gaps_px), dpi)
 
 
-def test_domusong_gets_15mm_floor_even_with_tiny_input():
+def test_domusong_gets_min_floor_even_with_tiny_input():
     tmp = os.path.join(tempfile.gettempdir(), "_test_domusong_min_gap_sheet.png")
     _make_single_design_sheet(tmp)
     dpi = 300.0
@@ -74,7 +78,7 @@ def test_domusong_gets_15mm_floor_even_with_tiny_input():
     assert gap_mm >= MIN_DOMUSONG_GAP_MM - 0.05, (
         f"도무송은 최소 {MIN_DOMUSONG_GAP_MM:g}mm 여유가 있어야 하는데 {gap_mm:.2f}mm 뿐임"
     )
-    print("[OK] 도무송: 작게 입력해도 최소 15mm 여유까지 자동으로 밀려남")
+    print(f"[OK] 도무송: 작게 입력해도 최소 {MIN_DOMUSONG_GAP_MM:g}mm 여유까지 자동으로 밀려남")
 
 
 def test_full_cut_still_uses_the_smaller_2mm_floor():
@@ -98,14 +102,14 @@ def test_full_cut_still_uses_the_smaller_2mm_floor():
     gap_mm = _innermost_gap_mm(result, (400, 400, 800, 800), dpi)
     print(f"완칼(FULL_CUT) 안쪽 여유: {gap_mm:.2f}mm (기준: {MIN_GAP_MM:g}mm, 도무송 기준 아님)")
     assert gap_mm >= MIN_GAP_MM - 0.05, f"완칼은 최소 {MIN_GAP_MM:g}mm는 보장돼야 하는데 {gap_mm:.2f}mm 뿐임"
-    assert gap_mm < MIN_DOMUSONG_GAP_MM - 1.0, (
-        "완칼까지 도무송의 15mm 기준을 적용해버리면 회귀 -- 완칼은 그대로 2mm 근처여야 함"
+    assert gap_mm < MIN_GAP_MM + 1.0, (
+        f"완칼은 기존 {MIN_GAP_MM:g}mm 근처여야 함(더 크게 밀리면 회귀)"
     )
-    print("[OK] 완칼: 도무송 전용 15mm 기준의 영향을 받지 않고 기존 2mm 기준 그대로 유지됨(회귀 없음)")
+    print("[OK] 완칼: 기존 2mm 기준 그대로 유지됨(회귀 없음)")
 
 
 def main():
-    test_domusong_gets_15mm_floor_even_with_tiny_input()
+    test_domusong_gets_min_floor_even_with_tiny_input()
     test_full_cut_still_uses_the_smaller_2mm_floor()
     print("\nAll DOMUSONG min-gap checks passed.")
 

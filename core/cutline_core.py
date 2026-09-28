@@ -57,7 +57,14 @@ MIN_GAP_MM = 2.0
 # 도무송인지 아닌지에 따라 이 값과 MIN_GAP_MM 중 하나를 골라
 # `OffsetSpec.enforce_minimum_gap`에 넘긴다(완칼은 기존 2.0mm 그대로,
 # 회귀 없음).
-MIN_DOMUSONG_GAP_MM = 15.0
+#
+# 53차(실제 인쇄소 도무송 가이드 파일 실측: 다이 사이 최소 여유 2.0mm)에서
+# 이 값을 2.0mm로 낮추기로 했고 다른 파일 주석 4곳에도 그렇게 기록돼 있었지만
+# 정작 이 상수 변경만 저장에서 빠져 15.0이 그대로 남아 있었다 -- 2026-09-28
+# 멍푸 확인("2.0mm, 인쇄소 가이드")으로 실제 값을 바로잡음. 지금은
+# MIN_GAP_MM과 같은 값이지만, 도무송 전용 기준을 따로 조정할 수 있게 상수는
+# 분리해둔다.
+MIN_DOMUSONG_GAP_MM = 2.0
 
 
 # The subpixel pipeline (load_raster_design/segment_design_in_region) works
