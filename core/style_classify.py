@@ -20,7 +20,7 @@ sheets so far) mix two kinds of design elements in the very same tile:
     equal to the shape's actual area. Real hand-drawn cutline for these:
     that box's own rectangle, inset (무테).
 
-Measured on 2조수희_5_유포지_유광코팅(cs6).ai's REAL 칼선레이어 polygons
+Measured on a real reference file's REAL 칼선레이어 polygons
 (rectangularity = polygon.area / polygon.minimum_rotated_rectangle.area):
   - the framed swing-bear box: real cutline rectangularity 0.879
   - the reused bunny corner frame: real cutline rectangularity 1.000

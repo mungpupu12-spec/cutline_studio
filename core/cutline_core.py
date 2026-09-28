@@ -47,6 +47,18 @@ MM_PER_INCH = 25.4
 # actual print/cut process.
 MIN_GAP_MM = 2.0
 
+# 2026-09-10(40차) 피드백("도무송 칼선은 다른 칼선보다 중심 기준을 두고
+# 최소 15mm는 외부에서 안 쪽으로 들어와야해. 저렇게 얇게 칼선이 들어가면
+# 무조건 파손돼"): 도무송(CIRCLE/ELLIPSE/SQUARE/RECTANGLE -- 실제 금형이
+# 찍어내는 단순한 기하 도형)은 완칼(실루엣을 그대로 따라가는 칼선)과 달리
+# 물리적인 금형 자체가 버텨야 하므로, 일반 MIN_GAP_MM(2.0mm)보다 훨씬 큰
+# 최소 여유가 필요하다는 실무 기준 -- 도무송 전용 최소 간격을 별도로 둠.
+# `core.interactive_cutline.generate_cutline_for_selection`이 cutline_type이
+# 도무송인지 아닌지에 따라 이 값과 MIN_GAP_MM 중 하나를 골라
+# `OffsetSpec.enforce_minimum_gap`에 넘긴다(완칼은 기존 2.0mm 그대로,
+# 회귀 없음).
+MIN_DOMUSONG_GAP_MM = 15.0
+
 
 # The subpixel pipeline (load_raster_design/segment_design_in_region) works
 # by upsampling the binary mask `supersample`x before re-extracting contours
@@ -445,8 +457,17 @@ def compute_offsets(
         buffered = design.buffer(px, join_style=join_style, resolution=buffer_resolution)
         if merge_gap_mm and merge_gap_mm > 0:
             close_px = mm_to_px(merge_gap_mm, dpi) / 2.0
-            buffered = buffered.buffer(close_px, resolution=buffer_resolution).buffer(
-                -close_px, resolution=buffer_resolution
+            # 2026-09-10 피드백("도무송 파란색 선이 모서리가 뾰족해야 해"):
+            # 위 바깥쪽 buffer는 이미 join_style을 그대로 받아 뾰족한
+            # 모서리(mitre, join_style=2)를 유지할 수 있었지만, 그 다음 이
+            # "간격 좁으면 합치기" closing 단계(buffer(+)/buffer(-))는
+            # join_style을 안 넘겨줘서 shapely 기본값(round)으로 다시
+            # 둥글게 깎아버리고 있었다 -- 실제 파일로 확인된 회귀: 도무송
+            # 직사각형의 90도 모서리가 이 단계 때문에 살짝 둥글게 나옴.
+            # 같은 join_style을 그대로 넘겨서, 완칼(둥글게가 맞는 경우)은
+            # 그대로 둥글고 도무송(뾰족해야 하는 경우)은 끝까지 뾰족하게.
+            buffered = buffered.buffer(close_px, join_style=join_style, resolution=buffer_resolution).buffer(
+                -close_px, join_style=join_style, resolution=buffer_resolution
             )
         if bounds_poly is not None:
             # A real die can never cut outside the actual printed canvas --
@@ -492,13 +513,115 @@ def merge_close_elements(
     neighbors and any elements that end up close across a tile-repeat
     boundary, with no risk of missing a pair that only becomes close once
     everything is placed in its real, final position.
+
+    2026-09-10(47차) 피드백("칼선이 왜 뭉개지고 뚫리고 합쳐지는지"): 시트
+    전체를 한 덩어리로 놓고 buffer(+)/buffer(-)를 한 번에 돌리면, 실제로는
+    서로 `gap_px` 안에 있지도 않은(즉 합칠 필요가 전혀 없는) 다른 도안들의
+    윤곽까지 같은 연산을 그대로 통과하며 미묘하게 깎이거나(뭉개짐), 여러
+    조각이 한 화면에서 뒤섞여 union될 때 GEOS가 생성하는 자잘한 구멍(뚫림)이
+    같이 생길 위험이 있었다 -- 실제로 조각이 촘촘히 배치된 시트(이번에 문제
+    보고된 시트들)일수록 이 전역 연산의 영향 범위가 넓어져 증상이 더 잘
+    보였을 것으로 추정됨.
+
+    지금부터는 서로 `gap_px` 이내에 있는 조각들끼리만(그래프의 연결 요소로
+    묶어) buffer(+)/buffer(-)를 적용하고, 어디에도 가깝지 않은 조각은 그
+    연산 자체를 거치지 않고 원본 그대로 통과시킨다 -- "2mm 안이면 반드시
+    합친다"는 기존 규칙(최우선 순위로 지정된 규칙, 절대 약화하지 않음)은
+    똑같이 지키면서, 상관없는 도안까지 건드리는 부작용만 없앤다.
     """
+    if geom.is_empty:
+        return MultiPolygon([])
+    polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    n = len(polys)
+    if n <= 1:
+        return geom if isinstance(geom, MultiPolygon) else MultiPolygon(polys)
+
+    # 서로 gap_px 이내인 조각들을 union-find로 묶는다(간단한 그래프 연결
+    # 요소 계산 -- 조각 수가 시트 하나 기준으로 많아야 수십 개라 O(n^2)
+    # 거리 비교로 충분히 빠름).
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if polys[i].distance(polys[j]) < gap_px:
+                union(i, j)
+
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(polys[i])
+
     half = gap_px / 2.0
-    merged = geom.buffer(half, resolution=resolution).buffer(-half, resolution=resolution)
-    if isinstance(merged, Polygon):
-        merged = MultiPolygon([merged])
-    elif merged.is_empty:
-        merged = MultiPolygon([])
+    result_polys: list = []
+    for members in groups.values():
+        if len(members) == 1:
+            result_polys.append(members[0])
+            continue
+        merged = unary_union(members).buffer(half, resolution=resolution).buffer(
+            -half, resolution=resolution
+        )
+        if isinstance(merged, Polygon):
+            if not merged.is_empty:
+                result_polys.append(merged)
+        elif not merged.is_empty:
+            result_polys.extend(merged.geoms)
+
+    return MultiPolygon(result_polys)
+
+
+def smooth_design_naturally(
+    design, presmooth_px: float, cap_factor: float = 0.4, resolution: int = 16
+):
+    """
+    "자연스러운 칼선이 중요해, 옵션이 아니라 기본이 되어야해" (2026-09-09(15차)):
+    실루엣을 margin만큼 바깥으로 밀기 전에, 그 실루엣 자체를 미리 매끄럽게
+    다듬는다 -- 캐릭터 몸통처럼 큰 형태는 굴곡(귀 사이 틈 등)이 완전히
+    뭉개지지 않으면서도 눈에 보이는 잔물결이 없어질 만큼 크게(presmooth_px),
+    그 옆의 아주 작은 별개 요소(말풍선 속 작은 아이콘, 모서리 표시 등)는
+    같은 큰 값을 그대로 쓰면 buffer(+)/buffer(-) 라운드트립 자체가 그 작은
+    모양을 통째로 지워버린다(morphological opening이 자기 반지름보다 좁은
+    형태를 없애버리는 것과 동일한 원리) -- 실제 12칸 시트 파일로 직접
+    측정: 반지름(면적 기준 등가 원반지름)이 14~17px인 작은 요소들에
+    presmooth_px=85px를 그대로 쓰면 다 사라짐.
+    그래서 조각마다 따로, 그 조각 자기 크기에 맞춰 presmooth 크기를 스스로
+    제한한다(equiv_radius * cap_factor) -- 큰 조각은 원래 원하는 크기
+    그대로 다듬어지고, 작은 조각은 자기 크기 안에서만 아주 살짝 다듬어져
+    사라지지 않는다. 조각들을 따로 다듬은 뒤에 합치므로(먼저 합쳐서
+    한꺼번에 다듬는 것과 달리) 큰 조각을 위한 큰 presmooth가 작은 조각까지
+    집어삼키는 일이 없다.
+    """
+    geoms = list(design.geoms) if hasattr(design, "geoms") else [design]
+    geoms = [g for g in geoms if g is not None and not g.is_empty]
+    if not geoms:
+        return design
+
+    smoothed = []
+    for g in geoms:
+        equiv_radius = math.sqrt(g.area / math.pi) if g.area > 0 else 0.0
+        px = min(presmooth_px, equiv_radius * cap_factor)
+        px = max(px, 0.0)
+        if px <= 0.0:
+            smoothed.append(g)
+            continue
+        sm = g.buffer(px, join_style=1, resolution=resolution).buffer(
+            -px, join_style=1, resolution=resolution
+        )
+        if not sm.is_empty:
+            smoothed.append(sm)
+        else:
+            smoothed.append(g)
+
+    merged = unary_union(smoothed)
     return merged
 
 

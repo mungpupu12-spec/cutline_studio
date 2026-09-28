@@ -13,7 +13,7 @@ already trusts" is exactly what `core.margin_inspector` measures: the
 per-sample-point spread (std) of a REAL, already-approved hand-drawn
 cutline around REAL segmented artwork, on this same file.
 
-Measured this round, on `5조수희_5_유포지_인델별(색감 수정)`, tile 0's 12
+Measured this round, on a real reference file, tile 0's 12
 real cutline shapes (96 boundary samples each, core.margin_inspector):
 
     element   median_mm   std_mm
@@ -72,8 +72,8 @@ from dataclasses import dataclass
 
 DEFAULT_SAFETY_FACTOR = 1.0
 
-# This round's reference measurement (5조수희_인델별, tile 0, 12 real
-# elements) -- see module docstring for the full per-element table.
+# This round's reference measurement (a real reference file, tile 0, 12
+# real elements) -- see module docstring for the full per-element table.
 REFERENCE_STD_MM = [0.76, 0.28, 0.28, 0.27, 0.46, 0.33, 0.36, 0.31, 0.57, 0.27, 0.26, 0.62]
 
 
@@ -97,8 +97,8 @@ def estimate_slip_margin_mm(
     reference cutlines (e.g. `MarginStats.std_mm` for each of
     `core.margin_inspector.measure_margin_from_image`'s results on a real
     file/vendor). Defaults to this round's own 12-element measurement on
-    `5조수희_인델별` when the caller has nothing more specific for the file
-    at hand.
+    a real reference file when the caller has nothing more specific for the
+    file at hand.
 
     `slip_allowance_mm = safety_factor * worst(reference_std_mm)`, added on
     top of `base_margin_mm` (the artist's own 1.5mm style standard) to get

@@ -65,7 +65,80 @@ def main():
             abs(im.size[0] - expected_w) <= 1 and abs(im.size[1] - expected_h) <= 1,
         )
 
-    # 3) missing page index raises a clear error instead of an obscure one
+    # 3) MULTIPLE-DISTINCT-EMBEDDED-IMAGES branch (2026-09-08(10차), found
+    # while reviewing every .ai file in 멍푸님's "자료집" reference folder):
+    # a page with 2+ DIFFERENT embedded images (not the same design repeated)
+    # must render the WHOLE page (every placement, composited correctly),
+    # not just extract whichever one image happened to come first.
+    multi_demo = os.path.join(SAMPLES, "ai_import_multi_demo.ai")
+    check("ai_import_multi_demo.ai fixture exists", os.path.isfile(multi_demo))
+    out3 = os.path.join(OUT_DIR, "ai_import_multi.png")
+    load_ai_as_raster(multi_demo, out3, dpi=150.0)
+    check("multi-distinct-image branch wrote a file", os.path.isfile(out3) and os.path.getsize(out3) > 0)
+    with Image.open(out3) as im:
+        # samples/make_ai_import_multi_demo.py builds a 420x200pt page ->
+        # at 150dpi that's 420/72*150 x 200/72*150 -- if the OLD (buggy)
+        # single-image-extraction path were taken instead, the output would
+        # be ring.png's own native 300x300 square, not this page-shaped size.
+        expected_w = round(420.0 / 72.0 * 150.0)
+        expected_h = round(200.0 / 72.0 * 150.0)
+        check(
+            f"page with 2 distinct images renders the FULL page (got {im.size}, "
+            f"expected ~({expected_w},{expected_h})), not just one embedded image",
+            abs(im.size[0] - expected_w) <= 1 and abs(im.size[1] - expected_h) <= 1,
+        )
+        # Both placements' content must actually be visible -- check that
+        # EACH placement's own crop region has at least some non-blank pixel
+        # (a crude but effective "something was drawn here, not left empty"
+        # check without hardcoding exact pixel colors/positions -- a single
+        # fixed-point probe risked landing on a transparent/white spot
+        # inside the fixture image itself, e.g. ring.png's own hollow
+        # center).
+        import numpy as np
+
+        rgba = np.array(im.convert("RGBA"))
+        scale = 150.0 / 72.0
+
+        def _region_has_content(x0_pt, y0_pt, x1_pt, y1_pt):
+            x0, y0 = round(x0_pt * scale), round(y0_pt * scale)
+            x1, y1 = round(x1_pt * scale), round(y1_pt * scale)
+            crop = rgba[y0:y1, x0:x1]
+            non_transparent = crop[:, :, 3] > 0
+            non_white = ~np.all(crop[:, :, :3] >= 250, axis=-1)
+            return bool(np.any(non_transparent & non_white))
+
+        check(
+            "left placement (ring.png) actually rendered (some non-blank pixel found)",
+            _region_has_content(10, 10, 190, 190),
+        )
+        check(
+            "right placement (scene.png) actually rendered (some non-blank pixel found)",
+            _region_has_content(220, 10, 400, 190),
+        )
+
+    # 4) a page where the SAME single image is placed many times must still
+    # take the fast embedded-extraction path (unaffected by the fix above --
+    # "more than one DISTINCT image" is judged by unique xrefs, not by
+    # placement count).
+    out3b = os.path.join(OUT_DIR, "ai_import_repeated_same.png")
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=300.0, height=100.0)
+    for x in (10, 110, 210):
+        page.insert_image(fitz.Rect(x, 10, x + 80, 90), filename=os.path.join(SAMPLES, "ring.png"))
+    repeated_same_path = os.path.join(OUT_DIR, "_ai_import_repeated_same_demo.ai")
+    doc.save(repeated_same_path, garbage=4, deflate=True)
+    doc.close()
+    load_ai_as_raster(repeated_same_path, out3b, dpi=300.0)
+    with Image.open(out3b) as im, Image.open(os.path.join(SAMPLES, "ring.png")) as ref:
+        check(
+            f"same image repeated 3x on one page still takes the fast single-extraction "
+            f"path (got {im.size}, expected ring.png's own native size {ref.size})",
+            im.size == ref.size,
+        )
+
+    # 5) missing page index raises a clear error instead of an obscure one
     try:
         load_ai_as_raster(ai_demo, os.path.join(OUT_DIR, "ai_import_bad.png"), page_index=5)
         check("out-of-range page_index raises", False)

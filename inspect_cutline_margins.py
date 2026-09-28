@@ -29,19 +29,53 @@ from core.margin_inspector import measure_margin_from_image
 from core.style_classify import classify_style
 from core.segmentation import segment_design_in_region
 
+# 2026-09-09 "교재" 폴더의 새 실제 파일들로 확인: 작가님의 실제 파일들이
+# 전부 "칼선레이어"라는 이름을 쓰는 게 아니라, 일부는 그냥 "칼선"이라는
+# 짧은 이름을 쓰기도 함(같은 실제 층위, 이름만 다름) -- 이 스크립트는 사람이
+# 직접 실행하는 진단용 CLI라서(실시간 칼선 생성 파이프라인과는 무관, 그
+# 파이프라인은 작가의 실제 레이어 이름을 아예 읽지 않음), 매번 --layer를
+# 손으로 다시 넣지 않아도 되도록 자주 쓰이는 이름들을 순서대로 시도해본다.
+# 그래도 안 되면 마지막엔 원래 지정한(또는 기본) 이름으로 낸 에러를 그대로
+# 보여준다 -- 조용히 다른 레이어를 골랐다고 착각하게 두지 않기 위해서다.
+COMMON_CUTLINE_LAYER_NAMES = ["칼선레이어", "칼선", "재단선", "cutline", "Cutline"]
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("ai_path", help="실제 .ai(PDF 호환) 파일 경로")
-    parser.add_argument("--layer", default="칼선레이어", help="칼선이 들어있는 레이어 이름 (기본: 칼선레이어)")
+    parser.add_argument(
+        "ai_path", help="실제 .ai(PDF 호환) 파일 경로"
+    )
+    parser.add_argument(
+        "--layer", default=None,
+        help="칼선이 들어있는 레이어 이름 (지정 안 하면 흔한 이름들을 순서대로 시도: "
+        + ", ".join(COMMON_CUTLINE_LAYER_NAMES),
+    )
     parser.add_argument("--top", type=int, default=20, help="큰 도형부터 최대 몇 개까지 보고할지 (기본 20)")
     parser.add_argument("--min-area-px", type=float, default=2000.0, help="이보다 작은 조각(점/노이즈)은 건너뜀")
     args = parser.parse_args()
 
+    candidate_names = [args.layer] if args.layer else COMMON_CUTLINE_LAYER_NAMES
+
     with tempfile.TemporaryDirectory() as tmp:
         print_img = os.path.join(tmp, "print.png")
         print(f"'{args.ai_path}' 여는 중...")
-        rc = load_real_cutlines(args.ai_path, print_img, layer_name=args.layer)
+        rc = None
+        last_error = None
+        for name in candidate_names:
+            try:
+                rc = load_real_cutlines(args.ai_path, print_img, layer_name=name)
+                if name != candidate_names[0]:
+                    print(f"('{candidate_names[0]}' 레이어는 없어서, '{name}' 레이어를 대신 찾음)")
+                break
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                continue
+        if rc is None:
+            tried = ", ".join(f"'{n}'" for n in candidate_names)
+            raise ValueError(
+                f"{args.ai_path}: 다음 레이어 이름을 전부 시도했지만 칼선을 찾지 못했습니다: "
+                f"{tried} (--layer로 실제 이름을 직접 지정해 보세요). 마지막 시도의 원래 오류: {last_error}"
+            )
         print(
             f"실제 칼선 {len(rc.cutlines_px)}개 발견 "
             f"(이미지 {rc.image_w_px}x{rc.image_h_px}px, 유효 DPI {rc.dpi:.1f})\n"

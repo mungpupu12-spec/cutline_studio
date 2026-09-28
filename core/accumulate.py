@@ -26,12 +26,24 @@ an all-"cut"-tier mix of 스티커 items combines into a "cut"-only result,
 while mixing in one 완칼/도무송 item (with safety/cut/bleed) adds those
 tiers too, populated only by the items that have them.
 
-The mandatory minimum-gap rule (core.cutline_core.MIN_GAP_MM /
-merge_close_elements) -- "칼선간 간격 2mm는 필수 규칙... 그 어떤 법칙보다
-우선 순위" -- is re-applied across the COMBINED geometry of each tier, not
-just within one item's own parts, since two different accumulated items
-(e.g. a 스티커 element and a neighboring 도무송 shape) can end up close to
-each other exactly the same way two parts of one design already could.
+2026-09-14(실제 파일로 확인된 문제, "칼선이 방황한다"): 예전엔 이 자리에서
+core.cutline_core.MIN_GAP_MM/merge_close_elements(2mm 미만이면 강제로
+합치기)를 서로 다른 도안(캐릭터) 사이에도 그대로 적용했었다. 실제 시트
+파일(인쇄 효율을 위해 캐릭터들을 서로 아주 가깝게, 종종 거의 맞닿게 배치)로
+돌려보니, 서로 무관한 캐릭터 여러 개가 하나의 구불구불한 윤곽으로 뭉쳐져버려
+"개체마다 반드시 1개의 칼선이 있어야 한다"는 훨씬 더 근본적인 정의를
+어기는 결과가 나왔다 -- 심지어 오늘 새로 만든 코드를 전부 꺼도 이미
+72개 중 54개가 서로 거리 0(맞닿음)으로 측정될 만큼 이 파일 자체가 원래
+그렇게 촘촘하게 배치돼 있었다(실측, 회귀 아님 -- 원래부터 있던 문제).
+
+멍푸님 확인(2026-09-14): "개체를 둘러싸는 칼선이어야해... 각각의 요소에
+개별 칼선이 있어야해"가 이 2mm 자동 병합 규칙보다 우선한다 -- 서로 다른
+누적 항목(도안)끼리는 아무리 가깝거나 겹쳐도 이제 다시는 하나로 합치지
+않는다(각 항목의 원래 모양을 그대로, 조금도 변형 없이 보존). 2mm 최소
+간격 자체가 필요 없어진 게 아니라, 그 강제 규칙을 "말없이 모양을 합쳐서
+지키는" 대신 사람이 직접 판단할 문제로 남겨둔다는 뜻 -- 한 도안 자기
+자신의 여러 조각을 하나로 잇는 용도(core.cutline_core.compute_offsets가
+단일 항목 안에서 쓰는 merge_gap_mm)는 이 결정과 무관하게 그대로 유지된다.
 """
 
 from __future__ import annotations
@@ -39,19 +51,27 @@ from __future__ import annotations
 from typing import Optional
 
 from shapely.geometry import MultiPolygon, Polygon
-from shapely.ops import unary_union
 
-from .cutline_core import CutlineResult, MIN_GAP_MM, merge_close_elements, mm_to_px
+from .cutline_core import CutlineResult, MIN_GAP_MM
 
 
-def _as_multipolygon(geom):
-    if geom is None:
-        return MultiPolygon([])
-    if isinstance(geom, Polygon):
-        return MultiPolygon([geom]) if not geom.is_empty else MultiPolygon([])
-    if geom.is_empty:
-        return MultiPolygon([])
-    return geom
+def _concat_multipolygon(geoms) -> MultiPolygon:
+    """
+    Concatenate each item's own polygon(s) into one MultiPolygon WITHOUT any
+    unary_union/merge_close_elements across items -- every item's exact
+    original shape is preserved untouched, even if two items' shapes are
+    touching or overlapping in space (2026-09-14 결정, see module docstring).
+    """
+    polys: list[Polygon] = []
+    for g in geoms:
+        if g is None or g.is_empty:
+            continue
+        if isinstance(g, Polygon):
+            polys.append(g)
+        else:
+            # MultiPolygon or GeometryCollection-like: take each part as-is.
+            polys.extend(part for part in g.geoms if isinstance(part, Polygon) and not part.is_empty)
+    return MultiPolygon(polys) if polys else MultiPolygon([])
 
 
 def combine_results(
@@ -59,11 +79,17 @@ def combine_results(
     merge_gap_mm: Optional[float] = MIN_GAP_MM,
 ) -> CutlineResult:
     """
-    Union every accumulated item's `design` (for the reference-artwork
-    overlay) and each of its `offsets` tiers (for the actual cut lines),
-    then re-enforce the mandatory minimum gap across the combined geometry
-    of each tier. Returns one CutlineResult, ready for the same
-    render_preview()/export_svg() calls a single-item result already used.
+    Combine every accumulated item's `design` (for the reference-artwork
+    overlay) and each of its `offsets` tiers (for the actual cut lines) into
+    one CutlineResult, ready for the same render_preview()/export_svg()
+    calls a single-item result already used.
+
+    2026-09-14부터: 서로 다른 누적 항목(items)의 칼선 지오메트리는 더 이상
+    unary_union되거나 merge_close_elements로 병합되지 않는다 -- 각 항목의
+    도형을 그대로 보존한 채 MultiPolygon으로 이어붙이기만 한다(위 모듈
+    docstring 참고). `merge_gap_mm`은 더 이상 이 함수 안에서 지오메트리에
+    쓰이지 않고, 안내 문구(adjustments)에만 남아 있다 -- 하위 호환을 위해
+    인자는 유지하되, 값이 있어도 병합 동작은 절대 일으키지 않는다.
 
     `items` must be non-empty and share the same `dpi` (true by
     construction in this project -- every item comes from the same loaded
@@ -82,8 +108,6 @@ def combine_results(
             if name not in tier_names:
                 tier_names.append(name)
 
-    gap_px = mm_to_px(merge_gap_mm, dpi) if merge_gap_mm else 0.0
-
     combined_offsets = {}
     for name in tier_names:
         geoms = [
@@ -91,17 +115,10 @@ def combine_results(
             for it in items
             if name in it.offsets and it.offsets[name] is not None and not it.offsets[name].is_empty
         ]
-        if not geoms:
-            combined_offsets[name] = MultiPolygon([])
-            continue
-        merged = unary_union(geoms)
-        merged = _as_multipolygon(merged)
-        if gap_px > 0 and not merged.is_empty:
-            merged = merge_close_elements(merged, gap_px)
-        combined_offsets[name] = merged
+        combined_offsets[name] = _concat_multipolygon(geoms)
 
     design_geoms = [it.design for it in items if it.design is not None and not it.design.is_empty]
-    combined_design = _as_multipolygon(unary_union(design_geoms) if design_geoms else None)
+    combined_design = _concat_multipolygon(design_geoms)
 
     adjustments: list[str] = []
     for i, it in enumerate(items, start=1):
@@ -109,8 +126,8 @@ def combine_results(
             adjustments.append(f"[{i}번째 영역] {note}")
     if len(items) > 1:
         adjustments.append(
-            f"영역 {len(items)}개가 하나의 파일로 누적됐습니다 -- 서로 다른 영역의 칼선끼리도 "
-            f"최소 {merge_gap_mm:g}mm 간격을 확보했습니다."
+            f"영역 {len(items)}개가 하나의 파일로 누적됐습니다 -- 각 영역의 칼선은 서로 "
+            f"가깝거나 겹치더라도 합쳐지지 않고 개별 도형으로 유지됩니다."
         )
 
     # The combined offset_mm is only ever used for display/reflection

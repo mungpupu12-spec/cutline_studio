@@ -1,10 +1,11 @@
 """
-Non-interactive smoke test for the 2026-08-26 완칼/스티커/도무송 workflow
-redesign: drives the real GUI class (gui.app.CutLineApp) headlessly under a
-virtual X display, exercising the same code paths a person clicking through
-the app would hit -- job_type selection, drag-selection simulation
-(setting self._selection_px directly, exactly like _on_canvas_release
-would), _generate_one_item, and the accumulation + combine_results flow.
+Non-interactive smoke test for the 무테/유테/도무송/조각 스티커 workflow
+(2026-08-26 최초 도입, 2026-09-07 job_type 4개 평탄화 리팩터 반영): drives
+the real GUI class (gui.app.CutLineApp) headlessly under a virtual X
+display, exercising the same code paths a person clicking through the app
+would hit -- job_type selection, drag-selection simulation (setting
+self._selection_px directly, exactly like _on_canvas_release would),
+_generate_one_item, and the accumulation + combine_results flow.
 
 Uses ONLY pre-existing public demo fixtures (samples/ring.png,
 samples/scene.png) already committed to this repo -- no new synthetic
@@ -57,24 +58,26 @@ def main():
     check("완칼 whole-image item has all 3 tiers", set(item1.offsets.keys()) == {"safety", "cut", "bleed"})
     app._accumulated.append(item1)
 
-    # ---- 2) 스티커 (STICKER / 유테=LINE_ART), one dragged region on scene.png ----
+    # ---- 2) 유테 (LINE_ART), one dragged region on scene.png ----
     # Selection rectangles below are padded bounding boxes of scene.png's OWN
     # already-known design shapes (measured directly via load_raster_design,
     # not guessed) so GrabCut has real content to segment inside each one.
+    # 2026-09-07 리팩터: job_type이 이제 무테/유테/도무송/조각스티커 4개
+    # 값을 바로 갖고 있어서(예전의 STICKER+image_style 하위 선택 없이),
+    # job_type.set("LINE_ART")만으로 충분하다.
     app._on_reset_accumulation()
     app.input_path.set(scene_path)
-    app.job_type.set("STICKER")
-    app.image_style.set("LINE_ART")
+    app.job_type.set("LINE_ART")
     app._selection_px = (53 - 15, 159 - 15, 240.75 + 15, 337.75 + 15)  # shape #3
     item2 = app._generate_one_item(scene_path)
-    check("스티커/유테 item has only 'cut' tier", set(item2.offsets.keys()) == {"cut"})
+    check("유테 item has only 'cut' tier", set(item2.offsets.keys()) == {"cut"})
     check(
         "ImageStyle.LINE_ART.value renamed to 유테",
         __import__("core.image_style", fromlist=["ImageStyle"]).ImageStyle.LINE_ART.value == "유테",
     )
     app._accumulated.append(item2)
 
-    # ---- 3) 스티커 (무테=BORDERLESS), a second region on the same scene ----
+    # ---- 3) 무테 (BORDERLESS), a second region on the same scene ----
     # Padding here (20px) must leave more real clearance around the shape's
     # own bbox than the inward margin_mm=1.5 will consume at this dpi
     # (mm_to_px(1.5, 150) ~= 8.86px) -- otherwise the inward-shrunk cutline
@@ -85,26 +88,56 @@ def main():
     # (2026-08-26) -- see the new content-bbox safety check below (case 3b)
     # this bug prompted in core/image_style.py.
     app._selection_px = (318 - 20, 175 - 20, 513.75 + 20, 289.75 + 20)  # shape #2
-    app.image_style.set("BORDERLESS")
+    app.job_type.set("BORDERLESS")
     item3 = app._generate_one_item(scene_path)
-    check("스티커/무테 item has only 'cut' tier", set(item3.offsets.keys()) == {"cut"})
+    check("무테 item has only 'cut' tier", set(item3.offsets.keys()) == {"cut"})
     check(
-        "스티커/무테 with adequate padding raises NO 칼선 경고",
+        "무테 with adequate padding raises NO 칼선 경고",
         not any("무테 칼선 경고" in a for a in item3.adjustments),
     )
     app._accumulated.append(item3)
 
-    # ---- 3b) 무테 safety-check regression: a DELIBERATELY too-tight
-    # selection (3px padding, well under the ~8.86px inward margin at this
-    # dpi/margin_mm) must now surface the new "무테 칼선 경고" note instead
-    # of silently shipping a cutline that cuts into the real artwork. This
-    # item is a throwaway (not added to app._accumulated) -- it exists only
-    # to prove the new check actually fires.
-    app._selection_px = (318 - 3, 175 - 3, 513.75 + 3, 289.75 + 3)  # shape #2, too tight
+    # ---- 3b) 무테 safety-check, 2026-09-08(11차) 이후 재해석, 2026-09-09
+    # (12차)에서 다시 한번 다듬음: 11차 때는 "이제 무테는 먼저 실제 선/색
+    # 경계를 추적하니, 선택 사각형이 그림 전체를 담고만 있으면(3px 여유도
+    # 충분) 더 이상 경고가 필요 없다"고 봤다. 하지만 12차에서 실제 화면
+    # 스크린샷으로 "장식이 셀 가장자리까지 흩어진 연속 무늬"에 추적을 그대로
+    # 적용하면 지그재그로 지저분한 칼선이 나온다는 문제가 발견되어,
+    # core/image_style.py에 "추적된 모양이 선택 영역 사방 중 한 면이라도
+    # 가장자리에 닿아 있으면(halo 없음) 추적을 버리고 사각형 축소로
+    # 되돌아간다"는 판정을 추가했다. 3px 여유는 이 프로젝트의 엣지 검출
+    # 자체가 갖는 노이즈 폭(core.style_classify.MIN_TRUSTED_HALO_PX=2.0px)
+    # 보다도 좁아서(직접 측정: 실제 gap이 0.0~2.0px로 나옴), "진짜 halo가
+    # 있다"고 신뢰할 수 없다 -- 그래서 이 경우는 다시 사각형 폴백으로
+    # 가고, 사각형 폴백이 실제로 그림을 잘라먹으므로 예전(11차 이전)과
+    # 똑같이 경고가 남아야 한다. 이건 회귀가 아니라 의도된 동작이다: 3px
+    # 처럼 노이즈 수준의 여유만 있는 선택은, 추적을 신뢰하기보다 작가에게
+    # 다시 확인하라고 경고하는 쪽이 더 안전하다.
+    app._selection_px = (318 - 3, 175 - 3, 513.75 + 3, 289.75 + 3)  # shape #2, 노이즈 폭 이하로 빠듯함
     item3b = app._generate_one_item(scene_path)
     check(
-        "너무 좁은 무테 선택은 '무테 칼선 경고' 노트를 남김",
+        "노이즈 폭 이하로 빠듯한 선택은 halo를 신뢰할 수 없어 다시 경고가 남음",
         any("무테 칼선 경고" in a for a in item3b.adjustments),
+    )
+    check(
+        "이 경우는 추적 결과를 안 썼으므로 '실제 선/색 경계를 추적' 노트는 없음",
+        not any("실제 선/색 경계를 추적한 모양을 기준으로" in a for a in item3b.adjustments),
+    )
+
+    # ---- 3c) 반면, 노이즈 폭보다는 확실히 넓지만 그림 대비로는 여전히
+    # 빠듯한 여유(8px -- margin_mm 인셋(약 8.86px, dpi=150)보다도 좁음)는
+    # halo로 신뢰되어 추적 경로를 타고, 경고 없이 정상 처리된다 -- 이게
+    # 바로 11차 개선이 실제로 지켜지는 경우(3b와의 대비로 "halo 판정"의
+    # 경계가 어디인지 함께 보여줌).
+    app._selection_px = (318 - 8, 175 - 8, 513.75 + 8, 289.75 + 8)  # shape #2, 노이즈 폭보다는 넓음
+    item3c = app._generate_one_item(scene_path)
+    check(
+        "노이즈 폭보다 넓은 빠듯한 선택은 halo로 신뢰되어 경고가 안 남음",
+        not any("무테 칼선 경고" in a for a in item3c.adjustments),
+    )
+    check(
+        "이 경우는 실제 경계 추적 경로를 탔다는 노트가 남음",
+        any("실제 선/색 경계를 추적" in a for a in item3c.adjustments),
     )
 
     # ---- 4) 도무송 (DOMUSONG / CIRCLE), a third region on the same scene ----
@@ -112,7 +145,15 @@ def main():
     app.job_type.set("DOMUSONG")
     app.cutline_type.set(CutlineType.CIRCLE.name)
     item4 = app._generate_one_item(scene_path)
-    check("도무송/CIRCLE item has all 3 tiers", set(item4.offsets.keys()) == {"safety", "cut", "bleed"})
+    # 2026-09-10(34차) 피드백("안쪽의 초록 선은 필요없어")으로 도무송 직접
+    # 선택 경로(_run_mixed_generate_subset)는 반환 직전 safety 키를 일부러
+    # 지운다(enforce_minimum_gap의 최소 간격 계산엔 이미 반영된 뒤라 칼선/
+    # 블리딩 위치엔 영향 없음) -- 그래서 이 테스트가 처음 만들어졌을 때
+    # 기대했던 "3단 전부"가 아니라 cut/bleed 2단만 남는 게 지금의 의도된
+    # 동작이다. 이 파일은 tkinter가 없는 샌드박스에서는 여태 아예 실행이
+    # 안 됐었어서(2026-09-11, python3.12+Xvfb로 처음 실행) 이 어긋남이
+    # 지금까지 드러나지 않았었다.
+    check("도무송/CIRCLE item has cut+bleed (safety는 34차부터 의도적으로 제거)", set(item4.offsets.keys()) == {"cut", "bleed"})
     app._accumulated.append(item4)
 
     # ---- 5) combine all 3 accumulated scene.png items into ONE result ----
@@ -120,7 +161,12 @@ def main():
     from core.cutline_core import MIN_GAP_MM, mm_to_px
 
     combined = combine_results(app._accumulated)
-    check("combined result has cut/safety/bleed tiers", set(combined.offsets.keys()) == {"cut", "safety", "bleed"})
+    # 여기 누적된 3개(item2 유테/item3 무테는 원래도 'cut'만 있음, item4
+    # 도무송은 34차부터 'safety'가 빠짐)엔 애초에 'safety'를 갖고 있는
+    # 항목이 하나도 없다(item1 완칼은 ring.png용이라 _on_reset_accumulation
+    # 으로 이미 비워짐, scene.png 3개엔 안 들어있음) -- 그래서 합친 결과도
+    # 'safety'가 없는 게 맞다.
+    check("combined result has cut/bleed tiers (safety 기여 항목이 없음)", set(combined.offsets.keys()) == {"cut", "bleed"})
     check("combined 'cut' tier non-empty", not combined.offsets["cut"].is_empty)
     check(
         "3 accumulated items -> 3 per-item notes in combined.adjustments",
@@ -131,22 +177,22 @@ def main():
         any("하나의 파일로 누적" in a for a in combined.adjustments),
     )
 
-    # min-gap enforcement sanity: no two distinct polygons in the combined
-    # 'cut' tier should be closer to each other than MIN_GAP_MM (converted
-    # to px at this dpi) -- merge_close_elements should have fused anything
-    # that close into one polygon already, so remaining SEPARATE polygons
-    # must already be farther apart than the gap.
+    # 2026-09-14부터: combine_results는 서로 다른 누적 항목끼리 더 이상 2mm
+    # 최소 간격을 강제로 합쳐서 지키지 않는다(멍푸님 지시 "2번" -- 개체마다
+    # 반드시 개별 칼선, 아무리 가깝거나 겹쳐도 병합 금지). 그래서 여기선 그
+    # 가정을 검증하는 대신, 각 항목의 원본 'cut' 도형이 buffer/union 없이
+    # 그대로(개수 그대로) 보존됐는지만 확인한다.
     gap_px = mm_to_px(MIN_GAP_MM, combined.dpi)
     polys = list(combined.offsets["cut"].geoms)
-    min_dist = None
-    for i in range(len(polys)):
-        for j in range(i + 1, len(polys)):
-            d = polys[i].distance(polys[j])
-            if min_dist is None or d < min_dist:
-                min_dist = d
+    per_item_cut_polys = sum(
+        len(list(it.offsets["cut"].geoms)) if hasattr(it.offsets["cut"], "geoms") else 1
+        for it in app._accumulated
+        if "cut" in it.offsets and it.offsets["cut"] is not None and not it.offsets["cut"].is_empty
+    )
     check(
-        f"min-gap holds across combined 'cut' polygons (min_dist={min_dist}, gap_px={gap_px:.1f})",
-        min_dist is None or min_dist >= gap_px - 1.0,  # small tolerance for buffer-round-trip rounding
+        f"combined 'cut' polygon count == sum of each item's own polygon count "
+        f"(합치지 않고 개별 보존, combined={len(polys)}, per-item 합={per_item_cut_polys}, gap_px={gap_px:.1f})",
+        len(polys) == per_item_cut_polys,
     )
 
     # ---- 6) export/preview functions accept the combined multi-tier-mix result ----
@@ -164,13 +210,13 @@ def main():
 
     # ---- 7) job-type validation errors fire when required selection is missing ----
     app._on_reset_accumulation()
-    app.job_type.set("STICKER")
+    app.job_type.set("LINE_ART")
     app._selection_px = None
     try:
         app._generate_one_item(scene_path)
-        check("스티커 without selection raises", False)
+        check("유테 without selection raises", False)
     except ValueError as e:
-        check(f"스티커 without selection raises ValueError ({e})", True)
+        check(f"유테 without selection raises ValueError ({e})", True)
 
     app.job_type.set("DOMUSONG")
     app._selection_px = None

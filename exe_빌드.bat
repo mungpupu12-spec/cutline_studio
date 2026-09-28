@@ -4,12 +4,18 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 echo ============================================
-echo   CutLine Studio - exe로 빌드하기
+echo   컷라인 스튜디오 - exe로 빌드하기
 echo ============================================
 echo.
-echo 이 창은 CutLine Studio.exe 하나만 있으면 Python 설치 없이도 더블클릭으로
-echo 바로 실행되는 실행 파일을 만듭니다. 완성되면 dist 폴더 안에
-echo "CutLine Studio.exe"가 생깁니다.
+echo 이 창은 Python 설치 없이도 더블클릭으로 바로 실행되는 프로그램을
+echo 만듭니다. 완성되면 dist\컷라인 스튜디오 폴더가 생기고, 그 안의
+echo "컷라인 스튜디오.exe"를 더블클릭하면 실행됩니다.
+echo (2026-08-31: 이전엔 exe 파일 하나만 있으면 됐지만, 실행할 때마다
+echo  내부적으로 압축을 푸는 방식이라 컴퓨터에 따라 이 과정이 느려
+echo  "검은 화면만 뜨고 멈춘 것처럼" 보이는 문제가 있었습니다. 지금은
+echo  폴더 안에 필요한 파일이 미리 풀려있는 방식이라 훨씬 빠르고
+echo  안정적으로 실행됩니다 -- 대신 exe 파일만 옮기지 말고, 폴더
+echo  전체를 통째로 복사해서 옮겨야 합니다.)
 echo.
 
 where python >nul 2>nul
@@ -64,10 +70,27 @@ if errorlevel 1 (
 )
 
 echo.
+echo 튜토리얼 슬라이드 이미지를 준비합니다...
+python assets\make_tutorial_slides.py
+
+if errorlevel 1 (
+    echo.
+    echo [오류] 튜토리얼 이미지 준비 중 문제가 발생했습니다. 위 오류 메시지를 확인해주세요.
+    pause
+    exit /b 1
+)
+
+echo.
 echo exe로 빌드합니다 -- 컴퓨터에 따라 몇 분 정도 걸릴 수 있습니다...
 echo.
-python -m PyInstaller --noconfirm --onefile --windowed ^
-    --name "CutLine Studio" ^
+rem 2026-08-31: "--onefile"은 실행할 때마다 매번 임시 폴더에 내용을 다시
+rem 풀어야 해서, 무거운 라이브러리(cv2/shapely/fitz 등)와 겹치면 시작이
+rem 느려지고 그 사이 검은 화면만 보이다 닫히는 것처럼 보일 수 있었음.
+rem "--onedir"은 한 번만 풀어서 폴더에 고정해두는 방식이라 매 실행이
+rem 훨씬 빠르고 안정적임 -- 대신 결과물이 exe 파일 하나가 아니라 폴더
+rem 전체가 됨(아래 완료 안내 참고).
+python -m PyInstaller --noconfirm --onedir --windowed ^
+    --name "컷라인 스튜디오" ^
     --icon assets\app_icon.ico ^
     --collect-all customtkinter ^
     --collect-all cv2 ^
@@ -75,8 +98,10 @@ python -m PyInstaller --noconfirm --onefile --windowed ^
     --collect-all fitz ^
     --collect-all PIL ^
     --collect-all cryptography ^
+    --collect-all skimage ^
     --add-data "assets\app_icon.ico;assets" ^
     --add-data "assets\app_icon.png;assets" ^
+    --add-data "assets\tutorial;assets\tutorial" ^
     gui\app.py
 
 if errorlevel 1 (
@@ -88,9 +113,10 @@ if errorlevel 1 (
 
 echo.
 echo ============================================
-echo   완료! dist 폴더 안의 "CutLine Studio.exe" 파일이 만들어졌습니다.
-echo   이 파일 하나만 원하는 곳(바탕화면 등)에 복사해서 더블클릭하면
-echo   Python 설치 없이 바로 실행됩니다.
+echo   완료! dist\컷라인 스튜디오 폴더가 만들어졌습니다.
+echo   그 폴더 전체를 원하는 곳(바탕화면 등)에 통째로 복사한 뒤,
+echo   폴더 안의 "컷라인 스튜디오.exe"를 더블클릭하면 실행됩니다.
+echo   (exe 파일만 따로 복사하면 실행되지 않으니 꼭 폴더째로 옮기세요.)
 echo ============================================
 echo.
 start "" explorer "dist"

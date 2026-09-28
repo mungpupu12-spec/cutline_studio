@@ -21,11 +21,54 @@ from PIL import Image
 
 from shapely.geometry import MultiPolygon, Polygon
 
-from .cutline_core import CutlineResult, MIN_GAP_MM, OffsetSpec, compute_offsets, mm_to_px, px_to_mm
+from .cutline_core import (
+    CutlineResult,
+    MIN_DOMUSONG_GAP_MM,
+    MIN_GAP_MM,
+    OffsetSpec,
+    compute_offsets,
+    mm_to_px,
+    px_to_mm,
+    smooth_design_naturally,
+)
 from .cutline_types import CutlineType, build_cutline_design
 from .image_style import ImageStyle, generate_style_cutline
 from .segmentation import segment_design_in_region
 from .style_classify import DEFAULT_RECTANGULARITY_THRESHOLD, StyleClassification, classify_style
+
+# 2026-09-08 피드백("햄스터를 칼선을 따야 하는데 햄스터 배를 동그랗게 칼선을
+# 생성했어"): 빽빽하게 붙어있는 반복 패턴 시트(예: 너구리+곰+꽃 격자)에서
+# GrabCut으로 실루엣을 추적하면, 캐릭터 몸 전체가 아니라 몸 안에서 색이 가장
+# 뚜렷하게 갈리는 작은 부분(예: 배의 밝은 무늬)만 잡아버리는 경우가 실제로
+# 확인됐다 -- 캐릭터의 몸통-배경 경계보다 캐릭터 "안"의 배-몸통 경계가 색
+# 대비가 더 강해서, GrabCut의 그래프컷이 그 더 강한 안쪽 경계에 달라붙어
+# 버리기 때문이다(core.interactive_cutline.generate_cutline_from_known_silhouette
+# 문서에도 이미 기록되어 있듯, 이전 세션에서 이미 한 번 확인된 GrabCut의
+# 근본적인 한계 -- "sure foreground" 시드를 중심에 둬도 결과가 똑같았던
+# 사례와 동일한 종류의 실패). 즉 이건 "더 똑똑한 시딩"으로 고칠 수 있는
+# 문제가 아니라, 결과가 명백히 잘못됐을 때(선택 영역의 극히 일부만 잡힘)
+# 그걸 감지해서 더 안전한 결과(사각형 컷)로 대체해야 하는 문제.
+#
+# 아래 min_ratio=0.35는 임의의 숫자가 아니라, "실루엣이 선택 영역(그 스티커가
+# 있는 셀/박스)의 최소 이 정도 비율은 채워야 정상적인 캐릭터로 볼 수 있다"는
+# 보수적인 안전 기준선이다 -- 실제 벨리(배) 부분만 잡히는 경우처럼 훨씬 작은
+# 조각이 나오면, 잘못 추적됐을 가능성이 매우 높다고 보고 대체한다.
+DEFAULT_UNDERSIZED_SILHOUETTE_RATIO = 0.35
+
+
+def is_silhouette_undersized(
+    design_area_px: float,
+    reference_area_px: float,
+    min_ratio: float = DEFAULT_UNDERSIZED_SILHOUETTE_RATIO,
+) -> bool:
+    """실루엣 추적 결과(design_area_px)가 원래 선택 영역(reference_area_px,
+    보통 자동 인식된 셀/박스의 넓이)에 비해 지나치게 작으면 True -- GrabCut이
+    캐릭터 전체가 아니라 몸 안의 대비가 강한 작은 부분(배 무늬 등)만 잘못
+    잡았을 가능성이 높다는 신호. reference_area_px가 0 이하(방어적 처리)면
+    비교할 기준이 없으므로 항상 False."""
+    if reference_area_px <= 0:
+        return False
+    return design_area_px < min_ratio * reference_area_px
 
 
 def generate_cutline_for_selection(
@@ -81,6 +124,54 @@ def generate_cutline_for_selection(
             image_path, selection_px, margin_px=grabcut_margin_px,
             supersample=supersample, note_sink=precision_notes,
         )
+        # 2026-09-09(14차/15차/16차) 피드백("모든 칼선은 매끄러워야하는데
+        # 다 선이 구불구불해" -> "자연스러운 칼선이 중요해 옵션이 아니라
+        # 기본이 되어야해" -> "칼선이 매끄럽지 않으면... 인쇄업체에서 해당
+        # 파일을 받아주지 않아. 매끄럽게 강도 강하게"):
+        # core.image_style.generate_style_cutline(유테)와 같은 크기 기준
+        # (참고 mm의 8배, 조각별로 스스로 크기를 낮추는
+        # smooth_design_naturally)을 여기(완칼/도무송)에도 그대로 적용 --
+        # 실제 파일로 두 경로를 나란히 돌려봤을 때 한쪽만 매끄럽게 처리되고
+        # 있던 차이를 없앤다. 기준 mm는 이 함수엔 하나의 margin_mm이 없으니
+        # (safety/cut/bleed 세 단계) 그중 가장 안쪽인 safety_mm을 쓴다.
+        smooth_ref_mm = offset_mm.safety_mm if offset_mm is not None else 1.0
+        presmooth_px = mm_to_px(smooth_ref_mm, dpi) * 8.0
+        content = smooth_design_naturally(content, presmooth_px)
+
+        # 2026-09-12(58차) 피드백("도무송은 밀렸고"): 도무송(CIRCLE/ELLIPSE/
+        # SQUARE/RECTANGLE)은 core.cutline_types.fit_domusong_shape가 이
+        # content의 bbox 중심에 딱 맞춰 모양을 만든다 -- 그런데 이 문서
+        # 위쪽(core.segmentation.segment_design_in_region 독스트링, 4번
+        # 항목)에도 이미 기록돼 있듯, GrabCut이 캐릭터 전체가 아니라 안쪽의
+        # 색 대비가 가장 강한 작은 무늬/디테일만 잡아버리는 실패가 실제로
+        # 있다(core.style_classify 문서에도 같은 종류의 실패가 기록됨).
+        # 유테/무테(BORDERLESS/LINE_ART) 경로는 이미 이 실패를
+        # is_silhouette_undersized로 감지해서 안전하게 대체하는데(gui/app.py
+        # 참고), 도무송 경로만 그 안전장치가 전혀 없어서 GrabCut이 이렇게
+        # 실패하면 다이컷 중심 자체가 실제 캐릭터 중심에서 벗어난 채로 그냥
+        # 나갔다 -- 실제 8개 파일로 재현/확인됨(스크래치패드
+        # qa_domusong_center_shift_all8.py, 커밋 안 함: 선택 영역 75개 중
+        # 14개에서 GrabCut 중심이 독립적인 기준 중심과 5%p 이상 벗어남,
+        # 최악 사례는 캐릭터의 배경-실루엣 경계는 놓치고 안쪽 흰색 장식
+        # 무늬만 잡음). 완칼(FULL_CUT)은 추적된 실루엣 자체가 결과물이라
+        # 이 문제와 무관하므로 도무송 타입에만 적용한다 -- 실루엣이
+        # 지나치게 작으면(선택 영역의 상당 부분을 놓쳤을 가능성) 잘못
+        # 추적됐다고 보고, 이미 검증된 "선택 영역 자체를 그대로 쓴다"(
+        # use_grabcut=False와 동일한 안전한 값)로 대체한다.
+        if cutline_type.is_domusong:
+            sel_x0, sel_y0, sel_x1, sel_y1 = selection_px
+            selection_area_px = max(0.0, (sel_x1 - sel_x0) * (sel_y1 - sel_y0))
+            content_area_px = content.area if content is not None and not content.is_empty else 0.0
+            if is_silhouette_undersized(content_area_px, selection_area_px):
+                ratio_pct = (
+                    content_area_px / selection_area_px * 100 if selection_area_px > 0 else 0.0
+                )
+                precision_notes.append(
+                    f"도무송: 실루엣 추적 결과가 선택 영역의 {ratio_pct:.0f}%밖에 안 돼(예: "
+                    f"몸통 전체가 아니라 안쪽 무늬 일부만 잡혔을 가능성) 잘못됐다고 보고, "
+                    f"선택 영역 자체를 기준으로 다이컷 중심/크기를 잡았습니다."
+                )
+                content = tuple(selection_px)
     else:
         content = tuple(selection_px)
 
@@ -92,10 +183,24 @@ def generate_cutline_for_selection(
     if bounds_px is None:
         bounds_px = (0, 0, w, h)
 
-    offset_mm_adj, adjustments = offset_mm.enforce_minimum_gap()
+    # 도무송(CIRCLE/ELLIPSE/SQUARE/RECTANGLE)과 완칼(FULL_CUT)은 최소 여유
+    # 기준이 다를 수 있어 별도 상수를 쓴다 -- 40차엔 도무송 전용 15mm를
+    # 뒀었지만, 53차에 실제 인쇄소 도무송 가이드 파일 실측(2.0mm)에 맞춰
+    # MIN_DOMUSONG_GAP_MM 자체를 2.0mm로 낮췄다(core.cutline_core 참고).
+    # 지금은 두 상수 값이 같아졌어도, 선택 로직 자체는 그대로 둔다.
+    min_gap_mm = MIN_DOMUSONG_GAP_MM if cutline_type.is_domusong else MIN_GAP_MM
+    offset_mm_adj, adjustments = offset_mm.enforce_minimum_gap(min_gap_mm=min_gap_mm)
     adjustments = precision_notes + adjustments
+    # 2026-09-10 피드백("도무송 파란색 선이 모서리가 뾰족해야 해"): 완칼(둥근
+    # join_style=1, 실루엣 굴곡을 매끄럽게 따라가야 하는 경우)과 달리, 도무송
+    # 정사각형/직사각형은 실제 금형이 각진 물리적 모서리라 buffer로 바깥으로
+    # 밀어도 90도 각이 그대로 살아있어야 한다 -- join_style=2(mitre)로 바꿔
+    # 모서리를 뾰족하게 유지한다(원형/타원형 도무송은 애초에 각진 모서리가
+    # 없어 이 값을 바꿔도 시각적으로 차이가 없음, 회귀 없음).
+    join_style = 2 if cutline_type.is_domusong else 1
     offsets = compute_offsets(
-        design, dpi, offset_mm_adj, merge_gap_mm=merge_gap_mm, clip_bounds=bounds_px
+        design, dpi, offset_mm_adj, join_style=join_style,
+        merge_gap_mm=merge_gap_mm, clip_bounds=bounds_px,
     )
 
     return CutlineResult(
@@ -118,6 +223,7 @@ def generate_cutline_by_style(
     margin_mm: float = 1.5,
     grabcut_margin_px: int = 40,
     supersample: int = 4,
+    sibling_boxes_px: Optional[list] = None,
 ) -> CutlineResult:
     """
     The real, everyday case (core.image_style): 유테 (line-art character on
@@ -146,6 +252,7 @@ def generate_cutline_by_style(
         grabcut_margin_px=grabcut_margin_px,
         supersample=supersample,
         note_sink=notes,
+        sibling_boxes_px=sibling_boxes_px,
     )
     if isinstance(line, Polygon):
         line_mp = MultiPolygon([line]) if not line.is_empty else MultiPolygon([])
@@ -295,6 +402,7 @@ def generate_cutline_auto(
     small_element_max_dim_mm: Optional[float] = None,
     reference_silhouette_px: Optional[Polygon] = None,
     supersample: int = 4,
+    sibling_boxes_px: Optional[list] = None,
 ) -> CutlineResult:
     """
     The "실무 기본값" auto-detect entry point: segments the ONE thing inside
@@ -358,6 +466,13 @@ def generate_cutline_auto(
     large selection (`core.cutline_core.auto_supersample`), with any cap
     recorded in the returned `adjustments`.
 
+    `sibling_boxes_px`: 같은 칸/영역 안에서 이미 낱개로 인식된 다른
+    요소들의 박스(원본 이미지 절대 좌표, 자기 자신은 뺀 목록). 유테로
+    분류될 때만 실제로 쓰인다(core.image_style._grow_design_into_low_
+    contrast_halo_px에 그대로 전달돼, 저대비 헤일로 확장이 그 박스들
+    영역으로는 절대 번지지 않게 막는다 -- 2026-09-14, "칼선이 개체를 안
+    둘러싸고 여러 개체를 휘감는다" 실제 파일 피드백으로 추가).
+
     Returns a CutlineResult whose `adjustments` records which style was
     auto-detected and the measured rectangularity score, so the GUI can
     show its work instead of silently guessing -- if the score looks
@@ -416,6 +531,7 @@ def generate_cutline_auto(
         margin_mm=margin_mm,
         grabcut_margin_px=grabcut_margin_px,
         supersample=supersample,
+        sibling_boxes_px=sibling_boxes_px,
     )
     if classification.halo_detected:
         note = (

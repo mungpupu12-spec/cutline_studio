@@ -3,12 +3,12 @@ General pixel<->page-point mapping for a placed raster image, INCLUDING
 rotation -- not just the axis-aligned scale+translate every other module
 in this project has assumed so far.
 
-Why this exists: every real file this project validated against before
-(1/2/3/4조수희) happened to place its single embedded print image
-completely unrotated, so "image pixel (px,py) -> page point" was always
-just a uniform per-axis scale from the image's own placement rect
-(rx0,ry0,rx1,ry1). `5조수희_5_유포지_인델별(색감 수정).ai` breaks that
-assumption two ways at once: (a) it places the SAME repeating-tile image
+Why this exists: several real files this project validated against before
+happened to place their single embedded print image completely unrotated,
+so "image pixel (px,py) -> page point" was always just a uniform per-axis
+scale from the image's own placement rect (rx0,ry0,rx1,ry1). A later real
+reference file breaks that assumption two ways at once: (a) it places the
+SAME repeating-tile image
 seven times (six upright, one physically rotated 90 degrees into a
 leftover corner), and (b) its reused "bunny corner" design is *also*
 placed rotated. Both need the image's real PDF placement MATRIX, not just
@@ -32,8 +32,8 @@ PyMuPDF Matrix always lands in the field with the same letter. This
 module treats a raw pixel (px, py) in the image's own raster (0..W, 0..H,
 origin top-left, y down -- exactly what cv2.imread / doc.extract_image's
 saved PNG use) as u=px/W, v=py/H, and exposes both directions. Verified
-against a real rotated placement (5조수희_인델별: a 90-degree-rotated
-tile instance) -- see core/image_placement's test in the dev journal for
+against a real rotated placement (a 90-degree-rotated
+tile instance from a real reference file) -- see core/image_placement's test in the dev journal for
 the worked numeric check.
 """
 

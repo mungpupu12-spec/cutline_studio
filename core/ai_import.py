@@ -16,9 +16,34 @@ technique already used and verified in core.ai_cutline_reader.load_real_cutlines
 against this project's real production files, which always embed one
 flattened print image) so the working image is the artist's own pixels at
 their own resolution -- never a re-rendered copy that could lose quality.
-Falls back to flattening the whole page at the requested DPI only when the
-file has no embedded raster at all (a purely vector illustration with no
-placed bitmap).
+Falls back to flattening the whole page at the requested DPI when the file
+has no embedded raster at all (a purely vector illustration with no placed
+bitmap), OR (2026-09-08(10차) 피드백: "자료집에 있는 일러스트 파일 전부
+칼선 분석하고 문제에 반영해") when the page embeds MORE THAN ONE distinct
+raster image.
+
+That second case was found by actually running this on every .ai file in
+멍푸님's "자료집"(교재) reference folder, not just her usual single-sheet
+production files: several files there (masking-tape roll templates, a
+multi-motif reference sheet) place SEVERAL DIFFERENT small motif images side by side
+on one page (e.g. one real file: 4 distinct dessert-character motifs, each
+placed 5 times along a tape strip -- 20 placements, 4 distinct images).
+`page.get_images(full=True)` lists EVERY placement, so `images[0]` there
+was just whichever ONE of the 4 motifs happened to be embedded first in the
+PDF's internal object order -- extracting only that xref silently discarded
+the other 3 motifs entirely and returned that one motif's own raw embedded
+resolution (its full original source-art size, e.g. 3500x3500px) instead of
+anything resembling the actual tiny tiled strip that's really printed. The
+correct working image for a page like that is the fully composited page
+itself (every motif, at its real placement/size) -- exactly what
+`page.get_pixmap()` already produces -- not any single embedded asset.
+
+A page where every placement shares the SAME single embedded xref (her
+normal production files, and reference files that just repeat one design
+many times) is unaffected by this change: "more than one DISTINCT image"
+is judged by the number of unique xrefs among all placements, not the
+number of placements, so a design repeated 12 times under one xref still
+takes the fast, full-resolution extraction path exactly as before.
 """
 
 from __future__ import annotations
@@ -40,18 +65,25 @@ def load_ai_as_raster(ai_path: str, out_path: str, dpi: float = 300.0, page_inde
         page = doc[page_index]
 
         images = page.get_images(full=True)
-        if images:
-            # 실제 인쇄용 래스터가 이미 심겨 있으면(이 프로젝트가 검증한 실제
-            # 완성 파일들은 전부 이런 구조) 그 원본 픽셀을 그대로 추출 --
-            # 다시 렌더링해서 해상도/화질을 잃지 않도록.
+        distinct_xrefs = {entry[0] for entry in images}
+        if images and len(distinct_xrefs) == 1:
+            # 실제 인쇄용 래스터가 이미 심겨 있고(같은 그림이 여러 번
+            # 배치됐더라도 전부 같은 xref) 딱 하나뿐이면(이 프로젝트가
+            # 검증한 실제 완성 파일들은 전부 이런 구조) 그 원본 픽셀을
+            # 그대로 추출 -- 다시 렌더링해서 해상도/화질을 잃지 않도록.
             xref = images[0][0]
             info = doc.extract_image(xref)
             with open(out_path, "wb") as f:
                 f.write(info["image"])
             return out_path
 
-        # 심겨 있는 래스터가 없는 순수 벡터 일러스트 -- 요청한 DPI로 페이지
-        # 자체를 통째로 래스터화 (알파 유지).
+        # 아래 두 경우 모두 페이지 자체를 통째로 래스터화(알파 유지)한다:
+        #   1. 심겨 있는 래스터가 아예 없는 순수 벡터 일러스트
+        #   2. 서로 다른 이미지가 2개 이상 심겨 있는 경우(예: 마스킹테이프
+        #      시트에 서로 다른 모티프 여러 개가 각각 여러 번 배치된 구성)
+        #      -- 이땐 그중 하나만 골라 추출하면 나머지 모티프를 전부
+        #      잃어버리므로, 모든 모티프가 실제 배치대로 합성된 페이지
+        #      전체를 쓰는 것만이 올바르다.
         zoom = max(dpi, 1.0) / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=True)
         pix.save(out_path)
