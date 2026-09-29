@@ -2148,6 +2148,8 @@ def detect_elements_by_background_flood_px(
     flood_delta: int = 12,
     min_area_ratio: float = 0.003,
     _img=None,
+    known_bg_lab=None,
+    bg_colors_out=None,
 ):
     """2026-09-28 무테 "보조 탐지기"(멍푸: "1개로 해결되지 않으면 1차, 2차 ...
     보조 보완 프로그램", "테스트 칼선 보면서 대조해"). 칸 안의 요소를 선(Canny)
@@ -2165,6 +2167,13 @@ def detect_elements_by_background_flood_px(
 
     한 가장자리에만 닿은 색(예: 칸 모서리에 걸친 캐릭터)은 배경 출발점으로
     쓰지 않아, 칸 가장자리에 걸친 요소가 배경으로 채워지지 않게 한다.
+
+    `known_bg_lab`: 같은 시트의 다른 칸에서 배경으로 확인된 색(Lab) 목록.
+    2026-09-29(실제 파일): 90도 돌려 놓은 칸에서는 잔디 언덕이 칸 한쪽(왼쪽)에만
+    닿고 그마저 캐릭터에 가려 두 토막이라, 위 규칙으로는 배경이 아닌 "요소"로
+    잡혀 잔디+캐릭터가 한 칼선이 됐다(배경이 칼선에 들어감). 다른 칸에서 이미
+    배경으로 확인된 색과 같은 가장자리 색은 배경 출발점으로 인정한다.
+    `bg_colors_out`: 주어지면 이 칸에서 배경으로 인정한 색(Lab 평균)을 담아 준다.
 
     Returns: 원본 이미지 좌표 Polygon 목록(요소 실루엣)."""
     from shapely.geometry import Polygon as _Polygon
@@ -2196,7 +2205,7 @@ def detect_elements_by_background_flood_px(
     K = 8
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     cv2.setRNGSeed(42)
-    _, labels, _ = cv2.kmeans(ring, K, None, crit, 2, cv2.KMEANS_PP_CENTERS)
+    _, labels, centers = cv2.kmeans(ring, K, None, crit, 2, cv2.KMEANS_PP_CENTERS)
     labels = labels.ravel()
     share = np.bincount(labels, minlength=K) / max(1, len(labels))
     ys, xs = np.where(ring_idx)
@@ -2209,13 +2218,46 @@ def detect_elements_by_background_flood_px(
             pres[nm] = (np.logical_and(sel, labels == k).sum() / tot) >= 0.03
         if (pres["L"] and pres["R"]) or (pres["T"] and pres["B"]) or share[k] >= 0.25:
             good.add(k)
+        elif known_bg_lab and share[k] >= 0.03:
+            c = centers[k]
+            if min(float(np.linalg.norm(c - np.asarray(b, np.float32))) for b in known_bg_lab) <= 10.0:
+                good.add(k)
+    if bg_colors_out is not None:
+        for k in good:
+            if share[k] >= 0.03:
+                bg_colors_out.append(tuple(float(v) for v in centers[k]))
     flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+
+    def _seed_point(i):
+        """가장자리 픽셀이 색 경계(장벽)면 -- 칸 테두리 선·재단 틈 때문에 가장자리
+        몇 px가 통째로 장벽인 칸이 실제로 있었다(90도 돌린 칸 왼쪽) -- 칸 안쪽으로
+        최대 12px 들어가며 장벽이 아닌 첫 픽셀을 출발점으로 쓴다."""
+        sx, sy = int(xs[i]), int(ys[i])
+        dx = 1 if sx < t else (-1 if sx >= w - t else 0)
+        dy = 1 if sy < t else (-1 if sy >= h - t else 0)
+        ref = centers[int(labels[i])]
+        for step in range(0, 13):
+            px, py = sx + dx * step, sy + dy * step
+            if not (0 <= px < w and 0 <= py < h):
+                return None
+            if not mask[py + 1, px + 1]:
+                if step == 0:
+                    return px, py
+                # 안쪽으로 들어간 점은 원래 가장자리 색과 같은 색일 때만(다른 색
+                # 요소 안으로 들어가 그 요소를 배경으로 채우지 않게)
+                if float(np.linalg.norm(lab[py, px] - ref)) <= 1.5 * flood_delta:
+                    return px, py
+                return None
+            if dx == 0 and dy == 0:
+                return None
+        return None
+
     seed_ids = [i for i in range(len(labels)) if int(labels[i]) in good][::5]
     for i in seed_ids:
-        sx, sy = int(xs[i]), int(ys[i])
-        if mask[sy + 1, sx + 1]:
+        pt = _seed_point(i)
+        if pt is None:
             continue
-        cv2.floodFill(sm, mask, (sx, sy), 0, (flood_delta,) * 3, (flood_delta,) * 3, flags)
+        cv2.floodFill(sm, mask, pt, 0, (flood_delta,) * 3, (flood_delta,) * 3, flags)
     # 2차: 한쪽 가장자리에만 보이는 색(예: 칸 한쪽 끝을 요소가 가려서 반대편엔
     # 안 보이는 가로 줄무늬)도, 거기서 채운 영역이 칸 폭/높이의 80% 이상
     # 길게 뻗으면 배경(줄무늬·띠)으로 인정한다. 칸 가장자리에 걸친 캐릭터는
@@ -2224,11 +2266,11 @@ def detect_elements_by_background_flood_px(
     for i in range(0, len(labels), 5):
         if int(labels[i]) in good:
             continue
-        sx, sy = int(xs[i]), int(ys[i])
-        if mask[sy + 1, sx + 1]:
+        pt = _seed_point(i)
+        if pt is None:
             continue
         trial = mask.copy()
-        cv2.floodFill(sm, trial, (sx, sy), 0, (flood_delta,) * 3, (flood_delta,) * 3, flags2)
+        cv2.floodFill(sm, trial, pt, 0, (flood_delta,) * 3, (flood_delta,) * 3, flags2)
         region = trial == 128
         if not region.any():
             continue
@@ -2274,6 +2316,60 @@ def detect_elements_by_background_flood_px(
                 p = max(p.geoms, key=lambda g: g.area)
             polys.append(p.simplify(0.8))
     return polys
+
+
+def merge_boxes_of_one_art_piece_px(image_path: str, cell_px: tuple, sub_boxes: list,
+                                    neck_mm: float = 1.5, dpi: float = 300.0):
+    """한 덩어리 그림이 색 경계로 두 박스로 쪼개진 것을 다시 합친다.
+
+    2026-09-29(실제 손 칼선 대조): 펼친 책(가운데 책등 선) 한 권이 왼쪽/오른쪽
+    쪽으로 쪼개져 칼선이 2개 생겼다 -- 실제 칼선은 책 전체에 1개. 칸 배경에서
+    채워 "배경이 아닌 덩어리"(detect_elements_by_background_flood_px)를 구하고,
+    두 박스의 그림이 같은 덩어리이면서 그 연결이 넓을 때(폭 neck_mm*2 이상 --
+    얇은 줄기·꼭짓점으로만 닿은 꽃과 잎처럼 따로 자르는 것은 합치지 않음)만
+    두 박스를 하나로 합친다."""
+    from shapely.geometry import box as _box
+    from shapely.ops import unary_union as _uu
+
+    if len(sub_boxes) < 2:
+        return sub_boxes
+    objs = detect_elements_by_background_flood_px(image_path, cell_px)
+    if not objs:
+        return sub_boxes
+    r = neck_mm * dpi / 25.4
+    boxes = [tuple(b) for b in sub_boxes]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                bi, bj = _box(*boxes[i]), _box(*boxes[j])
+                if bi.distance(bj) > 2 * r:
+                    continue
+                for obj in objs:
+                    a, b = obj.intersection(bi), obj.intersection(bj)
+                    if a.area < 0.25 * bi.area or b.area < 0.25 * bj.area:
+                        continue
+                    eroded = _uu([a, b]).buffer(-r)
+                    if eroded.is_empty:
+                        continue
+                    comps = list(eroded.geoms) if hasattr(eroded, "geoms") else [eroded]
+                    only_i, only_j = bi.difference(bj), bj.difference(bi)
+                    if any(
+                        c.intersection(only_i).area >= 0.1 * bi.area
+                        and c.intersection(only_j).area >= 0.1 * bj.area
+                        for c in comps
+                    ):
+                        u = (min(boxes[i][0], boxes[j][0]), min(boxes[i][1], boxes[j][1]),
+                             max(boxes[i][2], boxes[j][2]), max(boxes[i][3], boxes[j][3]))
+                        boxes = [bx for k, bx in enumerate(boxes) if k not in (i, j)] + [u]
+                        changed = True
+                        break
+                if changed:
+                    break
+            if changed:
+                break
+    return boxes
 
 
 def group_content_cells_px(image_path: str, cell_boxes: list):
@@ -2361,6 +2457,10 @@ def detect_repeat_aware_sub_element_boxes_px(image_path: str, cell_boxes: list, 
             )
         except Exception:  # noqa: BLE001
             sub_boxes = [primary_box]
+        try:
+            sub_boxes = merge_boxes_of_one_art_piece_px(image_path, primary_box, sub_boxes)
+        except Exception:  # noqa: BLE001
+            pass
         for sub_box in sub_boxes:
             group_indices = [len(boxes)]
             boxes.append(sub_box)

@@ -198,6 +198,94 @@ def _inset_inside_art(content, inset_px: float, open_factor: float = 2.5, cap_fa
     return _drop_tiny_parts(line)
 
 
+def _fill_art_pockets_from_background_flood(
+    image_path: str, design, selection_px, sibling_boxes_px=None, art_region_px=None,
+):
+    """GrabCut 실루엣이 요소 안쪽 그림 일부를 배경으로 빼먹은 경우(실측: 매트 위에
+    누운 캐릭터 -- 캐릭터 몸이 빠져 U자 모양이 되고, 안쪽으로 줄이면 칼선이 두
+    조각으로 갈라짐)를 메운다. 요소 박스 둘레의 배경색에서 채워 들어가 "배경이
+    아닌 곳"을 구하고(detect_elements_by_background_flood_px), 그중 실루엣의
+    볼록 껍질 안에 있으면서 실루엣과 붙어 있는 부분만 더한다 -- 배경은 절대
+    더하지 않고, 옆 요소도 볼록 껍질 밖이면 들어오지 않는다."""
+    from .multi_design import detect_elements_by_background_flood_px
+
+    try:
+        x0, y0, x1, y1 = selection_px
+        m = max(20.0, 0.08 * min(x1 - x0, y1 - y0))
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return design
+        h, w = img.shape[:2]
+        if art_region_px is not None:
+            # 요소가 들어 있는 칸 전체에서 배경을 채워야 요소 박스 밖으로 나간
+            # 연한 테두리 띠도 "그림"으로 잡힌다(박스 둘레만 보면 띠가 배경 취급됨).
+            region = tuple(float(v) for v in art_region_px)
+        else:
+            region = (max(0.0, x0 - m), max(0.0, y0 - m), min(float(w), x1 + m), min(float(h), y1 + m))
+        objs = detect_elements_by_background_flood_px(image_path, region, _img=img)
+    except Exception:  # noqa: BLE001
+        return design
+    if not objs:
+        return design
+    region_edge = shapely_box(*region).exterior.buffer(3.0)
+
+    def _edge_frac(g):
+        ext = g.exterior if isinstance(g, Polygon) else unary_union(
+            [q.exterior for q in getattr(g, "geoms", []) if isinstance(q, Polygon)]
+        )
+        return ext.intersection(region_edge).length / max(1e-6, ext.length)
+
+    base_edge = _edge_frac(design) if isinstance(design, Polygon) or hasattr(design, "geoms") else 0.0
+    # 2026-09-29(실측): 90도 돌린 칸에서 한쪽 가장자리를 따라 흐르는 배경 띠가
+    # 캐릭터에 가려 토막 나면 "배경이 아닌 덩어리"로 잡혀, 캐릭터 칼선에 배경
+    # 띠가 통째로 들어갔다. 메운 결과가 칸 가장자리에 더 많이 닿으면(= 가장자리
+    # 까지 이어진 배경) 메우지 않는다.
+    # 1) 실루엣을 품는 "배경이 아닌 덩어리"가 옆 요소를 건드리지 않고 실루엣보다
+    #    조금만 크면(연한 테두리 띠 등 GrabCut이 배경으로 빼먹은 그림 가장자리),
+    #    그 덩어리 전체를 그림으로 본다. 실측: 파스텔 시트의 큰 캐릭터 -- 실제
+    #    칼선은 연회색 테두리 띠 안에 있는데 GrabCut은 띠를 빼고 몸통만 잡았다.
+    comp = max(objs, key=lambda o: o.intersection(design).area)
+    if comp.intersection(design).area > 0.6 * design.area and comp.area <= 1.8 * design.area:
+        clash = False
+        for b in sibling_boxes_px or []:
+            bb = shapely_box(*b)
+            if bb.area > 0 and comp.intersection(bb).area > 0.1 * bb.area:
+                clash = True
+                break
+        if not clash:
+            cand = unary_union([design, comp]).buffer(0)
+            if _edge_frac(cand) - base_edge <= 0.03:
+                return cand
+    hull = design.convex_hull
+    fill = unary_union(objs).intersection(hull)
+    if fill.is_empty:
+        return design
+    merged = unary_union([design, fill.buffer(0)])
+    parts = list(merged.geoms) if hasattr(merged, "geoms") else [merged]
+    keep = [p for p in parts if p.intersects(design) and p.intersection(design).area > 0.2 * min(p.area, design.area)]
+    if not keep:
+        return design
+    out = unary_union(keep)
+    # 메우는 양이 실루엣보다 커지면(배경 판정 실패 의심) 원래대로
+    if out.area > 1.6 * design.area:
+        return design
+    # 볼록 껍질로 잘린 직선 변이 외곽선을 많이 차지하게 되면(실측: 은은한 빛
+    # 번짐이 있는 카드 속 캐릭터 -- 칼선이 각진 다각형이 됨) 메우지 않는다.
+    def _on_hull(g):
+        ring = hull.exterior.buffer(1.5)
+        ext = g.exterior if isinstance(g, Polygon) else unary_union([q.exterior for q in g.geoms])
+        return ext.intersection(ring).length / max(1e-6, ext.length)
+
+    try:
+        if _on_hull(out) - _on_hull(design) > 0.2:
+            return design
+        if _edge_frac(out) - base_edge > 0.03:
+            return design
+    except Exception:  # noqa: BLE001
+        return design
+    return out
+
+
 def _borderless_inward_from_silhouette(
     image_path: str,
     selection_px: tuple,
@@ -207,6 +295,7 @@ def _borderless_inward_from_silhouette(
     note_sink: Optional[list],
     sibling_boxes_px: Optional[list],
     precomputed_content_px=None,
+    art_region_px=None,
 ):
     """자동 인식으로 찾은 낱개 요소(또는 힌트로 보정한 실루엣)의 무테 칼선.
 
@@ -242,6 +331,19 @@ def _borderless_inward_from_silhouette(
         )
     if design is None or design.is_empty:
         return None
+    if precomputed_content_px is None:
+        filled = _fill_art_pockets_from_background_flood(
+            image_path, design, selection_px, sibling_boxes_px, art_region_px
+        )
+        if filled is not design and not filled.is_empty:
+            # 메워진 그림이 요소 박스 밖으로 조금 나가면(테두리 띠) 박스로 자르지
+            # 않도록 자르는 사각형을 넓힌다(옆 요소와 안 겹침은 위 함수가 확인).
+            fx0, fy0, fx1, fy1 = filled.bounds
+            rx0, ry0, rx1, ry1 = rect.bounds
+            rect = _rect_from_bounds((min(fx0, rx0), min(fy0, ry0), max(fx1, rx1), max(fy1, ry1)))
+            if art_region_px is not None:
+                rect = rect.intersection(_rect_from_bounds(art_region_px))
+        design = filled
     design = design.intersection(rect)
     ratio = design.area / rect.area if rect.area > 0 else 0.0
     if ratio >= MAX_TRUSTED_TRACE_RATIO and precomputed_content_px is None:
@@ -1231,6 +1333,7 @@ def generate_style_cutline(
     note_sink: Optional[list] = None,
     sibling_boxes_px: Optional[list] = None,
     precomputed_content_px=None,
+    art_region_px=None,
 ) -> Polygon:
     """
     Returns a single Polygon -- the one cutline this style calls for. No
@@ -1323,6 +1426,7 @@ def generate_style_cutline(
             silhouette_line = _borderless_inward_from_silhouette(
                 image_path, selection_px, inset_px, grabcut_margin_px,
                 supersample, note_sink, sibling_boxes_px, precomputed_content_px,
+                art_region_px,
             )
             if silhouette_line is not None:
                 if not silhouette_line.is_empty and bounds_px is not None:

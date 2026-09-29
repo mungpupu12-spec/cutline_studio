@@ -108,3 +108,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_mixed_detect_also_filters_cells_without_image_region():
+    """2026-09-29: ①(도무송 있음 흐름)의 칸 인식도 자동 인식과 같은 빈 칸 기준
+    (image_outer_region_px)으로 거른다 -- 실제 사용 중 맨 아래 빈 띠 칸에
+    사각형 칼선이 생긴 것을 막기 위함."""
+    src = open(os.path.join(os.path.dirname(__file__), "gui", "app.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_run_mixed_detect")
+    names = {n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "image_outer_region_px" in names

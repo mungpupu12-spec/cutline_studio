@@ -95,6 +95,7 @@ from core.multi_design import (
 )
 from core.repeat_grid import fit_cutline_result_to_box
 from core.svg_export import export_svg
+from core.cut_check import check_cut_spacing, summarize_cut_spacing
 from core.preview import render_preview
 from core.accumulate import combine_results
 from core import license_client as lic
@@ -1029,6 +1030,22 @@ class CutLineApp(ctk.CTk):
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
             corner_radius=16, height=40 + BUTTON_SIZE_BUMP_PX,
         )
+
+    def _refresh_domusong_yn_buttons(self):
+        """0번 "도무송 여부" 버튼 중 현재 작업 종류에 해당하는 쪽만 강조."""
+        yes = getattr(self, "_yn_yes_btn", None)
+        no = getattr(self, "_yn_no_btn", None)
+        if yes is None or no is None:
+            return
+        job = self.job_type.get()
+        chosen = yes if job in ("MIXED_AUTO", "DOMUSONG") else (no if job else None)
+        for b in (yes, no):
+            if b is chosen:
+                b.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
+                            border_width=0)
+            else:
+                b.configure(fg_color="transparent", hover_color=ACCENT_SOFT,
+                            text_color=TEXT_PRIMARY, border_width=1)
 
     def _btn_secondary(self, parent, text, command):
         """나머지 보조 동작에 쓰는 아웃라인 버튼. 같은 이유로 라운드/높이를
@@ -2106,12 +2123,20 @@ class CutLineApp(ctk.CTk):
         )
         domusong_yn_row = ctk.CTkFrame(sec0, fg_color="transparent")
         domusong_yn_row.pack(fill="x", pady=(4, 0))
-        self._btn_primary(
-            domusong_yn_row, "예 (도무송 있음)", lambda: self.job_type.set("MIXED_AUTO")
-        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self._btn_secondary(
-            domusong_yn_row, "아니오 (도무송 없음)", lambda: self.job_type.set("BORDERLESS")
-        ).pack(side="left", fill="x", expand=True)
+        # 2026-09-29(멍푸 PC에서 실제 사용 중 발견): "예"가 늘 파란 강조색이라
+        # "아니오"를 눌러도 화면상 아무것도 안 바뀌어, 무엇을 골랐는지 알 수
+        # 없었다. 이제 현재 작업 종류에 맞춰 고른 쪽만 강조한다. 좁은 화면에서
+        # 글자가 잘리던("니오 (도무송 없") 것도 짧은 문구로 줄임.
+        self._yn_yes_btn = self._btn_secondary(
+            domusong_yn_row, "예, 있음", lambda: self.job_type.set("MIXED_AUTO")
+        )
+        self._yn_yes_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._yn_no_btn = self._btn_secondary(
+            domusong_yn_row, "아니오, 없음", lambda: self.job_type.set("BORDERLESS")
+        )
+        self._yn_no_btn.pack(side="left", fill="x", expand=True)
+        self.job_type.trace_add("write", lambda *_: self._refresh_domusong_yn_buttons())
+        self._refresh_domusong_yn_buttons()
         # 2026-09-26(같은 날 재요청, 첨부 스크린샷에서 이 설명 문구를 직접
         # 동그라미 치고 "도무송 선택 후, 도안에 맞는 칼선 무테/유테/
         # 아웃라인으로 선택 작업합니다로 수정" 지시): 문구를 그대로 교체.
@@ -2304,7 +2329,7 @@ class CutLineApp(ctk.CTk):
         ).pack(fill="x", pady=(4, 8))
         self.generate_btn = self._btn_primary(sec7, "이 영역 추가 + 미리보기", self._on_generate)
         self.generate_btn.pack(fill="x", pady=(0, 6))
-        self._btn_secondary(sec7, "누적 초기화 (모두 지우기)", self._on_reset_accumulation).pack(
+        self._btn_secondary(sec7, "누적 초기화 (모두 지우기)", self._on_reset_accumulation_clicked).pack(
             fill="x", pady=(0, 8)
         )
         self.export_btn = self._btn_primary(sec7, "SVG로 내보내기", self._on_export)
@@ -3699,6 +3724,15 @@ class CutLineApp(ctk.CTk):
                     has_content = cell_has_content_px(path, b)
                 except Exception:  # noqa: BLE001
                     has_content = True
+                # 2026-09-29(멍푸 PC에서 실제 사용 중 발견): 이웃 칸 테두리가 살짝
+                # 걸친 맨 아래 빈 띠 칸은 위 검사를 통과해 ③에서 사각형 칼선이
+                # 생겼다(배경 칼선). 자동 인식과 같은 기준(이미지 외곽이 없으면
+                # 빈 칸)으로 한 번 더 거른다.
+                if has_content and self._real_grid_cells_px:
+                    try:
+                        has_content = image_outer_region_px(path, b) is not None
+                    except Exception:  # noqa: BLE001
+                        pass
                 if has_content:
                     filtered_cell_boxes.append(b)
             cell_boxes = filtered_cell_boxes
@@ -3948,6 +3982,7 @@ class CutLineApp(ctk.CTk):
             )
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+        self._resolve_cut_conflicts(rest_start_index)
 
         for gi in cell_indices:
             self._mixed_processed.add(gi)
@@ -4528,6 +4563,17 @@ class CutLineApp(ctk.CTk):
             self._report_exception_to_server("칼선 생성/미리보기 처리 중")
             self.after(0, self._on_error, str(e))
 
+    def _grid_cell_containing(self, box_px):
+        """요소 박스 중심이 들어 있는 실제 칸(.ai 격자) -- 없으면 None."""
+        cells = getattr(self, "_real_grid_cells_px", None) or []
+        if box_px is None or not cells:
+            return None
+        cx, cy = (box_px[0] + box_px[2]) / 2.0, (box_px[1] + box_px[3]) / 2.0
+        for c in cells:
+            if c[0] <= cx <= c[2] and c[1] <= cy <= c[3]:
+                return tuple(c)
+        return None
+
     def _generate_one_item_for_auto_detect(self, path):
         """자동 인식(_run_auto_detect_and_add_all)으로 찾은 영역 전용 생성
         경로.
@@ -4590,6 +4636,7 @@ class CutLineApp(ctk.CTk):
                 margin_mm=self.style_margin_mm.get(),
                 supersample=self.precision.get(),
                 sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
+                art_region_px=self._grid_cell_containing(self._selection_px),
             )
             x0, y0, x1, y1 = self._selection_px
             cell_area_px = max(0.0, (x1 - x0) * (y1 - y0))
@@ -4630,6 +4677,7 @@ class CutLineApp(ctk.CTk):
                 margin_mm=self.style_margin_mm.get(),
                 supersample=self.precision.get(),
                 sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
+                art_region_px=self._grid_cell_containing(self._selection_px),
             )
 
         if job in ("LINE_ART", "MASKING_TAPE"):
@@ -4758,6 +4806,17 @@ class CutLineApp(ctk.CTk):
         self.status.set(status_text)
         self.generate_btn.configure(state="normal")
         self.export_btn.configure(state="normal")
+
+    def _on_reset_accumulation_clicked(self):
+        """2026-09-29(실제 사용 중 발견): 버튼 한 번에 만든 칼선 전체가 확인 없이
+        지워졌다 -- 칼선이 있을 때만 한 번 묻는다."""
+        n = len(self._accumulated)
+        if n and not self._show_confirm_dialog(
+            "누적된 칼선을 모두 지울까요?",
+            [f"지금까지 만든 {n}개 영역의 칼선이 모두 지워집니다(파일로 저장한 것은 그대로)."],
+        ):
+            return
+        self._on_reset_accumulation()
 
     def _on_reset_accumulation(self):
         self._exit_hint_mode()
@@ -5386,11 +5445,10 @@ class CutLineApp(ctk.CTk):
                 )
             except Exception:  # noqa: BLE001 -- 보조 탐지 실패해도 기존 결과는 그대로
                 traceback.print_exc()
-        if self.job_type.get() == "BORDERLESS":
-            try:
-                self._merge_overlapping_borderless_cuts(run_start_index)
-            except Exception:  # noqa: BLE001 -- 합치기 실패해도 개별 칼선은 그대로 남음
-                traceback.print_exc()
+        if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE"):
+            # 2026-09-29: 무테만이 아니라 무테+유테 자동에서도 칼선끼리 교차·이중
+            # 칼선이 실제 파일에서 나왔다(저장 전 점검으로 발견) -- 같은 정리를 한다.
+            self._resolve_cut_conflicts(run_start_index)
 
         if added == 0:
             self.after(
@@ -5446,10 +5504,18 @@ class CutLineApp(ctk.CTk):
         ])
         added = 0
         note = "무테 보조 탐지: 기존 인식에서 빠진 요소를 배경 채우기로 찾아 그림 안쪽으로 잘랐습니다."
+        # 시트 전체의 배경색 모음: 한 칸에서 배경으로 확인된 색은 다른 칸(예: 90도
+        # 돌려 놓은 칸)에서 한쪽 가장자리에만 닿아도 배경으로 본다.
+        sheet_bg = []
+        for grp in groups:
+            try:
+                detect_elements_by_background_flood_px(path, cells[grp[0]], bg_colors_out=sheet_bg)
+            except Exception:  # noqa: BLE001
+                pass
         for grp in groups:
             prim = cells[grp[0]]
             cell_area = max(1.0, (prim[2] - prim[0]) * (prim[3] - prim[1]))
-            for el in detect_elements_by_background_flood_px(path, prim):
+            for el in detect_elements_by_background_flood_px(path, prim, known_bg_lab=sheet_bg):
                 # 칸 넓이의 1% 미만은 더하지 않는다: 실측으로 배경 건물의 창문
                 # 칸 같은 무늬 조각(약 5mm)이 여기 걸렸고, 실제로 빠져 있던
                 # 요소(병아리·잎 등, 칸의 1.5% 이상)는 모두 이보다 컸다.
@@ -5502,6 +5568,75 @@ class CutLineApp(ctk.CTk):
                     }
                 added += 1
         return added
+
+    def _resolve_cut_conflicts(self, start_idx):
+        """자동 생성한 칼선 정리: (1) 서로 겹치거나 안에 들어간 칼선은 한 조각으로
+        합치고, (2) 2mm보다 가까운 두 칼선은 작은 쪽을 상대에게서 2mm 떨어지게
+        살짝 줄인다(줄이면 너무 많이 깎이면 합친다). 실제 손 칼선 8개 파일에서
+        교차·이중 칼선은 0건, 최소 간격은 약 2mm였다(core.cut_check 참고)."""
+        try:
+            self._merge_overlapping_borderless_cuts(start_idx)
+        except Exception:  # noqa: BLE001 -- 합치기 실패해도 개별 칼선은 그대로 남음
+            traceback.print_exc()
+        try:
+            self._separate_too_close_cuts(start_idx)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _separate_too_close_cuts(self, start_idx, min_gap_mm=2.0):
+        from shapely.geometry import MultiPolygon, Polygon
+        from shapely.strtree import STRtree
+        from core.cutline_core import mm_to_px as _mm_to_px
+
+        gap_px = _mm_to_px(min_gap_mm, self.dpi.get())
+        tol_px = _mm_to_px(0.1, self.dpi.get())
+        idxs = [
+            i for i in range(start_idx, len(self._accumulated))
+            if self._accumulated[i].offsets.get("cut") is not None
+            and not self._accumulated[i].offsets["cut"].is_empty
+        ]
+        if len(idxs) < 2:
+            return 0
+        fixed = 0
+        for _round in range(2):
+            geoms = [self._accumulated[i].offsets["cut"] for i in idxs]
+            tree = STRtree(geoms)
+            changed = False
+            for k, g in enumerate(geoms):
+                for m in tree.query(g.buffer(gap_px)):
+                    m = int(m)
+                    if m <= k:
+                        continue
+                    a, b = geoms[k], geoms[m]
+                    if a.is_empty or b.is_empty:
+                        continue
+                    d = a.distance(b)
+                    if d >= gap_px - tol_px:
+                        continue
+                    small, big = (k, m) if a.area <= b.area else (m, k)
+                    sg = geoms[small]
+                    shrunk = sg.difference(geoms[big].buffer(gap_px, join_style=1))
+                    shrunk = shrunk.buffer(-1.0).buffer(1.0)
+                    parts = [q for q in getattr(shrunk, "geoms", [shrunk]) if isinstance(q, Polygon) and not q.is_empty]
+                    if not parts:
+                        continue
+                    largest = max(q.area for q in parts)
+                    parts = [q for q in parts if q.area >= 0.05 * largest]
+                    new = MultiPolygon(parts)
+                    if new.area < 0.85 * sg.area:
+                        continue  # 너무 많이 깎이면 건드리지 않음(저장 전 점검에서 알림)
+                    res = self._accumulated[idxs[small]]
+                    res.offsets["cut"] = new
+                    res.adjustments = list(res.adjustments or []) + [
+                        f"옆 칼선과 {min_gap_mm:g}mm 미만으로 붙어 있어, 떼는 여백이 끊어지지 않게 "
+                        f"이 칼선을 {min_gap_mm:g}mm 떨어지도록 살짝 줄였습니다."
+                    ]
+                    geoms[small] = new
+                    fixed += 1
+                    changed = True
+            if not changed:
+                break
+        return fixed
 
     def _merge_overlapping_borderless_cuts(self, start_idx):
         """이번 무테 자동 인식에서 만든 칼선들 중 서로 *겹치는* 것을 한 조각으로
@@ -5560,7 +5695,7 @@ class CutLineApp(ctk.CTk):
             res.offsets["cut"] = mp
             res.design = mp
             res.adjustments = list(res.adjustments or []) + [
-                f"무테: 서로 겹쳐 그려진 요소 {len(members)}개는 칼선이 교차하지 않도록 한 조각으로 합쳤습니다."
+                f"서로 겹치거나 안에 들어간 칼선 {len(members)}개는 교차·이중 칼선이 되지 않도록 한 조각으로 합쳤습니다."
             ]
             keep_meta = self._grabcut_hint_meta.get(keep)
             boxes = [keep_meta["box_px"]] if keep_meta else []
@@ -5587,14 +5722,18 @@ class CutLineApp(ctk.CTk):
 
     def _show_auto_detect_result(self, preview_png, added, n_total, errors):
         self._show_preview(preview_png, item_result=None)
-        msg = f"자동 인식 완료: {n_total}개 중 {added}개 도안을 추가했습니다."
+        # 2026-09-29(실제 사용 중 발견): 예전 문구 "{찾은 수}개 중 {추가 수}개"는
+        # 반복 칸 복사·누락 보충으로 추가 수가 찾은 수보다 많아져 "8개 중 57개"처럼
+        # 말이 안 됐다 -- 실제로 추가된 칼선 수와 실패 수만 알린다.
+        summary = f"자동 인식 완료: 칼선 {added}개를 추가했습니다."
+        if errors:
+            summary += f" (실패 {len(errors)}개)"
+        msg = summary
         if errors:
             msg += "\n\n실패한 항목:\n" + "\n".join(errors)
         self.status.set(msg)
         if errors:
-            self._show_note_dialog(
-                f"자동 인식 완료: {n_total}개 중 {added}개 추가됨", errors, kind="error"
-            )
+            self._show_note_dialog(summary, errors, kind="error")
         # 2026-09-13(66차): "실패"는 아니지만(생성은 됐지만) 사람이 눈으로
         # 확인해야 하는 항목(_split_overlap_warning_note)이 있으면 별도
         # 대화상자로 따로 알린다 -- errors 대화상자와 섞으면 "생성 실패"로
@@ -5639,6 +5778,19 @@ class CutLineApp(ctk.CTk):
 
     def _on_export(self):
         if self._last_result is None:
+            return
+        # 2026-09-29(멍푸: "왜 중첩되면 안 되는지"): 저장 직전 칼선끼리 교차·이중
+        # 칼선·2mm 미만 간격을 점검해, 있으면 위치와 함께 알리고 그래도 저장할지
+        # 묻는다(실제 손 칼선 8개 파일에는 이런 곳이 한 곳도 없었다).
+        try:
+            report = check_cut_spacing(self._last_result.offsets.get("cut"), self._last_result.dpi)
+            issues = summarize_cut_spacing(report)
+        except Exception:  # noqa: BLE001 -- 점검 실패가 저장을 막지 않게
+            issues = []
+        if issues and not self._show_confirm_dialog(
+            "칼선 점검: 인쇄 전에 확인이 필요한 곳이 있습니다",
+            issues + ["그래도 이대로 저장할까요? (아니오를 누르면 돌아가서 고칠 수 있습니다)"],
+        ):
             return
         # .ai로 불러온 경우 self.input_path는 내부 작업용 래스터 경로라서,
         # 그 대신 _choose_file이 기억해둔 원본 파일 이름을 우선 사용

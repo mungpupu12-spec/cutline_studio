@@ -225,6 +225,7 @@ def generate_cutline_by_style(
     supersample: int = 4,
     sibling_boxes_px: Optional[list] = None,
     precomputed_content_px=None,
+    art_region_px=None,
 ) -> CutlineResult:
     """
     The real, everyday case (core.image_style): 유테 (line-art character on
@@ -259,6 +260,7 @@ def generate_cutline_by_style(
         note_sink=notes,
         sibling_boxes_px=sibling_boxes_px,
         precomputed_content_px=precomputed_content_px,
+        art_region_px=art_region_px,
     )
     if isinstance(line, Polygon):
         line_mp = MultiPolygon([line]) if not line.is_empty else MultiPolygon([])
@@ -693,6 +695,7 @@ def generate_cutline_auto(
     reference_silhouette_px: Optional[Polygon] = None,
     supersample: int = 4,
     sibling_boxes_px: Optional[list] = None,
+    art_region_px=None,
 ) -> CutlineResult:
     """
     The "실무 기본값" auto-detect entry point: segments the ONE thing inside
@@ -821,12 +824,15 @@ def generate_cutline_auto(
     # 실루엣 가장자리 띠가 흰색/검은색 테두리일 때만 유테로 두고 아니면 무테
     # (안쪽)로 한다. 실측: 흰 테두리 스티커 시트는 유테 쪽이 실제와 더 맞고
     # (IoU 0.91), 무테 시트는 무테 쪽이 맞음(IoU 0.90).
-    if classification.halo_detected and style == ImageStyle.LINE_ART:
+    # 2026-09-29(멍푸 PC에서 실제 사용 대조): 할로 판정이 아닌 경로(사각형도가
+    # 기준보다 낮아 "사각형이 아니니 유테")로도 테두리 없는 캐릭터가 유테가 되어
+    # 칼선이 배경으로 나갔다(실제 격자 파일: 초록 캐릭터, 검은 바지 캐릭터).
+    # 유테는 흰색/검은색 테두리 선이 실제로 있을 때만 -- 판정 경로와 상관없이.
+    if style == ImageStyle.LINE_ART:
         if not has_white_or_black_border(image_path, content, dpi):
             style = ImageStyle.BORDERLESS
             border_note = (
-                "자동 감지: 무테 (배경 위에 떠 있지만 흰색/검은색 테두리 선이 없어, "
-                "요소 안쪽으로 자름)"
+                "자동 감지: 무테 (흰색/검은색 테두리 선이 없어, 요소 안쪽으로 자름)"
             )
 
     result = generate_cutline_by_style(
@@ -839,6 +845,7 @@ def generate_cutline_auto(
         grabcut_margin_px=grabcut_margin_px,
         supersample=supersample,
         sibling_boxes_px=sibling_boxes_px,
+        art_region_px=art_region_px,
     )
     if border_note is not None:
         note = border_note
