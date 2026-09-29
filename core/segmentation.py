@@ -222,11 +222,31 @@ def segment_design_in_region(
         gc_crop = crop
         gc_inner = inner
 
-    gc_mask = np.zeros(gc_crop.shape[:2], np.uint8)
+    # 2026-09-29(멍푸 PC에서 키스컷 롤 파일 실제 사용 중 발견): 요소가 이미지 위아래
+    # 끝까지 닿아 선택 사각형이 잘라낸 영역 전체를 덮으면 "배경" 표본이 하나도 없어
+    # GrabCut이 OpenCV 오류(bgdSamples.empty)로 실패했다(롤 1개에서 2개 요소 실패,
+    # 사용자에게는 OpenCV 원문 오류가 그대로 보임). 배경 표본이 없으면 가장자리 색으로
+    # 4px 테두리를 덧대어 실행하고 결과에서 다시 떼어낸다.
+    pad = 0
+    gx, gy, gw, gh = gc_inner
+    if gx <= 0 and gy <= 0 and gx + gw >= gc_crop.shape[1] and gy + gh >= gc_crop.shape[0]:
+        pad = 4
+    elif gw * gh >= gc_crop.shape[0] * gc_crop.shape[1]:
+        pad = 4
+    if pad:
+        ring = np.concatenate([gc_crop[0], gc_crop[-1], gc_crop[:, 0], gc_crop[:, -1]])
+        fill = [int(v) for v in np.median(ring, axis=0)]
+        gc_work = cv2.copyMakeBorder(gc_crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=fill)
+        gc_rect = (gx + pad, gy + pad, gw, gh)
+    else:
+        gc_work, gc_rect = gc_crop, gc_inner
+    gc_mask = np.zeros(gc_work.shape[:2], np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
     cv2.setRNGSeed(GRABCUT_RNG_SEED)
-    cv2.grabCut(gc_crop, gc_mask, gc_inner, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_RECT)
+    cv2.grabCut(gc_work, gc_mask, gc_rect, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_RECT)
+    if pad:
+        gc_mask = gc_mask[pad:-pad, pad:-pad]
 
     native_mask = np.where(
         (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0

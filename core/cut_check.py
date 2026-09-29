@@ -37,6 +37,11 @@ def check_cut_spacing(cut_geom, dpi: float, min_gap_mm: float = 2.0, tolerance_m
     (x_mm, y_mm, gap_mm) 위치(두 칼선이 가장 가까운 곳 근처, 원본 이미지 기준 mm)."""
     polys = _parts(cut_geom)
     out = {"crossing": [], "nested": [], "too_close": []}
+    # 칼선 안쪽 구멍(창처럼 뚫리는 안쪽 칼선)도 이중 칼선이다.
+    for p in polys:
+        for ring in p.interiors:
+            q = Polygon(ring).representative_point()
+            out["nested"].append((px_to_mm(q.x, dpi), px_to_mm(q.y, dpi), 0.0))
     if len(polys) < 2:
         return out
     limit_px = mm_to_px(max(0.0, min_gap_mm - tolerance_mm), dpi)
@@ -62,23 +67,25 @@ def check_cut_spacing(cut_geom, dpi: float, min_gap_mm: float = 2.0, tolerance_m
     return out
 
 
-def summarize_cut_spacing(report: dict, min_gap_mm: float = 2.0, max_items: int = 5) -> list:
-    """사람이 읽는 한 줄짜리 안내 목록(비어 있으면 문제 없음)."""
+def summarize_cut_spacing(report: dict, min_gap_mm: float = 2.0, max_items: int = 2) -> list:
+    """사람이 읽는 안내 목록(비어 있으면 문제 없음) -- 종류마다 한 줄, 위치는 앞의 몇 곳만.
+    (2026-09-29: 줄마다 번호가 붙는 확인 창에서 위치를 한 줄씩 늘어놓으면 작은 화면에서
+    창이 화면 밖으로 넘쳐 버튼이 가려졌다.)"""
+    def _where(items, with_gap=False):
+        locs = []
+        for x, y, g in items[:max_items]:
+            locs.append(f"가로 {x:.0f}·세로 {y:.0f}mm" + (f"(간격 {g:.1f}mm)" if with_gap else ""))
+        more = " 등" if len(items) > max_items else ""
+        return f" -- {', '.join(locs)}{more}" if locs else ""
+
     lines = []
     if report["crossing"]:
-        lines.append(f"칼선끼리 교차하는 곳 {len(report['crossing'])}군데 -- 스티커가 서로 잘려 나갑니다.")
+        lines.append(f"칼선끼리 교차하는 곳 {len(report['crossing'])}군데(스티커가 서로 잘려 나감)"
+                     + _where(report["crossing"]))
     if report["nested"]:
-        lines.append(f"칼선 안에 또 칼선이 있는 곳 {len(report['nested'])}군데 -- 이중 칼선(가운데가 떨어짐).")
+        lines.append(f"칼선 안에 또 칼선이 있는 곳 {len(report['nested'])}군데(이중 칼선, 가운데가 떨어짐)"
+                     + _where(report["nested"]))
     if report["too_close"]:
-        lines.append(
-            f"칼선 사이가 {min_gap_mm:g}mm보다 가까운 곳 {len(report['too_close'])}군데 -- 떼는 여백이 끊어질 수 있습니다."
-        )
-    shown = 0
-    for kind, label in (("crossing", "교차"), ("nested", "이중"), ("too_close", "가까움")):
-        for x, y, g in report[kind]:
-            if shown >= max_items:
-                break
-            extra = f", 간격 {g:.1f}mm" if kind == "too_close" else ""
-            lines.append(f"  · {label}: 가로 {x:.0f}mm, 세로 {y:.0f}mm 부근{extra}")
-            shown += 1
+        lines.append(f"칼선 사이가 {min_gap_mm:g}mm보다 가까운 곳 {len(report['too_close'])}군데(떼는 여백이 끊어짐)"
+                     + _where(report["too_close"], with_gap=True))
     return lines

@@ -33,3 +33,10 @@ def test_two_mm_gap_like_real_files_is_accepted():
     a = box(0, 0, 100, 100)
     b = box(100 + 1.98 * MM, 0, 200, 100)
     assert check_cut_spacing(MultiPolygon([a, b]), DPI)["too_close"] == []
+
+
+def test_hole_inside_a_cut_counts_as_double_cut():
+    from shapely.geometry import Polygon
+
+    ring = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)], [[(50, 50), (150, 50), (150, 150), (50, 150)]])
+    assert len(check_cut_spacing(ring, DPI)["nested"]) == 1

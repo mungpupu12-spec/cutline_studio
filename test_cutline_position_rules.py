@@ -93,3 +93,41 @@ def test_pocket_missed_by_segmentation_is_filled():
         assert filled.difference(box(95, 55, 505, 335)).area < 1.0  # 배경은 안 더함
     finally:
         os.remove(path)
+
+
+def test_small_item_with_light_border_band_is_cut_inside_the_band_not_the_art():
+    """2026-09-29(실제 사용 피드백 "너무 좁은 영역"): 크림색 테두리 띠를 두른 작은
+    소품은 칼선이 그림 몸통 안이 아니라 띠 안에 있어야 한다(배경으로는 안 나감)."""
+    from core.image_style import ImageStyle, generate_style_cutline
+
+    img = Image.new("RGB", (400, 400), (230, 190, 120))       # 황토색 배경
+    d = ImageDraw.Draw(img)
+    d.ellipse((140, 140, 260, 260), fill=(245, 228, 200))     # 크림색 테두리 띠(폭 약 2.5mm)
+    d.ellipse((170, 170, 230, 230), fill=(60, 40, 30))        # 초콜릿 몸통(지름 약 5mm)
+    path = _save(img)
+    try:
+        cut = generate_style_cutline(
+            path, ImageStyle.BORDERLESS, 300.0, selection_px=(165, 165, 235, 235),
+            sibling_boxes_px=[], art_region_px=(0, 0, 400, 400),
+        )
+        body = Point(200, 200).buffer(30)
+        band = Point(200, 200).buffer(60)
+        assert cut.contains(body.buffer(-1))            # 몸통을 자르지 않음
+        assert cut.difference(band.buffer(1)).area < 1  # 배경으로 안 나감
+    finally:
+        os.remove(path)
+
+
+def test_grabcut_does_not_fail_when_element_fills_whole_strip():
+    """롤(띠) 파일에서 요소가 위아래 끝까지 닿아도 GrabCut 오류 없이 실루엣을 낸다."""
+    from core.segmentation import segment_design_in_region
+
+    img = Image.new("RGB", (300, 80), (240, 235, 225))
+    d = ImageDraw.Draw(img)
+    d.ellipse((100, 0, 200, 79), fill=(200, 60, 60))
+    path = _save(img)
+    try:
+        geom = segment_design_in_region(path, (0, 0, 300, 80), margin_px=0)
+        assert not geom.is_empty
+    finally:
+        os.remove(path)

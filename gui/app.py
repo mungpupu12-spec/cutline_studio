@@ -5128,6 +5128,13 @@ class CutLineApp(ctk.CTk):
         같은 내부 용어가 그대로 노출되고 있었다 -- 단일 생성 오류
         (_on_error)만 번역해주던 것을 자동 인식 배치 오류 목록에도 똑같이
         적용하도록 이 헬퍼로 뽑아냈다."""
+        if "OpenCV" in message or "cv::" in message or "Assertion failed" in message:
+            # 2026-09-29(PC 사용 중 발견): OpenCV 원문 오류(경로·함수 이름 포함)가
+            # 그대로 보였다 -- 이해할 수 있는 말로 바꾼다.
+            return (
+                "이 도안의 윤곽을 자동으로 찾지 못했습니다(이미지 끝에 딱 붙어 있거나 "
+                "배경과 구분이 어려운 경우). 해당 위치를 드래그해 직접 추가해 주세요."
+            )
         if "Could not read image" in message:
             return (
                 "이미지 파일을 열 수 없습니다(파일이 삭제되었거나 다른 위치로 "
@@ -5445,9 +5452,10 @@ class CutLineApp(ctk.CTk):
                 )
             except Exception:  # noqa: BLE001 -- 보조 탐지 실패해도 기존 결과는 그대로
                 traceback.print_exc()
-        if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE"):
-            # 2026-09-29: 무테만이 아니라 무테+유테 자동에서도 칼선끼리 교차·이중
-            # 칼선이 실제 파일에서 나왔다(저장 전 점검으로 발견) -- 같은 정리를 한다.
+        if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE", "LINE_ART", "MASKING_TAPE"):
+            # 2026-09-29: 무테만이 아니라 무테+유테 자동·유테·키스컷에서도 칼선끼리
+            # 교차·이중 칼선이 실제 파일에서 나왔다(저장 전 점검으로 발견, 키스컷 롤은
+            # 교차 12곳) -- 같은 정리를 한다.
             self._resolve_cut_conflicts(run_start_index)
 
         if added == 0:
@@ -5575,6 +5583,10 @@ class CutLineApp(ctk.CTk):
         살짝 줄인다(줄이면 너무 많이 깎이면 합친다). 실제 손 칼선 8개 파일에서
         교차·이중 칼선은 0건, 최소 간격은 약 2mm였다(core.cut_check 참고)."""
         try:
+            self._tidy_cut_parts(start_idx)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        try:
             self._merge_overlapping_borderless_cuts(start_idx)
         except Exception:  # noqa: BLE001 -- 합치기 실패해도 개별 칼선은 그대로 남음
             traceback.print_exc()
@@ -5582,6 +5594,56 @@ class CutLineApp(ctk.CTk):
             self._separate_too_close_cuts(start_idx)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def _tidy_cut_parts(self, start_idx, min_gap_mm=2.0):
+        """한 요소의 칼선 안쪽 구멍(창 모양으로 뚫리는 칼선)을 없애고, 같은 요소가
+        2mm보다 가깝게 여러 조각으로 갈라진 칼선은 하나로 잇는다.
+
+        2026-09-29(멍푸 PC에서 모든 샘플 마지막 사용 중 발견): 흰 테두리 스티커
+        시트에서 칼선 안에 작은 구멍 칼선(최대 약 12x7mm)이 18~21개, 한 요소가
+        0.1mm 틈으로 갈라진 칼선이 15곳 있었다(원본 손 칼선에는 둘 다 0건)."""
+        from shapely.geometry import MultiPolygon, Polygon
+        from shapely.ops import unary_union
+        from core.cutline_core import mm_to_px as _mm_to_px
+
+        gap = _mm_to_px(min_gap_mm, self.dpi.get())
+        for i in range(start_idx, len(self._accumulated)):
+            res = self._accumulated[i]
+            cut = res.offsets.get("cut")
+            if cut is None or cut.is_empty:
+                continue
+            parts = [p for p in getattr(cut, "geoms", [cut]) if isinstance(p, Polygon) and not p.is_empty]
+            filled = [Polygon(p.exterior) for p in parts]
+            filled = [p for p in filled if not any(q is not p and q.contains(p) for q in filled)]
+            changed = len(filled) != len(parts) or any(p.interiors for p in parts)
+            if len(filled) > 1:
+                close = any(
+                    filled[a].distance(filled[b]) < gap
+                    for a in range(len(filled)) for b in range(a + 1, len(filled))
+                )
+                if close:
+                    joined = unary_union(filled).buffer(gap / 2.0, join_style=1).buffer(-gap / 2.0, join_style=1)
+                    filled = [Polygon(p.exterior) for p in getattr(joined, "geoms", [joined])
+                              if isinstance(p, Polygon) and not p.is_empty]
+                    changed = True
+            # 좁게 튀어나온 가시(폭 약 1.6mm 미만 -- 칼로 따라 자를 수 없고 옆 칼선과
+            # 가까워지는 원인, 흰 테두리 스티커 시트에서 실측)는 둥글게 다듬는다.
+            r = 0.4 * gap
+            smoothed = []
+            for p in filled:
+                o = p.buffer(-r, join_style=1).buffer(r, join_style=1)
+                o = max(getattr(o, "geoms", [o]), key=lambda g: g.area) if not o.is_empty else o
+                if not o.is_empty and o.area >= 0.9 * p.area and o.symmetric_difference(p).area > 1.0:
+                    smoothed.append(Polygon(o.exterior))
+                    changed = True
+                else:
+                    smoothed.append(p)
+            filled = smoothed
+            if changed and filled:
+                res.offsets["cut"] = MultiPolygon(filled)
+                res.adjustments = list(res.adjustments or []) + [
+                    "칼선 안쪽 구멍과, 2mm보다 가깝게 갈라진 같은 요소의 칼선 조각을 하나로 정리했습니다."
+                ]
 
     def _separate_too_close_cuts(self, start_idx, min_gap_mm=2.0):
         from shapely.geometry import MultiPolygon, Polygon
@@ -5725,7 +5787,14 @@ class CutLineApp(ctk.CTk):
         # 2026-09-29(실제 사용 중 발견): 예전 문구 "{찾은 수}개 중 {추가 수}개"는
         # 반복 칸 복사·누락 보충으로 추가 수가 찾은 수보다 많아져 "8개 중 57개"처럼
         # 말이 안 됐다 -- 실제로 추가된 칼선 수와 실패 수만 알린다.
-        summary = f"자동 인식 완료: 칼선 {added}개를 추가했습니다."
+        # 반복 칸 복사본·보충 요소까지 포함해 실제로 저장될 칼선 개수(내보내기 SVG와 같은 수)
+        # 를 센다 -- ①②③ 흐름에서 "43개"라고 알렸는데 실제 칼선은 71개였다(9/29 PC 사용).
+        n_parts = 0
+        for it in self._accumulated:
+            c = it.offsets.get("cut") if it is not None else None
+            if c is not None and not c.is_empty:
+                n_parts += len(getattr(c, "geoms", [c]))
+        summary = f"자동 인식 완료: 칼선 {n_parts or added}개가 만들어졌습니다."
         if errors:
             summary += f" (실패 {len(errors)}개)"
         msg = summary
