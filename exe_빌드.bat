@@ -80,6 +80,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem 2026-09-30: 예전에 빌드한 dist 폴더의 프로그램이 실행 중이면 그 안의 파일이 잠겨 있어
+rem PyInstaller가 옛 폴더를 지우다가 "PermissionError: 액세스가 거부되었습니다"로 멈췄다
+rem (멍푸 PC에서 실제로 발생). 빌드 전에 dist 폴더에서 실행 중인 프로그램이 있는지 확인하고,
+rem 있으면 닫을 때까지 기다린다.
+:check_running
+powershell -NoProfile -Command "$d = Join-Path (Get-Location) 'dist'; if (Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase) }) { exit 1 } else { exit 0 }"
+if errorlevel 1 (
+    echo.
+    echo [알림] 예전에 만든 컷라인 스튜디오가 아직 실행 중입니다.
+    echo        실행 중이면 옛 파일을 지울 수 없어 빌드가 실패합니다.
+    echo        컷라인 스튜디오 창을 모두 닫은 뒤, 이 창에서 아무 키나 누르세요.
+    pause >nul
+    goto check_running
+)
+
 echo.
 echo exe로 빌드합니다 -- 컴퓨터에 따라 몇 분 정도 걸릴 수 있습니다...
 echo.
