@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
+
+from . import image_cache as _image_cache
 import numpy as np
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
@@ -286,7 +288,7 @@ def load_raster_design(
     after the call), so the artist can see the request was pared down rather
     than have it be an invisible slowdown or an invisible quality change.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    img = _image_cache.imread(image_path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 

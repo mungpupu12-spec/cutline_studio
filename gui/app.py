@@ -95,6 +95,7 @@ from core.multi_design import (
 )
 from core.repeat_grid import fit_cutline_result_to_box
 from core.svg_export import export_svg
+from core.png_export import export_cut_png
 from core.cut_check import check_cut_spacing, summarize_cut_spacing
 from core.preview import render_preview
 from core.accumulate import combine_results
@@ -179,26 +180,12 @@ _RECT_LIKE_THRESHOLD = 0.95
 # 0.29% -- 정상 케이스의 최저치 19%와 60배 이상 차이). 그래서 안전장치를
 # 완전히 없애지 않고, "낱개 조각" 문맥에서만 훨씬 더 낮은(그래도 진짜 실패는
 # 확실히 잡는) 기준으로 낮춘다.
-_UNDERSIZED_RATIO_FOR_FINE_SUBELEMENT = 0.10
-
-
-def _undersized_retry_note(ratio_pct: float, fallback_design) -> str:
-    is_rect_like = True
-    try:
-        if fallback_design is not None and not fallback_design.is_empty:
-            is_rect_like = _shape_rectangularity(fallback_design) >= _RECT_LIKE_THRESHOLD
-    except Exception:
-        is_rect_like = True  # 판단 실패 시 기존과 같이 보수적으로 "사각형" 문구 유지
-    prefix = (
-        f"실루엣 추적 결과가 선택 영역의 {ratio_pct:.0f}%밖에 안 돼(예: 몸통 "
-        f"전체가 아니라 배 같은 일부만 잡혔을 가능성) 잘못됐다고 보고, "
-    )
-    if is_rect_like:
-        return prefix + "안전한 사각형(무테 방식) 컷으로 자동 대체했습니다."
-    return prefix + (
-        "무테 방식으로 다시 실제 선/색 경계를 추적했고, 이번엔 정상적으로 "
-        "실루엣을 따라간 모양이 나와 그 결과를 그대로 사용했습니다."
-    )
+# 2026-09-30: 요소 계산을 여러 프로세스로 돌리려고 core.element_jobs로 옮김(값·문구 동일)
+from core.element_jobs import (  # noqa: E402
+    UNDERSIZED_RATIO_FOR_FINE_SUBELEMENT as _UNDERSIZED_RATIO_FOR_FINE_SUBELEMENT,
+    undersized_retry_note as _undersized_retry_note,
+)
+from core import procpool as _procpool  # noqa: E402
 
 
 # 2026-09-13(66차) 피드백("하나의 요소가 여러개의 칼선으로 쪼개지고 중첩되는
@@ -477,7 +464,7 @@ TUTORIAL_SLIDES = [
     ("step2.png", "작업 종류를 고르세요"),
     ("step3.png", "도안을 자동으로 인식해요"),
     ("step5.png", "영역 추가로 칼선 생성"),
-    ("step6.png", "SVG로 내보내기 저장"),
+    ("step6.png", "칼선 내보내기(PNG)로 저장"),
 ]
 # 튜토리얼 내용을 바꿀 때마다 이 번호를 올리면, "다시 보지 않기"를 이미
 # 체크한 사용자에게도 새로워진 튜토리얼이 한 번은 다시 뜬다(아래
@@ -489,6 +476,8 @@ TUTORIAL_VERSION = 5
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+
+
 
 
 class CutLineApp(ctk.CTk):
@@ -2322,7 +2311,8 @@ class CutLineApp(ctk.CTk):
         self._btn_secondary(sec7, "누적 초기화 (모두 지우기)", self._on_reset_accumulation_clicked).pack(
             fill="x", pady=(0, 8)
         )
-        self.export_btn = self._btn_primary(sec7, "SVG로 내보내기", self._on_export)
+        # 2026-09-30(멍푸: "칼선 파일 svg 말고 png로"): 기본은 투명 배경 PNG(원본 이미지와 같은 크기)
+        self.export_btn = self._btn_primary(sec7, "칼선 내보내기 (PNG)", self._on_export)
         self.export_btn.configure(state="disabled")
         self.export_btn.pack(fill="x")
 
@@ -3721,12 +3711,18 @@ class CutLineApp(ctk.CTk):
             # (cell_has_content_px)으로 빈 칸을 걸러내고 있으므로, ①에서도
             # 똑같이 미리 걸러 애초에 화면에 나타나지도 않게 한다(판정 자체가
             # 실패하면 안전하게 "내용 있음"으로 간주 -- 회귀 없음).
-            filtered_cell_boxes = []
-            for b in cell_boxes:
+            from core.parallel import pmap
+
+            def _content_flag(b):
                 try:
-                    has_content = cell_has_content_px(path, b)
+                    return cell_has_content_px(path, b)
                 except Exception:  # noqa: BLE001
-                    has_content = True
+                    return True
+
+            # 2026-09-30 속도: 칸마다 독립 계산이라 동시에(순서 그대로)
+            content_flags = pmap(_content_flag, list(cell_boxes))
+            filtered_cell_boxes = []
+            for b, has_content in zip(cell_boxes, content_flags):
                 # 2026-09-29(멍푸 PC에서 실제 사용 중 발견): 이웃 칸 테두리가 살짝
                 # 걸친 맨 아래 빈 띠 칸은 위 검사를 통과해 ③에서 사각형 칼선이
                 # 생겼다(배경 칼선). 자동 인식과 같은 기준(이미지 외곽이 없으면
@@ -3754,6 +3750,49 @@ class CutLineApp(ctk.CTk):
             return
         self.after(0, self._on_mixed_detect_done, path, boxes, groups, cell_boxes)
 
+    def _start_rest_prefetch(self, path, cell_boxes_px, cell_groups, dpi, margin, precision):
+        """③과 같은 방식으로 작업 목록을 만들어(카드 칸 없음 가정) 뒤에서 미리 계산해 둔다."""
+        self._prefetched_rest = {}
+        ready = threading.Event()  # 작업을 다 맡겼는지(③이 너무 빨리 눌려도 같은 계산을 두 번 하지 않게)
+        self._prefetch_ready = ready
+        def _run():
+            try:
+                remaining_flat = [cell_boxes_px[idx] for grp in cell_groups for idx in grp]
+                fine_boxes, fine_groups = detect_repeat_aware_sub_element_boxes_px(path, remaining_flat)
+                with Image.open(path) as _im:
+                    image_size = _im.size
+                tasks = []
+                for fgi in fine_groups:
+                    primary_idx = fgi[0]
+                    sel = tuple(fine_boxes[primary_idx])
+                    bounds = expand_box_to_neighbor_midpoint_px(sel, list(fine_boxes), image_size)
+                    siblings = [tuple(b) for j, b in enumerate(fine_boxes) if j != primary_idx]
+                    tasks.append(("rest", (path, sel, bounds, siblings, dpi, margin, precision)))
+                # 결과를 돌려받아 보관(③에서 같은 작업이면 그대로 씀 -- core.procpool.local_task_key)
+                store = {}
+                for t in tasks:
+                    k = _procpool.local_task_key(t)
+                    if k is not None and k not in store:
+                        store[k] = _procpool.submit(t)
+                self._prefetched_rest = store
+                ready.set()
+                # ③ 끝의 보조 탐지(배경 채우기로 빠진 요소 찾기)와 그 요소들의 칼선도 미리
+                cells_s, groups_s, elements_s = self._supplement_detect(path, remaining_flat)
+                from core.parallel import pmap
+
+                els = []
+                for grp, grp_els in zip(groups_s, elements_s):
+                    prim = cells_s[grp[0]]
+                    cell_area = max(1.0, (prim[2] - prim[0]) * (prim[3] - prim[1]))
+                    els.extend(el for el in grp_els if el.area >= 0.01 * cell_area)  # ③과 같은 최소 크기
+                pmap(lambda el: self._supplement_make(path, el, dpi, margin, precision, True), els)
+            except Exception:  # noqa: BLE001 -- 미리 계산은 실패해도 ③이 그대로 계산함
+                traceback.print_exc()
+            finally:
+                ready.set()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _on_mixed_detect_done(self, path, boxes, groups, cell_boxes=None):
         self._load_source_preview(path)  # 여기서 _mixed_* 상태가 한 번 초기화됨
         self._mixed_path = path
@@ -3773,6 +3812,16 @@ class CutLineApp(ctk.CTk):
             "(빨간 테두리)하세요 -- 표시 안 한 나머지는 무테/유테로 자동 처리됩니다. 다 "
             "골랐으면 '② 표시한 대로 칼선 생성'을 누르세요."
         )
+        # 2026-09-30 속도(멍푸: "칼선 생성 시간이 3초를 넘으면 안 돼"): ① 화면이 다 뜬 뒤, 사용자가
+        # 카드 칸을 표시하는 동안 "③ 남은 칼선"에 필요한 무거운 계산(세부 조각 나누기, 요소마다
+        # GrabCut 실루엣, 보조 탐지 등)을 뒤에서 미리 해 둔다. 결과는 버리고 계산 기억만 남기므로
+        # 칼선은 전과 똑같고, ③을 누르면 기억해 둔 결과를 꺼내 써서 빨리 끝난다.
+        try:
+            self._start_rest_prefetch(path, list(boxes), [list(g) for g in groups],
+                                      float(self.dpi.get()), float(self.style_margin_mm.get()),
+                                      int(self.precision.get()))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
 
     # 2026-09-10(36차 이어서) 피드백("도무송은 먼저 선택해서 생성하고,
     # 그다음에 다음 종류 선택하는 방향으로 가고"): 표시된 도무송과 나머지
@@ -3781,6 +3830,7 @@ class CutLineApp(ctk.CTk):
     # 나눴다. 어느 버튼을 먼저 눌러도 되고, self._mixed_processed로 이미
     # 만든 그룹은 기록해둬서 두 번 만들지 않는다 -- 모든 그룹이 다 끝나면
     # (어느 버튼에서 끝나든) 그때 최종 결과 화면으로 전환된다.
+
     def _mixed_generate_common_checks(self):
         """② / ③ 공통 검증. 통과하면 (path, groups, marked) 튜플, 실패하면
         None(이미 오류 팝업을 띄운 뒤)."""
@@ -3912,54 +3962,64 @@ class CutLineApp(ctk.CTk):
         n_fine = len(fine_groups)
         with Image.open(path) as _im:
             image_size = _im.size
+        dpi_v, margin_v, precision_v = self.dpi.get(), self.style_margin_mm.get(), self.precision.get()
+        def _task(fgi):
+            """대표 조각 하나의 칼선 계산 작업(core.element_jobs.rest_fine_item 인자)."""
+            primary_idx = fgi[0]
+            sel = tuple(fine_boxes[primary_idx])
+            bounds = expand_box_to_neighbor_midpoint_px(sel, neighbor_boxes_for_bounds, image_size)
+            siblings = [tuple(b) for j, b in enumerate(fine_boxes) if j != primary_idx]
+            return ("rest", (path, sel, bounds, siblings, dpi_v, margin_v, precision_v))
+
+        def _on_progress(n_done):
+            self.after(0, self.status.set, f"나머지 무테/유테 세부 칼선 생성 중... ({n_done}/{n_fine})")
+
+        # 2026-09-30(멍푸: "칼선 생성 시간이 3초를 넘으면 안 돼"): 조각마다 순서대로 하나씩
+        # 만들던 것을 여러 조각 동시에(미리 띄워 둔 작업 프로세스들, core.procpool) 만든다.
+        # 결과는 원래 순서 그대로 모으고, 계산 내용은 전과 같다.
+        all_tasks = [_task(fgi) for fgi in fine_groups]
+        generated = [None] * len(all_tasks)
+        # ① 직후 뒤에서 미리 계산해 둔 같은 작업은 그 결과를 그대로 쓰고(계산이 아직 안 끝났으면
+        # 끝날 때까지 기다림), 나머지(카드 칸 근처 등 조건이 달라진 것)만 새로 계산한다.
+        ready = getattr(self, "_prefetch_ready", None)
+        if ready is not None:
+            ready.wait(timeout=30)  # 미리 계산 작업을 맡기는 중이면 잠깐 기다렸다가 그 결과를 씀
+        pre = getattr(self, "_prefetched_rest", None) or {}
+        todo = []
+        for i, t in enumerate(all_tasks):
+            fut = pre.get(_procpool.local_task_key(t)) if pre else None
+            if fut is None:
+                todo.append(i)
+                continue
+            try:
+                import dataclasses
+
+                r = fut.result()
+                # 정리 단계가 결과를 고쳐 쓰므로 보관본은 그대로 두고 복사본을 쓴다
+                generated[i] = (dataclasses.replace(r, offsets=dict(r.offsets),
+                                                    adjustments=list(r.adjustments or [])), None)
+            except Exception as e:  # noqa: BLE001
+                generated[i] = (None, e)
+        if todo:
+            done_before = len(all_tasks) - len(todo)
+            fresh = _procpool.run_tasks([all_tasks[i] for i in todo],
+                                        on_progress=lambda n: _on_progress(done_before + n))
+            for i, r in zip(todo, fresh):
+                generated[i] = r
+
         for i, fgi in enumerate(fine_groups):
             primary_idx = fgi[0]
             x0, y0, x1, y1 = fine_boxes[primary_idx]
-            selection_px = (x0, y0, x1, y1)
-            self.after(
-                0, self.status.set,
-                f"나머지 무테/유테 세부 칼선 생성 중... ({i + 1}/{n_fine})",
-            )
-            try:
-                style_bounds_px = expand_box_to_neighbor_midpoint_px(
-                    selection_px, neighbor_boxes_for_bounds, image_size,
-                )
-                sibling_boxes_px = [b for j, b in enumerate(fine_boxes) if j != primary_idx]
-                item_result = generate_cutline_auto(
-                    image_path=path,
-                    dpi=self.dpi.get(),
-                    selection_px=selection_px,
-                    bounds_px=style_bounds_px,
-                    margin_mm=self.style_margin_mm.get(),
-                    supersample=self.precision.get(),
-                    sibling_boxes_px=sibling_boxes_px,
-                )
-                cell_area_px = max(0.0, (x1 - x0) * (y1 - y0))
-                design_area_px = item_result.design.area if item_result.design is not None else 0.0
-                if is_silhouette_undersized(
-                    design_area_px, cell_area_px,
-                    min_ratio=_UNDERSIZED_RATIO_FOR_FINE_SUBELEMENT,
-                ):
-                    fallback = generate_cutline_by_style(
-                        image_path=path,
-                        style=ImageStyle.BORDERLESS,
-                        dpi=self.dpi.get(),
-                        selection_px=selection_px,
-                        bounds_px=style_bounds_px,
-                        margin_mm=self.style_margin_mm.get(),
-                        supersample=self.precision.get(),
-                    )
-                    ratio_pct = (design_area_px / cell_area_px * 100) if cell_area_px > 0 else 0.0
-                    fallback.adjustments = list(item_result.adjustments or []) + list(
-                        fallback.adjustments or []
-                    ) + [_undersized_retry_note(ratio_pct, fallback.design)]
-                    item_result = fallback
-                self._accumulated.append(item_result)
-                added += 1
-            except Exception as e:  # noqa: BLE001
-                self._report_exception_to_server("나머지 무테/유테 세부 처리 중")
-                errors.append(f"{i + 1}번째 조각: {self._friendly_error_text(str(e))}")
+            item_result, err = generated[i]
+            if err is not None:
+                try:
+                    raise err
+                except Exception:  # noqa: BLE001 -- 서버 보고는 except 블록 안에서만 동작
+                    self._report_exception_to_server("나머지 무테/유테 세부 처리 중")
+                errors.append(f"{i + 1}번째 조각: {self._friendly_error_text(str(err))}")
                 continue
+            self._accumulated.append(item_result)
+            added += 1
             for other_idx in fgi[1:]:
                 ox0, oy0, ox1, oy1 = fine_boxes[other_idx]
                 try:
@@ -4577,6 +4637,16 @@ class CutLineApp(ctk.CTk):
                 return tuple(c)
         return None
 
+    # 자동 인식에서 스레드로 미리 계산할 수 있는 작업 종류(순수 계산: 같은 입력 -> 같은 칼선)
+    _PURE_AUTO_JOBS = ("AUTO_STYLE", "BORDERLESS", "LINE_ART", "MASKING_TAPE")
+
+    @staticmethod
+    def _auto_item_pure(path, job, sel, siblings, art_region, dpi, margin, precision):
+        """자동 인식 한 요소의 순수 계산(core.element_jobs.auto_item -- 화면 상태 없이 인자만)."""
+        from core.element_jobs import auto_item
+
+        return auto_item(path, job, sel, siblings, art_region, dpi, margin, precision)
+
     def _generate_one_item_for_auto_detect(self, path):
         """자동 인식(_run_auto_detect_and_add_all)으로 찾은 영역 전용 생성
         경로.
@@ -4623,98 +4693,22 @@ class CutLineApp(ctk.CTk):
         잡혔을 때)를 감지해서 더 안전한 사각형(무테 방식) 컷으로 자동
         대체한다 -- is_silhouette_undersized 참고."""
         job = self.job_type.get()
-        if job == "AUTO_STYLE":
-            # 2026-09-10 피드백: 무테+유테 자동 판단도 자동 인식 배치 경로에서는
-            # 바로 위 BORDERLESS/LINE_ART와 똑같은 안전장치(실루엣이 선택 영역의
-            # 극히 일부만 잡히면 안전한 사각형 컷으로 자동 대체, is_silhouette_
-            # undersized)를 그대로 적용해야 한다 -- generate_cutline_auto는
-            # 어느 스타일이 골라지든 그 스타일로 바로 실루엣을 추적하므로, 유테로
-            # 골라졌을 때 이 추적이 실패하는 경우까지 똑같이 대비해야 하기 때문.
+        if job in self._PURE_AUTO_JOBS:
             if self._selection_px is None:
                 raise ValueError("자동 인식된 영역이 없습니다.")
-            result = generate_cutline_auto(
-                image_path=path,
-                dpi=self.dpi.get(),
-                selection_px=self._selection_px,
-                margin_mm=self.style_margin_mm.get(),
-                supersample=self.precision.get(),
-                sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
-                art_region_px=self._grid_cell_containing(self._selection_px),
+            key = tuple(self._selection_px)
+            pre = (getattr(self, "_auto_precomputed", None) or {}).get(key)
+            if pre is not None:
+                res, err = pre
+                if err is not None:
+                    raise err
+                return res
+            return self._auto_item_pure(
+                path, job, self._selection_px,
+                list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
+                self._grid_cell_containing(self._selection_px),
+                self.dpi.get(), self.style_margin_mm.get(), self.precision.get(),
             )
-            x0, y0, x1, y1 = self._selection_px
-            cell_area_px = max(0.0, (x1 - x0) * (y1 - y0))
-            design_area_px = result.design.area if result.design is not None else 0.0
-            if is_silhouette_undersized(design_area_px, cell_area_px):
-                fallback = generate_cutline_by_style(
-                    image_path=path,
-                    style=ImageStyle.BORDERLESS,
-                    dpi=self.dpi.get(),
-                    selection_px=self._selection_px,
-                    margin_mm=self.style_margin_mm.get(),
-                    supersample=self.precision.get(),
-                )
-                ratio_pct = (design_area_px / cell_area_px * 100) if cell_area_px > 0 else 0.0
-                fallback.adjustments = list(result.adjustments or []) + list(fallback.adjustments or []) + [
-                    _undersized_retry_note(ratio_pct, fallback.design)
-                ]
-                return fallback
-            return result
-
-        if job == "BORDERLESS":
-            # 2026-09-28(멍푸: "무테는 이미지 안쪽에 칼선이 들어간다", "배경색이
-            # 칼선으로 잡히면 안 됨", "테스트 칼선 보면서 대조해"): 예전(9/7)엔
-            # 무테를 골라도 요소를 유테처럼 바깥으로 밀어 배경까지 잘랐다.
-            # 테스트 폴더의 실제 손 칼선을 읽어 대조해보니, 무테 시트는 칸 안
-            # 요소(캐릭터·소품)마다 칼선이 따로 있고 모두 요소 실루엣에서 약
-            # 0.7~1.5mm *안쪽*이었다. 그래서 요소마다 GrabCut 실루엣을 찾아
-            # 그림 안쪽으로 여백만큼 줄인다(core.image_style의
-            # _borderless_inward_from_silhouette -- sibling_boxes_px가 이
-            # 경로의 신호). 배경은 절대 스티커에 들어가지 않는다.
-            if self._selection_px is None:
-                raise ValueError("자동 인식된 영역이 없습니다.")
-            return generate_cutline_by_style(
-                image_path=path,
-                style=ImageStyle.BORDERLESS,
-                dpi=self.dpi.get(),
-                selection_px=self._selection_px,
-                margin_mm=self.style_margin_mm.get(),
-                supersample=self.precision.get(),
-                sibling_boxes_px=list(getattr(self, "_auto_detect_sibling_boxes_px", None) or []),
-                art_region_px=self._grid_cell_containing(self._selection_px),
-            )
-
-        if job in ("LINE_ART", "MASKING_TAPE"):
-            # 2026-09-08(9차): 마스킹테이프도 자동 인식에서는 유테와 완전히
-            # 같은 방식(실루엣 추적)으로 처리한다 -- 아래 로직은 이미 항상
-            # ImageStyle.LINE_ART를 쓰므로 이 조건에 추가하는 것만으로 충분.
-            if self._selection_px is None:
-                raise ValueError("자동 인식된 영역이 없습니다.")
-            result = generate_cutline_by_style(
-                image_path=path,
-                style=ImageStyle.LINE_ART,
-                dpi=self.dpi.get(),
-                selection_px=self._selection_px,
-                margin_mm=self.style_margin_mm.get(),
-                supersample=self.precision.get(),
-            )
-            x0, y0, x1, y1 = self._selection_px
-            cell_area_px = max(0.0, (x1 - x0) * (y1 - y0))
-            design_area_px = result.design.area if result.design is not None else 0.0
-            if is_silhouette_undersized(design_area_px, cell_area_px):
-                fallback = generate_cutline_by_style(
-                    image_path=path,
-                    style=ImageStyle.BORDERLESS,
-                    dpi=self.dpi.get(),
-                    selection_px=self._selection_px,
-                    margin_mm=self.style_margin_mm.get(),
-                    supersample=self.precision.get(),
-                )
-                ratio_pct = (design_area_px / cell_area_px * 100) if cell_area_px > 0 else 0.0
-                fallback.adjustments = list(fallback.adjustments or []) + [
-                    _undersized_retry_note(ratio_pct, fallback.design)
-                ]
-                return fallback
-            return result
         # 2026-09-07(7차) 피드백("도무송은 모두 이미지 안쪽으로 칼선이
         # 들어가야해"): 도무송/완칼은 옆 칸을 침범하지 못하도록 경계를
         # 넘긴다(수동 단일 작업에서는 이 함수를 거치지 않으므로 영향 없음).
@@ -4771,7 +4765,9 @@ class CutLineApp(ctk.CTk):
         self._clear_selection()
         self._source_image = None  # showing a rendered result now, not a raw source -- no new drag-select until a file is (re)loaded
         if Image is not None:
-            img = Image.open(preview_png)
+            from core.preview import open_rendered
+
+            img = open_rendered(preview_png)  # 2026-09-30 속도: 방금 그린 것은 다시 읽지 않음
             self._preview_full_image = img
             # 2026-09-07(7차) 피드백("칼선이 잘 됐는지 확대해서 볼 수 있는
             # 기능 필요"): 새로 생성될 때마다 100%로 되돌린다 -- 이전 결과에서
@@ -4863,6 +4859,7 @@ class CutLineApp(ctk.CTk):
         self.export_btn.configure(state="disabled")
         self._ai_placement = None
         self._source_raster_dpi = None
+        self._prefetched_rest = {}
         self.status.set("화면을 초기화했습니다. 도안 파일을 다시 선택하세요.")
         # 2026-09-29: 초기화 뒤에는 왼쪽 패널을 맨 위("도안 파일")로 -- 스크롤이 아래에
         # 남아 있으면 무엇부터 해야 할지 안 보였다(PC에서 확인).
@@ -5281,6 +5278,47 @@ class CutLineApp(ctk.CTk):
             target=self._run_auto_detect_and_add_all, args=(path,), daemon=True
         ).start()
 
+    def _precompute_auto_items(self, path, boxes, groups):
+        """자동 인식의 대표 요소들 칼선을 여러 스레드로 미리 계산해 {선택 박스: (결과, 오류)}로
+        돌려준다(2026-09-30 속도: "칼선 생성 시간이 3초를 넘으면 안 돼"). 아래 순서대로 도는
+        반복은 이 결과를 그대로 꺼내 써서 칼선은 전과 똑같다. 순수 계산이 아닌 작업 종류
+        (도무송 등)는 비워 두고 예전처럼 하나씩 계산한다."""
+        job = self.job_type.get()
+        if job not in self._PURE_AUTO_JOBS:
+            self._prewarm_segmentation(path, [boxes[g[0]] for g in groups])
+            return {}
+        dpi, margin, precision = self.dpi.get(), self.style_margin_mm.get(), self.precision.get()
+        tasks = []
+        for group in groups:
+            primary_idx = group[0]
+            sel = tuple(boxes[primary_idx])
+            siblings = [b for j, b in enumerate(boxes) if j != primary_idx]
+            tasks.append((sel, siblings, self._grid_cell_containing(sel)))
+
+        results = _procpool.run_tasks([
+            ("auto", (path, job, sel, [tuple(b) for b in siblings], art_region, dpi, margin, precision))
+            for sel, siblings, art_region in tasks
+        ])
+        return {t[0]: r for t, r in zip(tasks, results) if r is not None}
+
+    def _prewarm_segmentation(self, path, boxes_px):
+        """boxes_px 각각의 GrabCut 실루엣을 여러 스레드로 미리 계산(결과는 캐시에 남음)."""
+        try:
+            from core.parallel import pmap
+            from core.segmentation import segment_design_in_region
+
+            precision = self.precision.get()
+
+            def _one(box):
+                try:
+                    segment_design_in_region(path, tuple(box), margin_px=40, supersample=precision)
+                except Exception:  # noqa: BLE001 -- 실패하면 원래 순서대로 돌 때 다시 시도/처리됨
+                    pass
+
+            pmap(_one, list(boxes_px))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
     def _run_auto_detect_and_add_all(self, path):
         # 2026-09-07 피드백: 실제 재단선 격자를 읽은 파일이면(_on_ai_loaded
         # 참고) 픽셀에서 다시 추측하지 말고 그 실제 칸을 그대로 쓴다 --
@@ -5368,6 +5406,10 @@ class CutLineApp(ctk.CTk):
         # 채워서 기존 _generate_one_item을 그대로 재사용 -- 개별 항목 하나가
         # 실패해도(예: 너무 작거나 이상한 영역) 전체를 중단하지 않고 계속
         # 진행하며, 실패 목록은 마지막에 모아서 알려준다.
+        # 2026-09-30 속도: 가장 오래 걸리는 GrabCut 실루엣을 모든 대표 요소에 대해 먼저 동시에
+        # 계산해 둔다(결과는 core.segmentation 안에 기억됨) -- 아래 순서대로 도는 반복은 그 결과를
+        # 그대로 꺼내 쓰므로 칼선은 전과 똑같고 시간만 줄어든다.
+        self._auto_precomputed = self._precompute_auto_items(path, boxes, groups)
         for gi, group in enumerate(groups, start=1):
             primary_idx = group[0]
             x0, y0, x1, y1 = boxes[primary_idx]
@@ -5477,6 +5519,7 @@ class CutLineApp(ctk.CTk):
                     self._report_exception_to_server("반복 도안 복제 처리 중")
                     errors.append(f"{other_idx + 1}번째 도안(반복 복제): {self._friendly_error_text(str(e))}")
         self._selection_px = None
+        self._auto_precomputed = None  # 이번 자동 인식에서만 쓰는 미리 계산 결과(다른 작업에 섞이지 않게)
 
         if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE") and self._real_grid_cells_px:
             try:
@@ -5521,6 +5564,77 @@ class CutLineApp(ctk.CTk):
 
         self.after(0, self._show_auto_detect_result, preview_png, added, n_total, errors)
 
+    _SUPPLEMENT_NOTE = "무테 보조 탐지: 기존 인식에서 빠진 요소를 배경 채우기로 찾아 그림 안쪽으로 잘랐습니다."
+    _supplement_memo: dict = {}
+    _supplement_memo_lock = threading.Lock()
+
+    @classmethod
+    def _supplement_make(cls, path, el, dpi, margin, precision, auto_style):
+        """보조 탐지 요소 하나의 칼선(순수 계산) -> (스타일, 결과). 같은 파일·같은 요소·같은 설정이면
+        기억해 둔 결과의 복사본을 준다(뒤이어 정리 단계가 결과를 고쳐 쓰므로 원본은 보존)."""
+        import dataclasses
+
+        note = cls._SUPPLEMENT_NOTE
+        key = None
+        try:
+            st = os.stat(path)
+            key = (os.path.abspath(path), st.st_mtime_ns, st.st_size, el.wkb, float(dpi), float(margin),
+                   int(precision), bool(auto_style))
+        except Exception:  # noqa: BLE001
+            key = None
+        if key is not None:
+            with cls._supplement_memo_lock:
+                hit = cls._supplement_memo.get(key)
+            if hit is not None:
+                style, res = hit
+                return style, dataclasses.replace(res, offsets=dict(res.offsets),
+                                                  adjustments=list(res.adjustments or []))
+        if auto_style and has_white_or_black_border(path, el, dpi):
+            # 무테+유테 자동: 흰색/검은색 테두리 선이 있으면 유테(바깥)
+            res = generate_cutline_by_style(
+                image_path=path, style=ImageStyle.LINE_ART, dpi=dpi,
+                selection_px=tuple(el.bounds), margin_mm=margin,
+                supersample=precision, precomputed_content_px=el,
+            )
+            res.adjustments = [note.replace("그림 안쪽으로", "테두리 바깥으로")] + list(res.adjustments or [])
+            style = "LINE_ART"
+        else:
+            res = generate_borderless_cut_from_silhouette(path, el, dpi, margin, note=note)
+            style = "BORDERLESS"
+        if key is not None:
+            with cls._supplement_memo_lock:
+                if len(cls._supplement_memo) > 2048:
+                    cls._supplement_memo.clear()
+                cls._supplement_memo[key] = (style, dataclasses.replace(
+                    res, offsets=dict(res.offsets), adjustments=list(res.adjustments or [])))
+        return style, res
+
+    @staticmethod
+    def _supplement_detect(path, cell_boxes):
+        """보조 탐지의 "요소 찾기" 부분(화면 상태 없음 -- 결과는 core.multi_design 안에 기억되어
+        ① 직후 뒤에서 미리 불러 두면 ③에서 다시 계산하지 않음). -> (칸들, 반복 그룹, 그룹별 요소)"""
+        from core.parallel import pmap
+
+        cells, groups = group_content_cells_px(path, [
+            c for c in cell_boxes if image_outer_region_px(path, c) is not None
+        ])
+
+        def _bg_of(grp):
+            out = []
+            try:
+                detect_elements_by_background_flood_px(path, cells[grp[0]], bg_colors_out=out)
+            except Exception:  # noqa: BLE001
+                pass
+            return out
+
+        # 칸마다 독립 계산이라 동시에(색 모음 순서는 칸 순서 그대로)
+        sheet_bg = [c for part in pmap(_bg_of, list(groups)) for c in part]
+        elements_per_group = pmap(
+            lambda grp: detect_elements_by_background_flood_px(path, cells[grp[0]], known_bg_lab=sheet_bg),
+            list(groups),
+        )
+        return cells, groups, elements_per_group
+
     def _supplement_missing_elements(self, path, start_idx, cell_boxes, auto_style=False):
         """무테 자동 인식 보조(자동 적용): 기존 경로(선 기반 낱개 탐지 +
         GrabCut)가 놓친 요소만 배경 채우기 탐지기
@@ -5535,48 +5649,74 @@ class CutLineApp(ctk.CTk):
         margin = self.style_margin_mm.get()
         dpi = self.dpi.get()
         inset = _mm_to_px(margin, dpi)
-        existing = []
+        existing_cuts = []  # 칼선 조각 하나하나(버퍼 전) -- 아래 "일부 조각" 판정용
         for i in range(start_idx, len(self._accumulated)):
             cut = self._accumulated[i].offsets.get("cut")
             if cut is not None and not cut.is_empty:
-                existing.append(cut.buffer(inset))
-        covered = unary_union(existing) if existing else None
-        cells, groups = group_content_cells_px(path, [
-            c for c in cell_boxes if image_outer_region_px(path, c) is not None
-        ])
+                existing_cuts.extend(list(cut.geoms) if hasattr(cut, "geoms") else [cut])
+        # 2026-09-30 속도: 예전엔 모든 칼선을 여백만큼 넓혀 한 덩어리로 합친 뒤(칼선 100여 개면
+        # 약 0.6초) 요소마다 겹침을 쟀다. 요소 근처(여백 이내)의 칼선만 골라 넓혀 합쳐도 요소와
+        # 겹치는 넓이는 똑같다.
+        from shapely.strtree import STRtree
+
+        _tree = STRtree(existing_cuts) if existing_cuts else None
+
+        def _covered_near(el):
+            if _tree is None:
+                return None
+            near = [existing_cuts[int(k)] for k in _tree.query(el.buffer(inset + 1.0))]
+            near = [c for c in near if c.distance(el) < inset + 1.0]
+            return unary_union([c.buffer(inset) for c in near]) if near else None
+        cells, groups, elements_per_group = self._supplement_detect(path, cell_boxes)
         added = 0
-        note = "무테 보조 탐지: 기존 인식에서 빠진 요소를 배경 채우기로 찾아 그림 안쪽으로 잘랐습니다."
-        # 시트 전체의 배경색 모음: 한 칸에서 배경으로 확인된 색은 다른 칸(예: 90도
-        # 돌려 놓은 칸)에서 한쪽 가장자리에만 닿아도 배경으로 본다.
-        sheet_bg = []
-        for grp in groups:
-            try:
-                detect_elements_by_background_flood_px(path, cells[grp[0]], bg_colors_out=sheet_bg)
-            except Exception:  # noqa: BLE001
-                pass
-        for grp in groups:
+        note = self._SUPPLEMENT_NOTE
+        from core.parallel import pmap
+        candidates = []  # (칸 그룹, 대표 칸, 요소) -- 걸러낸 뒤 한꺼번에 동시에 칼선 계산
+        for grp, group_elements in zip(groups, elements_per_group):
             prim = cells[grp[0]]
             cell_area = max(1.0, (prim[2] - prim[0]) * (prim[3] - prim[1]))
-            for el in detect_elements_by_background_flood_px(path, prim, known_bg_lab=sheet_bg):
+            for el in group_elements:
+                # 2026-09-30: 칸 모서리에 걸려 잘린 작은 장식 조각(다른 칸에서 이어지는 나무 끝 등)은
+                # 실제 손 칼선에서도 자르지 않았다(실제 파일 대조: 칸 모서리 두 변에 걸친 1.5% 크기
+                # 조각 14개가 모두 원본 칼선 없음). 두 변 이상에 닿은 요소는 칸의 5% 이상일 때만.
+                try:
+                    tol = 6.0
+                    ex0, ey0, ex1, ey1 = el.bounds
+                    edges = sum([ex0 <= prim[0] + tol, ey0 <= prim[1] + tol,
+                                 ex1 >= prim[2] - tol, ey1 >= prim[3] - tol])
+                    if edges >= 2 and el.area < 0.05 * cell_area:
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
                 # 칸 넓이의 1% 미만은 더하지 않는다: 실측으로 배경 건물의 창문
                 # 칸 같은 무늬 조각(약 5mm)이 여기 걸렸고, 실제로 빠져 있던
                 # 요소(병아리·잎 등, 칸의 1.5% 이상)는 모두 이보다 컸다.
                 if el.area < 0.01 * cell_area:
                     continue
+                covered = _covered_near(el)
                 if covered is not None and el.intersection(covered).area / el.area >= 0.3:
-                    continue
-                el_style = "BORDERLESS"
-                if auto_style and has_white_or_black_border(path, el, dpi):
-                    # 무테+유테 자동: 흰색/검은색 테두리 선이 있으면 유테(바깥)
-                    el_style = "LINE_ART"
-                    res = generate_cutline_by_style(
-                        image_path=path, style=ImageStyle.LINE_ART, dpi=dpi,
-                        selection_px=tuple(el.bounds), margin_mm=margin,
-                        supersample=self.precision.get(), precomputed_content_px=el,
-                    )
-                    res.adjustments = [note.replace("그림 안쪽으로", "테두리 바깥으로")] + list(res.adjustments or [])
-                else:
-                    res = generate_borderless_cut_from_silhouette(path, el, dpi, margin, note=note)
+                    # 2026-09-30(멍푸 PC 화면의 나무): 이미 있는 칼선이 이 요소의 *일부 조각*
+                    # (나무 줄기)일 뿐이면 건너뛰지 않는다 -- 요소 전체(나무 윗부분+줄기)
+                    # 칼선을 더하면 아래 겹침 정리(_merge_overlapping_borderless_cuts)가
+                    # 조각과 합쳐 칼선 하나로 만든다. 조각 = 이 요소 안에 80% 이상 들어가고,
+                    # 요소가 그 조각보다 1.5~8배 큰 경우(조각 하나만 -- 여러 요소를 삼킨 큰
+                    # 덩어리는 제외: 실제 파일 대조에서 장면 전체가 한 칼선이 되는 회귀 확인).
+                    touching = [c for c in existing_cuts if c.intersects(el)]
+                    frag_area = sum(c.area for c in touching)
+                    only_fragments = len(touching) == 1 and all(
+                        c.intersection(el).area >= 0.8 * c.area for c in touching
+                    ) and 1.5 * frag_area <= el.area <= 8.0 * frag_area
+                    if not only_fragments:
+                        continue
+                candidates.append((grp, prim, el))
+
+        precision = self.precision.get()
+
+        # 2026-09-30 속도: 요소마다 독립 계산이라 동시에(순서·결과는 그대로). 결과는 기억되어,
+        # ① 직후 뒤에서 미리 계산해 둔 요소는 다시 계산하지 않는다(_supplement_make).
+        made = pmap(lambda cand: self._supplement_make(path, cand[2], dpi, margin, precision, auto_style),
+                    candidates)
+        for (grp, prim, el), (el_style, res) in zip(candidates, made):
                 if res.offsets["cut"].is_empty:
                     continue
                 self._accumulated.append(res)
@@ -5641,11 +5781,11 @@ class CutLineApp(ctk.CTk):
         from core.cutline_core import mm_to_px as _mm_to_px
 
         gap = _mm_to_px(min_gap_mm, self.dpi.get())
-        for i in range(start_idx, len(self._accumulated)):
-            res = self._accumulated[i]
-            cut = res.offsets.get("cut")
+
+        def _tidy_one(cut):
+            """칼선 하나(여러 조각일 수 있음)를 정리한 결과. 바뀐 게 없으면 None."""
             if cut is None or cut.is_empty:
-                continue
+                return None
             parts = [p for p in getattr(cut, "geoms", [cut]) if isinstance(p, Polygon) and not p.is_empty]
             filled = [Polygon(p.exterior) for p in parts]
             filled = [p for p in filled if not any(q is not p and q.contains(p) for q in filled)]
@@ -5674,10 +5814,23 @@ class CutLineApp(ctk.CTk):
                     smoothed.append(p)
             filled = smoothed
             if changed and filled:
-                res.offsets["cut"] = MultiPolygon(filled)
-                res.adjustments = list(res.adjustments or []) + [
-                    "칼선 안쪽 구멍과, 2mm보다 가깝게 갈라진 같은 요소의 칼선 조각을 하나로 정리했습니다."
-                ]
+                return MultiPolygon(filled)
+            return None
+
+        # 2026-09-30 속도: 칼선마다 독립 계산이라 동시에(core.parallel -- shapely 계산은 파이썬
+        # 잠금을 풀어 코어 수만큼 빨라짐). 적용은 원래 순서대로.
+        from core.parallel import pmap
+
+        idxs = list(range(start_idx, len(self._accumulated)))
+        tidied = pmap(lambda i: _tidy_one(self._accumulated[i].offsets.get("cut")), idxs)
+        for i, new_cut in zip(idxs, tidied):
+            if new_cut is None:
+                continue
+            res = self._accumulated[i]
+            res.offsets["cut"] = new_cut
+            res.adjustments = list(res.adjustments or []) + [
+                "칼선 안쪽 구멍과, 2mm보다 가깝게 갈라진 같은 요소의 칼선 조각을 하나로 정리했습니다."
+            ]
 
     def _separate_too_close_cuts(self, start_idx, min_gap_mm=2.0):
         from shapely.geometry import MultiPolygon, Polygon
@@ -5899,23 +6052,43 @@ class CutLineApp(ctk.CTk):
         # 그 대신 _choose_file이 기억해둔 원본 파일 이름을 우선 사용
         # (합성 시트처럼 원본이 없으면 기존과 동일하게 input_path에서 유도).
         base = self._export_basename or os.path.splitext(os.path.basename(self.input_path.get()))[0]
-        default_name = base + "_cutlines.svg"
+        # 2026-09-30(멍푸: "칼선 파일 svg 말고 png로 개체 그룹화 해서 그대로 원본 이미지에 적용할
+        # 수 있게"): 기본은 PNG -- 원본 이미지와 같은 크기·해상도의 투명 배경에 마젠타 칼선만.
+        # 필요하면 저장 창에서 형식을 SVG로 바꿀 수도 있다(파일 확장자로 구분).
+        default_name = base + "_cutlines.png"
         out_path = filedialog.asksaveasfilename(
-            title="SVG로 내보내기",
-            defaultextension=".svg",
+            title="칼선 내보내기",
+            defaultextension=".png",
             initialfile=default_name,
-            filetypes=[("SVG", "*.svg")],
+            filetypes=[("PNG - 칼선만, 투명 배경(원본 이미지와 같은 크기)", "*.png"), ("SVG", "*.svg")],
         )
         if not out_path:
             return
         try:
-            # 2026-09-29: 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장
-            export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
-                       placement=getattr(self, "_ai_placement", None))
+            placement = getattr(self, "_ai_placement", None)
+            if out_path.lower().endswith(".svg"):
+                # 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장(2026-09-29)
+                export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
+                           placement=placement)
+                lines = [out_path]
+            else:
+                if not out_path.lower().endswith(".png"):
+                    out_path += ".png"
+                img_dpi = None
+                if placement and placement.get("pt_per_px"):
+                    img_dpi = 72.0 / float(placement["pt_per_px"])  # AI 안 인쇄 이미지의 실제 해상도
+                elif getattr(self, "_source_raster_dpi", None):
+                    img_dpi = self._source_raster_dpi
+                export_cut_png(self._last_result, out_path, dpi=img_dpi)
+                lines = [
+                    out_path,
+                    f"원본 이미지와 같은 크기({self._last_result.width_px}x{self._last_result.height_px}px)의 "
+                    "투명 배경 PNG입니다 -- 원본 이미지 위에 왼쪽 위 모서리를 맞춰 겹치면 칼선 위치가 그대로 맞습니다.",
+                ]
             self.status.set(f"저장됨: {out_path}")
-            self._show_note_dialog("SVG로 저장했습니다", [out_path], kind="info")
+            self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")
         except Exception as e:  # noqa: BLE001
-            self._report_exception_to_server("SVG 내보내기 저장 중")
+            self._report_exception_to_server("칼선 내보내기 저장 중")
             self._show_note_dialog("저장 중 오류가 발생했습니다", [str(e)], kind="error")
 
 
@@ -5932,7 +6105,13 @@ def main():
     app = None
     try:
         app = CutLineApp()
+        # 칼선 계산용 작업 프로세스를 뒤에서 미리 띄워 둔다(첫 칼선 생성부터 빠르게)
+        try:
+            _procpool.warm_up_async()
+        except Exception:  # noqa: BLE001
+            pass
         app.mainloop()
+        _procpool.shutdown()
     except Exception:  # noqa: BLE001
         # 2026-08-27 피드백("한 번도 프로그램을 테스트조차 못 해봤어"):
         # --windowed 빌드는 콘솔이 없어서 시작 중 예외가 나면 진짜 아무
@@ -5984,4 +6163,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # 2026-09-30: exe(PyInstaller)에서 작업 프로세스(core.procpool)를 쓰려면 맨 처음에 필요
+    import multiprocessing as _mp
+
+    _mp.freeze_support()
     main()

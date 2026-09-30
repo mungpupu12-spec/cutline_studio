@@ -22,6 +22,8 @@ design and mostly excludes its neighbors.
 from __future__ import annotations
 
 import cv2
+
+from . import image_cache as _image_cache
 import numpy as np
 from shapely.affinity import scale as shapely_scale, translate as shapely_translate
 from shapely.geometry import MultiPolygon, Polygon
@@ -95,7 +97,60 @@ def _edge_outline_mask(
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
 
 
+_SEGMENT_CACHE: "dict" = {}
+_SEGMENT_CACHE_MAX = 512
+_SEGMENT_CACHE_LOCK = __import__("threading").Lock()
+
+
 def segment_design_in_region(
+    image_path: str,
+    rect_px: tuple,
+    margin_px: int = 40,
+    iterations: int = 5,
+    supersample: int = 4,
+    simplify_tol_px: float = 0.6,
+    min_area_px: float = 25.0,
+    note_sink: list | None = None,
+    max_grabcut_dim: int = 420,
+) -> MultiPolygon:
+    """같은 이미지·같은 영역·같은 설정으로 다시 부르면 GrabCut을 다시 돌리지 않고 이전 결과를
+    돌려준다(2026-09-30 속도 조사: 요소 하나마다 자동 판정용과 무테 칼선용으로 똑같은 GrabCut을
+    두 번씩 돌리고 있었음 -- ③에서 56번 중 28번이 중복). 그때 남긴 안내 문구도 똑같이 다시
+    남긴다. 이미지 파일이 바뀌면(수정 시각/크기) 새로 계산한다."""
+    import os as _os
+
+    try:
+        st = _os.stat(image_path)
+        key = (_os.path.abspath(image_path), st.st_mtime_ns, st.st_size,
+               tuple(round(float(v), 3) for v in rect_px), int(margin_px), int(iterations),
+               int(supersample), float(simplify_tol_px), float(min_area_px), int(max_grabcut_dim))
+    except (OSError, TypeError, ValueError):
+        key = None
+    if key is not None:
+        with _SEGMENT_CACHE_LOCK:
+            hit = _SEGMENT_CACHE.get(key)
+        if hit is not None:
+            geom, notes = hit
+            if note_sink is not None:
+                note_sink.extend(notes)
+            return geom
+    notes: list = []
+    geom = _segment_design_in_region_uncached(
+        image_path, rect_px, margin_px=margin_px, iterations=iterations, supersample=supersample,
+        simplify_tol_px=simplify_tol_px, min_area_px=min_area_px, note_sink=notes,
+        max_grabcut_dim=max_grabcut_dim,
+    )
+    if note_sink is not None:
+        note_sink.extend(notes)
+    if key is not None:
+        with _SEGMENT_CACHE_LOCK:
+            if len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_MAX:
+                _SEGMENT_CACHE.pop(next(iter(_SEGMENT_CACHE)))
+            _SEGMENT_CACHE[key] = (geom, list(notes))
+    return geom
+
+
+def _segment_design_in_region_uncached(
     image_path: str,
     rect_px: tuple,
     margin_px: int = 40,
@@ -177,7 +232,7 @@ def segment_design_in_region(
     오늘 시점에도 여전히 미해결로 남겨둔다 -- 정직하게, 안전하지 않은
     해결책을 급하게 넣기보다는 이번 RNG 고정 수정만 반영한다.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = img.shape[:2]
@@ -437,7 +492,7 @@ def segment_design_with_hints(
     좌표(GUI에서 이미 쓰고 있는 좌표계와 동일) -- 이 함수 내부에서만 크롭/
     축소 좌표로 변환한다.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = img.shape[:2]

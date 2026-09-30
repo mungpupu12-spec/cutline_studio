@@ -40,7 +40,11 @@ Canny 엣지 검출 + (엣지로 둘러싸인 안쪽을 전경으로 채우는) 
 
 from __future__ import annotations
 
+import threading
+
 import cv2
+
+from . import image_cache as _image_cache
 import numpy as np
 from PIL import Image
 
@@ -193,30 +197,27 @@ def _fill_enclosed_regions(
     동일하게 동작한다."""
     background = cv2.bitwise_not(mask_u8)  # 255 where NOT edge/foreground
     padded = cv2.copyMakeBorder(background, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=255)
-    flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
-    reached = padded.copy()
+    # 2026-09-30(속도 조사: 이 부분이 칸마다 파이썬 루프로 테두리 픽셀 수만 개를 하나씩 확인하며
+    # floodFill을 부르고 있었다 -- ③에서 약 2초): "테두리(+border_margin_px 띠)의 배경 픽셀에서
+    # 4방향으로 이어지는 배경 = 바깥"이라는 똑같은 판정을, 배경의 4방향 연결 성분을 한 번에
+    # 구해 씨앗 영역에 닿은 성분을 고르는 방식으로 바꿈(결과는 이전 floodFill 방식과 동일).
     ph, pw = padded.shape[:2]
-    border_xy = set()
-    for x in range(pw):
-        border_xy.add((x, 0))
-        border_xy.add((x, ph - 1))
-    for y in range(ph):
-        border_xy.add((0, y))
-        border_xy.add((pw - 1, y))
+    bg = (padded == 255).astype(np.uint8)
+    _n_lab, labels = cv2.connectedComponents(bg, connectivity=4)
+    seed = np.zeros((ph, pw), bool)
+    seed[0, :] = seed[-1, :] = True
+    seed[:, 0] = seed[:, -1] = True
     if border_margin_px > 0:
         h0, w0 = background.shape[:2]
         margin = min(border_margin_px, h0, w0)
-        cols = list(range(0, margin)) + list(range(max(0, w0 - margin), w0))
-        rows = list(range(0, margin)) + list(range(max(0, h0 - margin), h0))
-        for y in range(h0):
-            for x in cols:
-                border_xy.add((x + 1, y + 1))  # +1: copyMakeBorder 오프셋
-        for x in range(w0):
-            for y in rows:
-                border_xy.add((x + 1, y + 1))
-    for bx, by in border_xy:
-        if reached[by, bx] == 255:  # 아직 어떤 flood에도 닿지 않은 배경
-            cv2.floodFill(reached, flood_mask, (bx, by), 128)
+        seed[1:1 + h0, 1:1 + margin] = True
+        seed[1:1 + h0, 1 + max(0, w0 - margin):1 + w0] = True
+        seed[1:1 + margin, 1:1 + w0] = True
+        seed[1 + max(0, h0 - margin):1 + h0, 1:1 + w0] = True
+    hit = np.unique(labels[seed & (bg > 0)])
+    hit = hit[hit > 0]
+    reached_bool = np.isin(labels, hit) & (bg > 0)
+    reached = np.where(reached_bool, 128, padded).astype(np.uint8)
     reached = reached[1:-1, 1:-1]  # 앞서 둘렀던 가짜 테두리 1px를 다시 잘라냄
     enclosed = (background == 255) & (reached != 128)
 
@@ -384,21 +385,28 @@ def _split_touching_blobs(mask_u8: np.ndarray, min_area: int, peak_ratio: float 
     blur_ksize = int(blur_sigma * 6) | 1  # 홀수로 보정
     dist_for_peaks = cv2.GaussianBlur(dist, (blur_ksize, blur_ksize), blur_sigma)
 
+    # 2026-09-30 속도: 블롭마다 시트 전체 크기 배열(수천x수천)을 새로 만들던 것을 블롭의
+    # 바운딩 박스 안에서만 계산하도록 바꿈(결과 동일 -- peak_local_max도 라벨 영역의 바운딩
+    # 박스 안에서만 봄). 키스컷 롤 한 장에서 이 함수만 약 16초 걸리던 원인.
     for i in range(1, n_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_area:
             continue
-        blob_mask = labels == i
-        blob_dist = np.where(blob_mask, dist, 0)
+        bx, by = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+        bw, bh = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
+        sl = (slice(by, by + bh), slice(bx, bx + bw))
+        blob_mask = labels[sl] == i
+        blob_dist = np.where(blob_mask, dist[sl], 0)
         local_max = float(blob_dist.max())
         if local_max <= 0:
             continue
 
-        seed_components = []  # 각 원소: 이 블롭 안에서 찾은 씨앗 하나의 boolean 마스크
+        seed_points = []  # 씨앗 점(전체 이미지 좌표)
+        seed_masks = []   # 또는 씨앗 덩어리(블롭 박스 안 boolean 마스크)
         if _PEAK_LOCAL_MAX_AVAILABLE:
             try:
                 coords = _peak_local_max(
-                    dist_for_peaks,
+                    dist_for_peaks[sl],
                     min_distance=int(round(min_distance)),
                     labels=blob_mask.astype(np.int32),
                     threshold_abs=min_peak_dist,
@@ -408,23 +416,23 @@ def _split_touching_blobs(mask_u8: np.ndarray, min_area: int, peak_ratio: float 
                 coords = None
             if coords is not None and len(coords) > 0:
                 for y, x in coords:
-                    m = np.zeros(mask_u8.shape, dtype=bool)
-                    m[int(y), int(x)] = True
-                    seed_components.append(m)
+                    seed_points.append((by + int(y), bx + int(x)))
 
-        if not seed_components:
+        if not seed_points:
             # skimage를 못 쓰거나(설치 안 됨) 극대값을 하나도 못 찾은 경우
             # (이 블롭 전체가 min_peak_dist 미만으로 얇음 등) -- 예전
-            # 방식(블롭 전체 최댓값 * peak_ratio) 그대로 폴백한다. 이 경로는
-            # 지금까지 실측으로 검증돼온 기존 동작을 그대로 보존하므로
-            # 회귀 위험이 없다.
+            # 방식(블롭 전체 최댓값 * peak_ratio) 그대로 폴백한다.
             seed_mask = (blob_dist >= local_max * peak_ratio).astype(np.uint8)
             n_seed, seed_labels = cv2.connectedComponents(seed_mask, connectivity=8)
             for seed_i in range(1, n_seed):
-                seed_components.append(seed_labels == seed_i)
+                seed_masks.append(seed_labels == seed_i)
 
-        for comp in seed_components:
-            markers[comp] = next_marker
+        for (py, px) in seed_points:
+            markers[py, px] = next_marker
+            marker_origin[next_marker] = i
+            next_marker += 1
+        for comp in seed_masks:
+            markers[sl][comp] = next_marker
             marker_origin[next_marker] = i
             next_marker += 1
 
@@ -1234,6 +1242,7 @@ def _detect_boxes_from_gray(
     return boxes
 
 
+@_image_cache.file_memo  # 2026-09-30 속도: 같은 칸 반복 계산 방지(결과는 True/False)
 def cell_has_content_px(
     image_path: str,
     cell_px: tuple,
@@ -1304,8 +1313,8 @@ def cell_has_content_px(
     (차이가 매우 작으면) 그 덩어리는 내용으로 세지 않는다 -- 배경 자체가
     다시 칠해진 것일 뿐 실제 그림이 아니라고 보는 것."""
     x0, y0, x1, y1 = [int(round(v)) for v in cell_px]
-    with Image.open(image_path) as im:
-        im = im.convert("RGB")
+    if True:  # 2026-09-30: 캐시된 이미지(core.image_cache)
+        im = _image_cache.pil_open(image_path, "RGB")
         w, h = im.size
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(w, x1), min(h, y1)
@@ -1772,8 +1781,8 @@ def detect_design_bboxes_px(
     are assumed to be meaningfully larger than that. Returns an empty list
     if nothing looks like a separate design (e.g. a blank image).
     """
-    with Image.open(image_path) as im:
-        im = im.convert("RGB")
+    if True:  # 2026-09-30: 캐시된 이미지(core.image_cache)
+        im = _image_cache.pil_open(image_path, "RGB")
         w, h = im.size
         gray = np.array(im.convert("L"))
 
@@ -1849,8 +1858,8 @@ def detect_sub_element_boxes_px(
     원본 이미지 좌표로 그 리스트에 추가만 한다 -- 반환하는 boxes 자체에는
     전혀 영향 없는 순수 진단 정보."""
     rx0, ry0, rx1, ry1 = [int(round(v)) for v in region_px]
-    with Image.open(image_path) as im:
-        im = im.convert("RGB")
+    if True:  # 2026-09-30: 캐시된 이미지(core.image_cache)
+        im = _image_cache.pil_open(image_path, "RGB")
         w, h = im.size
         rx0, ry0 = max(0, rx0), max(0, ry0)
         rx1, ry1 = min(w, rx1), min(h, ry1)
@@ -2078,7 +2087,7 @@ def group_identical_boxes_px(
     나머지는 복제)다. 입력 순서는 항상 보존된다(그룹 자체도, 그룹 안
     인덱스 순서도).
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = img.shape[:2]
@@ -2141,7 +2150,62 @@ def map_box_between_frames_px(box_px: tuple, from_frame_px: tuple, to_frame_px: 
     return (rx0, ry0, rx1, ry1)
 
 
+_BG_FLOOD_CACHE: dict = {}
+_BG_FLOOD_LOCK = threading.Lock()
+_SPLIT_MEMO: dict = {}
+_SPLIT_MEMO_LOCK = threading.Lock()
+
+
 def detect_elements_by_background_flood_px(
+    image_path: str,
+    cell_px: tuple,
+    grad_threshold: float = 3.0,
+    flood_delta: int = 12,
+    min_area_ratio: float = 0.003,
+    _img=None,
+    known_bg_lab=None,
+    bg_colors_out=None,
+):
+    """결과를 기억하는 겉 함수(2026-09-30 속도 조사: 무테 요소 하나마다 자기가 든 칸 전체를
+    다시 배경 채우기 하고 있었음 -- 같은 칸의 요소 34개가 같은 계산을 34번, 자동 인식에서 약
+    7초). 파일(수정 시각/크기)·칸·설정·배경색 목록이 같으면 이전 결과(요소 목록과 배경색)를
+    그대로 쓴다. _img를 직접 넘기면(파일과 다를 수 있으므로) 기억하지 않는다."""
+    import os as _os
+
+    key = None
+    if _img is None:
+        try:
+            st = _os.stat(image_path)
+            key = (_os.path.abspath(image_path), st.st_mtime_ns, st.st_size,
+                   tuple(round(float(v), 3) for v in cell_px), float(grad_threshold), int(flood_delta),
+                   float(min_area_ratio),
+                   None if known_bg_lab is None else tuple(tuple(round(float(x), 4) for x in c) for c in known_bg_lab))
+        except (OSError, TypeError, ValueError):
+            key = None
+    if key is not None:
+        with _BG_FLOOD_LOCK:
+            hit = _BG_FLOOD_CACHE.get(key)
+        if hit is not None:
+            objs, colors = hit
+            if bg_colors_out is not None:
+                bg_colors_out.extend(colors)
+            return list(objs)
+    colors: list = []
+    objs = _detect_elements_by_background_flood_px_uncached(
+        image_path, cell_px, grad_threshold=grad_threshold, flood_delta=flood_delta,
+        min_area_ratio=min_area_ratio, _img=_img, known_bg_lab=known_bg_lab, bg_colors_out=colors,
+    )
+    if bg_colors_out is not None:
+        bg_colors_out.extend(colors)
+    if key is not None:
+        with _BG_FLOOD_LOCK:
+            if len(_BG_FLOOD_CACHE) > 1024:
+                _BG_FLOOD_CACHE.clear()
+            _BG_FLOOD_CACHE[key] = (tuple(objs), tuple(colors))
+    return list(objs)
+
+
+def _detect_elements_by_background_flood_px_uncached(
     image_path: str,
     cell_px: tuple,
     grad_threshold: float = 3.0,
@@ -2178,7 +2242,7 @@ def detect_elements_by_background_flood_px(
     Returns: 원본 이미지 좌표 Polygon 목록(요소 실루엣)."""
     from shapely.geometry import Polygon as _Polygon
 
-    img = _img if _img is not None else cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _img if _img is not None else _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         return []
     H, W = img.shape[:2]
@@ -2211,21 +2275,29 @@ def detect_elements_by_background_flood_px(
     ys, xs = np.where(ring_idx)
     sides = {"L": xs < t, "R": xs >= w - t, "T": ys < t, "B": ys >= h - t}
     good = set()
+    # 2026-09-30(멍푸 PC 화면에서 "칼선이 적합하지 않다"고 표시한 나무): 칸 왼쪽 위 모서리에
+    # 걸친 분홍 나무와 오른쪽 가장자리의 다른 분홍 나무가 같은 색이라 "좌우 양쪽 가장자리에
+    # 나오는 색 = 배경"으로 판정 -> 나무 윗부분이 배경으로 채워져 칼선이 줄기에만 생겼다
+    # (실제 손 칼선은 나무 전체 한 개). 양쪽 가장자리 규칙으로만 배경이 된 색은, 실제로 채워
+    # 본 영역이 칸을 가로/세로로 60% 이상 가로지르거나 칸의 8% 이상을 덮을 때만 배경으로
+    # 인정한다(하늘·바닥·잔디 띠처럼 진짜 배경은 길게 이어짐. 실측: 나무 윗부분 7.5%·가로
+    # 20%/세로 49%, 파스텔 시트의 잔디 띠 가로 75%, 분홍 언덕 11%). 칸의 25% 이상을 차지하는 색, 다른
+    # 칸에서 배경으로 확인된 색은 예전 그대로 바로 배경.
+    span_checked = set()
     for k in range(K):
         pres = {}
         for nm, sel in sides.items():
             tot = max(1, int(sel.sum()))
             pres[nm] = (np.logical_and(sel, labels == k).sum() / tot) >= 0.03
-        if (pres["L"] and pres["R"]) or (pres["T"] and pres["B"]) or share[k] >= 0.25:
+        if share[k] >= 0.25:
             good.add(k)
-        elif known_bg_lab and share[k] >= 0.03:
-            c = centers[k]
-            if min(float(np.linalg.norm(c - np.asarray(b, np.float32))) for b in known_bg_lab) <= 10.0:
-                good.add(k)
-    if bg_colors_out is not None:
-        for k in good:
-            if share[k] >= 0.03:
-                bg_colors_out.append(tuple(float(v) for v in centers[k]))
+        elif known_bg_lab and share[k] >= 0.03 and min(
+            float(np.linalg.norm(centers[k] - np.asarray(b, np.float32))) for b in known_bg_lab
+        ) <= 10.0:
+            good.add(k)
+        elif (pres["L"] and pres["R"]) or (pres["T"] and pres["B"]):
+            good.add(k)
+            span_checked.add(k)
     flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
 
     def _seed_point(i):
@@ -2253,11 +2325,35 @@ def detect_elements_by_background_flood_px(
         return None
 
     seed_ids = [i for i in range(len(labels)) if int(labels[i]) in good][::5]
+    flags_trial = 4 | cv2.FLOODFILL_MASK_ONLY | (64 << 8)
+    min_bg_area = 0.08 * w * h
+    span_accepted = set()
     for i in seed_ids:
         pt = _seed_point(i)
         if pt is None:
             continue
-        cv2.floodFill(sm, mask, pt, 0, (flood_delta,) * 3, (flood_delta,) * 3, flags)
+        if int(labels[i]) not in span_checked:
+            cv2.floodFill(sm, mask, pt, 0, (flood_delta,) * 3, (flood_delta,) * 3, flags)
+            continue
+        if mask[pt[1] + 1, pt[0] + 1]:
+            continue  # 이미 채웠거나(배경) 요소로 남기기로 한 자리
+        trial = mask.copy()
+        cv2.floodFill(sm, trial, pt, 0, (flood_delta,) * 3, (flood_delta,) * 3, flags_trial)
+        region = trial == 64
+        if not region.any():
+            continue
+        rys, rxs = np.where(region)
+        if ((rxs.max() - rxs.min()) >= 0.6 * w or (rys.max() - rys.min()) >= 0.6 * h
+                or len(rxs) >= min_bg_area):
+            mask[region] = 255
+            span_accepted.add(int(labels[i]))
+        else:
+            mask[region] = 2  # 칸 모서리에 걸친 요소 -- 배경으로 채우지 않음
+    if bg_colors_out is not None:
+        # 실제로 배경으로 채운 색만 알려 준다(모서리 요소로 판정된 색은 다른 칸에 넘기지 않음)
+        for k in good:
+            if share[k] >= 0.03 and (k not in span_checked or k in span_accepted):
+                bg_colors_out.append(tuple(float(v) for v in centers[k]))
     # 2차: 한쪽 가장자리에만 보이는 색(예: 칸 한쪽 끝을 요소가 가려서 반대편엔
     # 안 보이는 가로 줄무늬)도, 거기서 채운 영역이 칸 폭/높이의 80% 이상
     # 길게 뻗으면 배경(줄무늬·띠)으로 인정한다. 칸 가장자리에 걸친 캐릭터는
@@ -2381,14 +2477,17 @@ def group_content_cells_px(image_path: str, cell_boxes: list):
 
     Returns: (filtered_cells, groups) -- groups는 filtered_cells 인덱스
     리스트들의 리스트, 각 그룹의 첫 원소가 대표."""
-    filtered = []
-    for box in cell_boxes:
+    from .parallel import pmap
+
+    def _has(box):
         try:
-            has_content = cell_has_content_px(image_path, box)
+            return cell_has_content_px(image_path, box)
         except Exception:  # noqa: BLE001
-            has_content = True
-        if has_content:
-            filtered.append(tuple(box))
+            return True
+
+    # 2026-09-30: 칸마다 독립 계산이라 동시에(core.parallel) -- 결과 순서는 그대로
+    flags = pmap(_has, list(cell_boxes))
+    filtered = [tuple(box) for box, has_content in zip(cell_boxes, flags) if has_content]
 
     if not filtered:
         return [], []
@@ -2446,14 +2545,40 @@ def detect_repeat_aware_sub_element_boxes_px(image_path: str, cell_boxes: list, 
     if not filtered:
         return [], []
 
-    boxes = []
-    groups = []
-    for cell_group in cell_groups:
-        primary_idx = cell_group[0]
-        primary_box = filtered[primary_idx]
+    from .parallel import pmap
+
+    def _split_one(cell_group):
+        primary_box = filtered[cell_group[0]]
+        own_suspicious = [] if suspicious_regions is not None else None
+        # 2026-09-30 속도: 같은 칸의 세부 조각 나누기 결과를 기억(① 직후 뒤에서 미리 계산해 두면
+        # ③을 누를 때 다시 계산하지 않음). 의심 영역 목록을 모으는 호출은 기억하지 않는다.
+        memo_key = None
+        if own_suspicious is None:
+            try:
+                import os as _os
+
+                st = _os.stat(image_path)
+                memo_key = (_os.path.abspath(image_path), st.st_mtime_ns, st.st_size,
+                            tuple(round(float(v), 3) for v in primary_box))
+            except (OSError, TypeError, ValueError):
+                memo_key = None
+            if memo_key is not None:
+                with _SPLIT_MEMO_LOCK:
+                    hit = _SPLIT_MEMO.get(memo_key)
+                if hit is not None:
+                    return list(hit), None
+        sub_boxes = _split_one_uncached(primary_box, own_suspicious)
+        if memo_key is not None:
+            with _SPLIT_MEMO_LOCK:
+                if len(_SPLIT_MEMO) > 512:
+                    _SPLIT_MEMO.clear()
+                _SPLIT_MEMO[memo_key] = tuple(sub_boxes)
+        return sub_boxes, own_suspicious
+
+    def _split_one_uncached(primary_box, own_suspicious):
         try:
             sub_boxes = split_cell_into_sub_elements_px(
-                image_path, primary_box, suspicious_regions=suspicious_regions,
+                image_path, primary_box, suspicious_regions=own_suspicious,
             )
         except Exception:  # noqa: BLE001
             sub_boxes = [primary_box]
@@ -2461,6 +2586,18 @@ def detect_repeat_aware_sub_element_boxes_px(image_path: str, cell_boxes: list, 
             sub_boxes = merge_boxes_of_one_art_piece_px(image_path, primary_box, sub_boxes)
         except Exception:  # noqa: BLE001
             pass
+        return sub_boxes
+
+    # 2026-09-30 속도: 대표 칸마다 독립 계산이라 동시에(결과·안내 순서는 그대로 유지)
+    split_results = pmap(_split_one, list(cell_groups))
+
+    boxes = []
+    groups = []
+    for cell_group, (sub_boxes, own_suspicious) in zip(cell_groups, split_results):
+        primary_idx = cell_group[0]
+        primary_box = filtered[primary_idx]
+        if suspicious_regions is not None and own_suspicious:
+            suspicious_regions.extend(own_suspicious)
         for sub_box in sub_boxes:
             group_indices = [len(boxes)]
             boxes.append(sub_box)

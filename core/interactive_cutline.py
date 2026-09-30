@@ -34,6 +34,7 @@ from .cutline_core import (
 from .cutline_types import CutlineType, build_cutline_design
 from .image_style import ImageStyle, generate_style_cutline
 from .segmentation import segment_design_in_region
+from . import image_cache as _image_cache
 from .style_classify import DEFAULT_RECTANGULARITY_THRESHOLD, StyleClassification, classify_style
 
 # 2026-09-08 피드백("햄스터를 칼선을 따야 하는데 햄스터 배를 동그랗게 칼선을
@@ -305,7 +306,7 @@ def _sheet_background_bgr(image_path: str, img=None):
         return _SHEET_BG_CACHE[key]
     if img is None:
         import cv2
-        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     t = max(3, min(img.shape[:2]) // 200)
     ring = np.concatenate([
         img[:t].reshape(-1, 3), img[-t:].reshape(-1, 3),
@@ -319,7 +320,31 @@ def _sheet_background_bgr(image_path: str, img=None):
     return bg
 
 
+_OUTER_REGION_CACHE: dict = {}
+
+
 def image_outer_region_px(image_path: str, rect_px: tuple, min_fill_ratio: float = 0.05):
+    """같은 파일·같은 칸이면 이전 결과를 그대로(2026-09-30 속도: 같은 칸을 ①·③·보충 단계에서
+    여러 번 다시 계산하고 있었음). 파일이 바뀌면(수정 시각/크기) 새로 계산."""
+    import os as _os
+
+    try:
+        st = _os.stat(image_path)
+        key = (_os.path.abspath(image_path), st.st_mtime_ns, st.st_size,
+               tuple(round(float(v), 3) for v in rect_px), float(min_fill_ratio))
+    except (OSError, TypeError, ValueError):
+        key = None
+    if key is not None and key in _OUTER_REGION_CACHE:
+        return _OUTER_REGION_CACHE[key]
+    out = _image_outer_region_px_uncached(image_path, rect_px, min_fill_ratio)
+    if key is not None:
+        if len(_OUTER_REGION_CACHE) > 2048:
+            _OUTER_REGION_CACHE.clear()
+        _OUTER_REGION_CACHE[key] = out
+    return out
+
+
+def _image_outer_region_px_uncached(image_path: str, rect_px: tuple, min_fill_ratio: float = 0.05):
     """`rect_px`(칸/선택 영역) 안에서 실제로 인쇄된 이미지의 바깥 윤곽을
     Polygon(원본 픽셀 좌표)으로 돌려준다. 없으면(배경뿐인 빈 칸) None.
 
@@ -334,7 +359,7 @@ def image_outer_region_px(image_path: str, rect_px: tuple, min_fill_ratio: float
     import cv2
     import numpy as np
 
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         return None
     bg = _sheet_background_bgr(image_path, img)
@@ -633,7 +658,7 @@ def has_white_or_black_border(image_path: str, silhouette_px, dpi: float) -> boo
 
     if silhouette_px is None or silhouette_px.is_empty:
         return False
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         return False
     px = mm_to_px(1.0, dpi)
@@ -680,7 +705,14 @@ def has_white_or_black_border(image_path: str, silhouette_px, dpi: float) -> boo
     if outer_f is None or outer_f < 0.5:
         return False
     far_f = frac_bw(far)
-    return far_f is None or far_f < 0.5
+    # 2026-09-30(멍푸 PC 화면에서 "칼선이 적합하지 않다"고 표시한 강아지): 크림색(거의 흰색)
+    # 바닥 위에 선 무테 캐릭터가 바로 바깥 62% "흰색", 더 바깥 49% "흰색"이라 0.5 기준을
+    # 간신히 넘어 흰 테두리(유테)로 판정 -> 칼선이 배경으로 나갔다. 진짜 테두리 선은 테두리가
+    # 끝나면 흰색이 뚜렷하게 줄어든다(실제 흰 테두리 시트: 바로 바깥 대부분 흰색, 더 바깥은 거의
+    # 없음). 그래서 더 바깥이 바로 바깥의 60% 이상으로 여전히 흰색이면 = 흰 바탕/밝은 배경으로 본다.
+    if far_f is None:
+        return True
+    return far_f < 0.5 and far_f < 0.6 * outer_f
 
 
 def generate_cutline_auto(

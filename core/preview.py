@@ -39,11 +39,15 @@ def render_preview(
     canvas_w = result.width_px + margin_px * 2
     canvas_h = result.height_px + margin_px * 2
 
-    canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
+    # 2026-09-30 속도: 원본은 캐시에서(다시 읽지 않음), 합성은 RGB 붙여넣기로(투명 합성보다 빠름).
+    # 원본의 투명한 부분은 예전처럼 흰 바탕 위에 보이도록 알파를 마스크로 쓴다.
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
 
     if original_image_path:
-        art = Image.open(original_image_path).convert("RGBA")
-        canvas.alpha_composite(art, (margin_px, margin_px))
+        from . import image_cache
+
+        art = image_cache.pil_open(original_image_path, "RGBA")
+        canvas.paste(art, (margin_px, margin_px), art)
 
     draw = ImageDraw.Draw(canvas)
 
@@ -55,5 +59,20 @@ def render_preview(
             draw, geom, (margin_px, margin_px), COLORS_RGB[name], line_width
         )
 
-    canvas.convert("RGB").save(out_path)
+    # 2026-09-30 속도: 화면 표시용 임시 파일이라 압축을 약하게(저장 1.1초 -> 약 0.2초)
+    canvas.save(out_path, compress_level=1)
+    _LAST_RENDERED.clear()
+    _LAST_RENDERED[out_path] = canvas
     return out_path
+
+
+# 방금 그린 미리보기(파일로도 저장했지만, 화면에 띄울 때 다시 읽지 않도록 메모리에 하나 보관)
+_LAST_RENDERED: dict = {}
+
+
+def open_rendered(out_path: str):
+    """render_preview가 방금 그린 이미지면 메모리에서, 아니면 파일에서 연다."""
+    img = _LAST_RENDERED.get(out_path)
+    if img is not None:
+        return img
+    return Image.open(out_path)

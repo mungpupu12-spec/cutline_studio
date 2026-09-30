@@ -51,6 +51,8 @@ from enum import Enum
 from typing import Optional
 
 import cv2
+
+from . import image_cache as _image_cache
 import numpy as np
 from shapely.affinity import scale as shapely_scale, translate as shapely_translate
 from shapely.geometry import MultiPolygon, Polygon, box as shapely_box
@@ -195,7 +197,53 @@ def _inset_inside_art(content, inset_px: float, open_factor: float = 2.5, cap_fa
     r = 0.95 * inset_px
     if not line.is_empty and r > 0:
         line = line.buffer(r, join_style=1).buffer(-r, join_style=1)
+    line = _restore_long_tips(content, line, inset_px)
     return _drop_tiny_parts(line)
+
+
+def _restore_long_tips(content, line, inset_px: float, min_len_factor: float = 2.0,
+                       min_width_factor: float = 0.3):
+    """열기(위)가 털끝·톱니 같은 짧은 요철과 함께 초승달 끝·뾰족한 잎끝처럼 *길게 뻗은 끝*
+    까지 깎아 버리는 것을 되돌린다(2026-09-30, 멍푸 PC 화면에서 "적합하지 않다"고 표시한
+    초승달: 실제 손 칼선은 두 끝이 뾰족하게 끝까지 가는데 우리 칼선은 두 끝이 뭉툭하게
+    잘려 나감). 그냥 안쪽으로 줄인 모양(열기 없음)에서 열기 결과를 뺀 나머지 중, 길이가
+    여백의 2배(약 2.4mm) 이상인 조각만 다시 붙인다 -- 짧은 털끝/톱니는 그대로 깎인 채.
+    다시 붙이는 부분도 "그림 안쪽으로 여백만큼 줄인 모양"의 일부라 배경으로 나가지 않는다."""
+    try:
+        if content is None or content.is_empty or line is None or line.is_empty:
+            return line
+        plain = content.buffer(-inset_px, join_style=1)
+        if plain.is_empty:
+            return line
+        extra = plain.difference(line.buffer(0.5, join_style=1))
+        if extra.is_empty:
+            return line
+        keep = []
+        for g in (extra.geoms if hasattr(extra, "geoms") else [extra]):
+            if g.is_empty or g.geom_type != "Polygon":
+                continue
+            mrr = g.minimum_rotated_rectangle
+            xs, ys = mrr.exterior.coords.xy
+            sides = sorted(((xs[i + 1] - xs[i]) ** 2 + (ys[i + 1] - ys[i]) ** 2) ** 0.5 for i in range(3))
+            length = sides[-1]
+            if length < min_len_factor * inset_px:
+                continue
+            # 선처럼 너무 가는 조각(칼로 못 따라감)은 제외
+            if g.area / max(length, 1e-6) < min_width_factor * inset_px:
+                continue
+            # 칼선과 붙어 있는 끝만(떨어진 섬은 제외)
+            if g.distance(line) > 1.0:
+                continue
+            keep.append(g)
+        if not keep:
+            return line
+        merged = unary_union([line] + keep)
+        # 붙인 자리의 이음매만 살짝 매끄럽게(아주 작은 반지름 -- 그림 밖으로 나갈 수 없는 크기)
+        rr = 0.25 * inset_px
+        merged = merged.buffer(rr, join_style=1).buffer(-rr, join_style=1)
+        return merged.intersection(plain.buffer(0.3 * inset_px, join_style=1)).union(line)
+    except Exception:  # noqa: BLE001
+        return line
 
 
 def _fill_art_pockets_from_background_flood(
@@ -213,7 +261,7 @@ def _fill_art_pockets_from_background_flood(
     try:
         x0, y0, x1, y1 = selection_px
         m = max(20.0, 0.08 * min(x1 - x0, y1 - y0))
-        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
         if img is None:
             return design
         h, w = img.shape[:2]
@@ -223,7 +271,7 @@ def _fill_art_pockets_from_background_flood(
             region = tuple(float(v) for v in art_region_px)
         else:
             region = (max(0.0, x0 - m), max(0.0, y0 - m), min(float(w), x1 + m), min(float(h), y1 + m))
-        objs = detect_elements_by_background_flood_px(image_path, region, _img=img)
+        objs = detect_elements_by_background_flood_px(image_path, region)  # 결과 기억됨(같은 칸 반복 방지)
     except Exception:  # noqa: BLE001
         return design
     if not objs:
@@ -311,7 +359,7 @@ def _extend_with_border_band(image_path: str, design, dpi: float, max_w_mm: floa
     멀리까지 같은 색이라 아무것도 하지 않는다(배경으로 번지지 않음)."""
     if design is None or design.is_empty:
         return design
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         return design
     H, W = img.shape[:2]
@@ -381,7 +429,7 @@ def _light_border_band_width_px(image_path: str, design, dpi: float, tol: float 
     이어지는 부분(둘레의 60% 이상), 그 안쪽 몸통 색과는 뚜렷이 다름."""
     if design is None or design.is_empty:
         return 0.0
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         return 0.0
     H, W = img.shape[:2]
@@ -713,7 +761,7 @@ def _grow_design_into_low_contrast_halo_px(
     allow_zone = design.buffer(30.0)
     try:
         minx, miny, maxx, maxy = design.bounds
-        gray_full = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        gray_full = _image_cache.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if gray_full is None:
             return design
         H, W = gray_full.shape[:2]
@@ -923,7 +971,7 @@ def _detect_inside_outer_ring_px(
         if max_depth < band_step_px * 2:
             return None
 
-        bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        bgr = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
         if bgr is None:
             return None
         H, W = bgr.shape[:2]
@@ -1310,8 +1358,8 @@ def _measure_content_bbox_px(image_path: str, rect_px: tuple):
 
     from PIL import Image
 
-    with Image.open(image_path) as im:
-        im = im.convert("RGBA")
+    if True:  # 2026-09-30: 캐시된 이미지(core.image_cache)
+        im = _image_cache.pil_open(image_path, "RGBA")
         w, h = im.size
         x0, y0, x1, y1 = rect_px
         cx0, cy0 = max(0, int(x0)), max(0, int(y0))
@@ -1447,7 +1495,7 @@ def _trace_content_silhouette_px(
     "공주토끼와 딸기" 사례) None을 돌려줘서, 호출하는 쪽이 안전하게 기존
     방식(사각형 자체를 축소)으로 되돌아가게 한다."""
     x0, y0, x1, y1 = [int(round(v)) for v in rect_px]
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
     h, w = img.shape[:2]
