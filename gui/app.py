@@ -1251,46 +1251,25 @@ class CutLineApp(ctk.CTk):
         dd = getattr(self, "_open_dropdown", None)
         if dd is not None:
             try:
-                dd.grab_release()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
                 dd.destroy()
             except Exception:  # noqa: BLE001
                 pass
         self._open_dropdown = None
         self._dropdown_anchor = None
-        if getattr(self, "_dropdown_click_bound", False):
-            try:
-                self.unbind_all("<Button-1>")
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                self.unbind_all("<Escape>")
-            except Exception:  # noqa: BLE001
-                pass
-            self._dropdown_click_bound = False
 
     def _toggle_category_dropdown(self, anchor_widget, options, variable, on_change, allow_clear):
-        """options: [(값, 라벨), ...]. 같은 버튼을 다시 누르면 닫기만 하고
-        끝(토글). 다른 드롭다운이 열려 있었으면 먼저 닫는다.
+        """options: [(값, 라벨), ...]. 같은 버튼을 다시 누르면 닫기만 한다.
 
-        2026-09-08 피드백("옵션 자리 이탈 사라지지 않아서 강제 종료"): 이
-        드롭다운은 창 테두리가 없는(overrideredirect) + 항상 맨 위
-        (topmost) 뜨는 팝업 창이다. 예전엔 이 팝업을 만들고 위치를 계산하는
-        코드 전체가 아무 보호 장치 없이 실행됐는데, 만약 그 중간 어디선가
-        (예: 버튼을 만들거나 위치를 계산하는 도중) 예상 못한 예외가 나면
-        self._open_dropdown에 이 창이 등록되기도 전에 함수가 중간에
-        끊겨버려서, 화면엔 이 창이 그대로 남아있는데 앱 스스로는 "열린
-        드롭다운이 없다"고 착각하는 상태가 될 수 있었다. 그렇게 되면
-        _close_open_dropdown()이 아무 것도 찾지 못해 절대 닫을 수 없는
-        (테두리도 없고 항상 맨 위인) 유령 창이 화면에 남아, 결국 프로그램을
-        강제 종료하는 것 말고는 없앨 방법이 없어진다. 이제 이 함수 전체를
-        try/except로 감싸서, 어떤 이유로 실패하든 방금 만든 창을 즉시
-        파괴하고 아무 것도 남기지 않는다. 또한 Esc 키를 누르면 항상 열린
-        드롭다운을 닫도록 추가해서, 혹시라도 다른 이유로 화면에서 사라지지
-        않는 경우에도 창 전체를 끄지 않고 Esc 키만으로 빠져나갈 수 있는
-        비상 탈출구를 만들어 둔다."""
+        2026-09-29(멍푸: "옵션 창 위치 벗어나는 공백 없애고 칸에 맞게 스크롤방식으로
+        선택형 모두 변경"): 예전엔 버튼 아래에 따로 뜨는 테두리 없는 팝업 창이었다.
+        그 창은 화면 좌표로 크기/위치를 계산해야 했는데, Windows 배율(125% 등)에서
+        customtkinter가 폭을 한 번 더 키워 왼쪽 패널 밖으로 빈 공간이 삐져나왔고,
+        위치가 어긋나거나 사라지지 않는 문제도 여러 번 있었다. 이제 팝업 창을 아예
+        쓰지 않고, 옵션 목록을 버튼 바로 아래 **같은 카드 안에** 펼친다 -- 폭은
+        카드 폭 그대로(넘칠 수 없음), 높이는 옵션 4개 정도로 고정하고 그보다 많으면
+        그 칸 안에서 스크롤한다. 옵션을 고르거나, 버튼을 다시 누르거나, Esc를
+        누르면 닫힌다. 만드는 도중 오류가 나면 반쯤 만든 목록을 지우고 아무 것도
+        남기지 않는다."""
         was_open_for_this = (
             getattr(self, "_dropdown_anchor", None) is anchor_widget
             and getattr(self, "_open_dropdown", None) is not None
@@ -1299,311 +1278,140 @@ class CutLineApp(ctk.CTk):
         if was_open_for_this:
             return
 
-        dropdown = ctk.CTkToplevel(self)
+        holder = ctk.CTkFrame(
+            anchor_widget.master, fg_color=CONTROL_FILL, corner_radius=16,
+            border_width=1, border_color=BORDER,
+        )
         try:
-            self._build_and_position_dropdown(dropdown, anchor_widget, options, variable, on_change, allow_clear)
+            self._build_and_position_dropdown(holder, anchor_widget, options, variable, on_change, allow_clear)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
             try:
-                dropdown.destroy()
+                holder.destroy()
             except Exception:  # noqa: BLE001
                 pass
             self._open_dropdown = None
             self._dropdown_anchor = None
 
-    def _build_and_position_dropdown(self, dropdown, anchor_widget, options, variable, on_change, allow_clear):
-        """_toggle_category_dropdown이 새 드롭다운을 실제로 만들고 화면에
-        배치하는 부분만 따로 뗀 것 -- 호출부에서 이 전체를 try/except로
-        감쌀 수 있도록(위 docstring의 "유령 창 방지" 참고) 함수를 분리."""
-        try:
-            dropdown.overrideredirect(True)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            dropdown.attributes("-topmost", True)
-        except Exception:  # noqa: BLE001
-            pass
+    # 펼친 옵션 목록에서 스크롤 없이 보이는 옵션 줄 수(그보다 많으면 칸 안에서 스크롤)
+    DROPDOWN_VISIBLE_ROWS = 4
+    DROPDOWN_ROW_H = 40
 
-        # 2026-09-26(3차, 멍푸가 실제 화면으로 재확인 -- "옵션 밖으로
-        # 나오는거 고치라고 서너번 말했는데 왜 개선이 안돼"): 위(2차) 수정
-        # (card.pack_propagate(False) + card 폭 고정)은 카드 "틀" 자체가
-        # 커지는 건 막았지만, 그 안의 옵션 버튼 하나하나가 자기 글자 폭만큼
-        # 요구하는 최소 크기까지는 못 줄였다 -- Tk는 부모 프레임 폭을
-        # 고정해도 자식 위젯이 그보다 넓기를 "요구"하면 그 자식을 잘라내지
-        # 않고 프레임 밖으로 그대로 삐져나오게 그린다(팩 매니저가 넘치는
-        # 자식을 클리핑하지 않기 때문). 실제로 그녀의 화면 캡처로 확인:
-        # "무테/유테+도무송" 같은 긴 옵션 글자가 Windows 폰트로는 앵커
-        # 버튼 폭보다 넓게 요구되어, 카드 폭을 고정했는데도 그 버튼만
-        # 오른쪽 미리보기 화면까지 삐져나왔다.
-        #
-        # 근본 원인은 "카드가 넓어짐"이 아니라 "버튼 글자가 한 줄로
-        # 강제됨"이었으므로, 이번엔 각 옵션 버튼 내부 글자 라벨에 명시적
-        # wraplength(카드 폭 기준, 아래에서 앵커 폭으로 미리 계산)를 줘서
-        # 글자가 넓으면 그냥 두 줄로 줄바꿈되게 한다 -- 줄바꿈된 라벨은
-        # 세로로만 커지고 가로로는 절대 wraplength를 넘지 않으므로, 어떤
-        # 글꼴/해상도에서도 버튼이 카드 폭을 넘어설 수 없다(2차 수정과
-        # 함께 이중으로 안전).
-        self.update_idletasks()
-        popup_x = anchor_widget.winfo_rootx()
-        popup_w = max(anchor_widget.winfo_width(), 240)
-
-        # 2026-09-28("옵션 삐져 나온 공백 없애라고" -- 실제 화면 스크린샷으로
-        # 재확인): 여태까지의 6차례 수정은 모두 "카드/버튼 자체가 팝업 폭(w)
-        # 보다 넓어지는 것"만 막았는데, 이번엔 그 반대 방향 원인이다 --
-        # popup_w의 기준인 anchor_widget(지금 고른 값을 보여주는 버튼,
-        # 예: "무테/유테+도무송")은 왼쪽 조작 패널(self._left_col, 폭
-        # 380px로 고정된 CTkScrollableFrame) *안에 스크롤되는 내용물*이라서,
-        # 이 스크롤 프레임이 세로 스크롤만 지원하고 가로로는 내용물을
-        # 자르지 않다 보니, 버튼 자신의 winfo_width()가 실제 화면에 보이는
-        # 패널 폭보다 더 크게 보고될 수 있다(글자가 길어서 버튼이 자기
-        # 내용에 맞춰 자연스럽게 넓어진 경우 등). 그러면 이 팝업 카드도 그
-        # 만큼 넓게 뜨는데, 안쪽 옵션 버튼들(무테/유테/자동생성 등)은 그보다
-        # 짧은 글자라 카드보다 좁게 그려져서, 카드의 나머지 빈 공간이 왼쪽
-        # 패널 경계를 넘어 오른쪽 미리보기 화면 쪽으로 "삐져나온 공백"처럼
-        # 보이게 된다. 기존의 가로(x) 보정은 화면 전체 폭(screen_w) 기준
-        # 이라서, 이 패널 폭보다는 훨씬 넓은 화면에서는 전혀 걸리지 않았다.
-        # 팝업은 항상 이 패널의 실제 화면 폭 안에서만 뜨게(패널보다 넓어질
-        # 수 없게) 먼저 못박는다 -- 패널 자체가 width=380으로 고정돼 있어
-        # 이 폭은 글꼴/해상도와 무관하게 안정적이다.
-        left_col = getattr(self, "_left_col", None)
-        if left_col is not None:
-            try:
-                panel_right = left_col.winfo_rootx() + left_col.winfo_width()
-                max_w_in_panel = panel_right - popup_x - 4
-                if max_w_in_panel >= 200:
-                    popup_w = min(popup_w, max_w_in_panel)
-            except Exception:  # noqa: BLE001
-                pass
-
-        # 버튼 pack(padx=8)의 좌우 여백 + 버튼 내부 여백을 뺀, 글자가 실제로
-        # 쓸 수 있는 폭.
-        option_wraplength_px = max(60, popup_w - 2 * 8 - 16)
-
-        card = ctk.CTkFrame(dropdown, fg_color=BG_CARD, corner_radius=10, border_width=1, border_color=BORDER)
-        card.pack(fill="both", expand=True)
-        # 2026-09-08(8차) 피드백 확인 결과("그냥 옵션을 고르려던 중이었는데
-        # 자리 이탈 + 사라지지 않음 + 선택도 안 됨"): 드물게 예외가 났을
-        # 때만이 아니라, 그냥 평소처럼 옵션을 고르려는 순간에도 벌어졌다는
-        # 점이 핵심 -- 이 팝업이 창 테두리 없는(overrideredirect) +
-        # 항상 맨 위(topmost) 창인데, 정작 이 창 자체에 입력 포커스를
-        # 넘기는 처리가 전혀 없었다. Windows에서는 이런 팝업이 화면엔
-        # 맨 위로 보여도 실제 마우스 클릭은 그 아래 깔린 메인 창으로
-        # 새어나가는 경우가 있는데, 그러면 (a) 옵션 버튼을 눌러도 반응이
-        # 없고(선택 안 됨), (b) 바깥 클릭 감지(_on_global_click)는 "화면
-        # 좌표상 팝업 영역 안"이라고 착각해 안 닫아버려서(자리는 그대로
-        # 보이는데 사라지지도 않음) 결과적으로 완전히 멈춘 것처럼 보이고
-        # 클릭이 전혀 안 먹히니 강제 종료 말고는 답이 없었을 것으로 보인다.
-        # 근본 대응: 이 팝업을 진짜 모달로 만든다(lift+focus_force+
-        # grab_set) -- grab_set 이후로는 이 앱의 모든 마우스 클릭이
-        # "이 팝업 창(과 그 안의 버튼들)"에만 전달되도록 OS/Tk가 강제하므로,
-        # 클릭이 엉뚱한 곳으로 새어나가는 경로 자체가 사라진다. 대신 팝업이
-        # 뜬 동안은 "바깥의 다른 버튼을 클릭"해서 닫던 방식이 항상 보장되진
-        # 않으므로(로컬 grab은 같은 앱의 다른 창까지 클릭을 전달하지 않을
-        # 수 있음), 그 대체 수단으로 (1) 옵션을 고르면 당연히 닫히고,
-        # (2) 카드 안의 버튼이 아닌 빈 공간을 클릭해도 닫히도록(아래
-        # card.bind) 새로 추가하고, (3) 위에서 이미 추가한 Esc 키로도
-        # 언제든 닫을 수 있다 -- 기존의 "바깥 클릭 시 닫기"(_on_global_click)
-        # 도 혹시 클릭이 정상적으로 앱에 전달되는 환경에서는 여전히 그대로
-        # 동작하므로 없애지 않고 그대로 둔다(이중 안전장치).
-        card.bind("<Button-1>", lambda _e: self._close_open_dropdown())
-
+    def _build_and_position_dropdown(self, holder, anchor_widget, options, variable, on_change, allow_clear):
+        """펼친 옵션 목록을 실제로 채우고 버튼 바로 아래에 붙인다(호출부가 try/except로 감쌈)."""
         def _pick(value):
             variable.set(value)
             if on_change:
                 on_change()
             self._close_open_dropdown()
 
-        def _clamp_button_width(btn):
-            # 위 option_wraplength_px 설명 참고: 라벨(_text_label)에
-            # wraplength를 강제해, 글자가 길어도 옆으로 삐져나오지 않고
-            # 카드 폭 안에서 줄바꿈되게 한다.
-            #
-            # 2026-09-26(6차, "옵션 이탈 좀 고치라고!!!" -- 앞서 5차까지
-            # wraplength+카드 폭 고정으로 고쳤다고 판단했지만 실제 그녀의
-            # Windows 화면에서 여전히 재발): wraplength는 "띄어쓰기가 있는
-            # 자리에서만" 줄을 바꾸는 힌트일 뿐이다. 만약 옵션 글자 중
-            # 띄어쓰기 없이 쭉 이어지는 부분이 wraplength보다 길면(예:
-            # 폰트가 달라 한 단어처럼 붙어 측정되는 경우), Tk는 그 한 덩어리를
-            # 줄바꿈하지 못하고 그대로 wraplength보다 넓게 그려버린다 --
-            # 이게 바로 이 사무실 리눅스 환경(글꼴 다름)에서는 재현이 안
-            # 되면서 그녀의 실제 Windows 글꼴에서만 계속 재발했던 이유로
-            # 보인다. wraplength(글자 줄바꿈 "힌트")에만 기대지 말고, 버튼
-            # 위젯 자체의 width를 카드 폭 기준으로 못박아 강제 고정한다 --
-            # 이러면 내용이 아무리 넓어지려 해도 버튼 자체가 그 이상 커질
-            # 수 없다(내용은 필요하면 잘려 보일지언정, 카드/팝업 밖으로
-            # 넘치는 일은 이제 폰트/줄바꿈 여부와 상관없이 원천적으로
-            # 불가능해진다).
-            try:
-                btn.configure(width=option_wraplength_px)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                if btn._text_label is not None:
-                    btn._text_label.configure(wraplength=option_wraplength_px)
-            except Exception:  # noqa: BLE001
-                pass
-            return btn
+        rows = list(options)
+        # "✕ 선택 해제"는 맨 아래(2026-09-29: 맨 위에 생기면 옵션이 한 줄씩 밀려 다른 옵션이 골라졌음)
+        show_clear = bool(allow_clear and variable.get())
+        n_rows = len(rows) + (1 if show_clear else 0)
+        needs_scroll = n_rows > self.DROPDOWN_VISIBLE_ROWS
 
-        # 2026-09-26(멍푸 피드백 "옵션 스크롤로 볼수 있게 해줘 이렇게 자꾸
-        # 형식을 어기면 완성도가 떨어져"): 옵션 개수가 많거나 화면이 작으면
-        # 이 팝업이 화면보다 커질 수 있는데, 바로 아래(y좌표 계산부)의 기존
-        # 코드는 그럴 때 그냥 팝업을 화면 위쪽에 눌러 담기만 해서 -- 뒤쪽
-        # 옵션(예: 도무송 세부 옵션의 "원형" 등)이 화면 밖으로 밀려나 보이지도
-        # 않고 클릭도 안 됐다. 이제 옵션 목록을 아예 스크롤 가능한 영역에
-        # 담아서, 몇 개가 있든 스크롤(휠/드래그)로 전부 볼 수 있고 전부 누를
-        # 수 있게 한다.
-        def _build_buttons(parent):
-            first = True
-            for i, (value, label) in enumerate(options):
-                bg, fg = self._PILL_COLORS[i % len(self._PILL_COLORS)]
-                selected = value == variable.get()
-                _clamp_button_width(ctk.CTkButton(
-                    parent, text=label, command=lambda v=value: _pick(v), font=self.font_body,
-                    fg_color=bg, hover_color=bg, text_color=fg, anchor="w", corner_radius=8,
-                    height=36, border_width=2 if selected else 0, border_color=ACCENT,
-                )).pack(fill="x", padx=8, pady=(8 if first else 3, 3))
-                first = False
-
-            # 2026-09-29: "✕ 선택 해제"가 목록 맨 위에 있으면, 값을 고른 뒤 다시 열 때마다
-            # 옵션들이 한 줄씩 아래로 밀려 같은 자리를 눌러도 다른 옵션이 골라졌다(실제
-            # 사용 중 확인) -> 맨 아래로 옮겨 옵션 위치가 항상 같게.
-            if allow_clear and variable.get():
-                _clamp_button_width(ctk.CTkButton(
-                    parent, text="✕ 선택 해제", command=lambda: _pick(""), font=self.font_caption,
-                    fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
-                    anchor="w", corner_radius=8, height=30,
-                )).pack(fill="x", padx=8, pady=(4, 2))
-
-            ctk.CTkFrame(parent, fg_color="transparent", height=6).pack()
-
-        # 1차: 지금까지 하던 대로 card에 바로 옵션을 채워서 "자연스러운
-        # 높이"(스크롤 없이 다 펼치면 몇 px인지)를 먼저 재본다.
-        _build_buttons(card)
-        x = popup_x
-        w = popup_w
-        dropdown.update_idletasks()
-        natural_h = card.winfo_reqheight()
-
-        screen_h_probe = dropdown.winfo_screenheight()
-        margin_probe = 8
-        # 2026-09-26(4차, "옵션이 칸안에서 스크롤이 되어야지 ... 오늘
-        # 하루종일 말해야해"): 이전엔 "화면보다 큰 경우에만" 스크롤을 켰는데,
-        # 실제로는 옵션이 5~7개만 돼도(화면보다는 작지만) 팝업 카드 자체가
-        # 계속 늘어나서 뒤에 있는 다른 칸(작업 종류 라벨, 그 아래 도무송
-        # 세부 옵션 버튼들)을 덮어버렸다 -- 화면 밖으로 나가진 않았지만
-        # "다른 칸 위로 떠서 가려버리는" 것도 결국 같은 문제. 이제 옵션이
-        # 몇 개든, 화면 크기와 상관없이 팝업 자체의 키를 작게(대략 4개 정도
-        # 보이는 높이) 고정하고, 그보다 많으면 무조건 스크롤 영역으로
-        # 바꿔서 항상 작은 칸 하나 안에서 스크롤로만 보게 한다.
-        FIXED_VISIBLE_CAP_PX = 210
-        max_popup_h = min(screen_h_probe - 2 * margin_probe, FIXED_VISIBLE_CAP_PX)
-
-        if natural_h > max_popup_h:
-            # 화면에 다 못 들어감 -- 방금 만든 옵션 버튼들을 지우고, 같은
-            # 버튼들을 스크롤 가능한 프레임 안에 다시 만든다(card 자체는
-            # 재사용, 안쪽 내용만 스크롤 영역으로 교체).
-            for child in list(card.winfo_children()):
-                child.destroy()
-            scroll_area = ctk.CTkScrollableFrame(
-                card, fg_color="transparent", corner_radius=0,
-                width=w, height=max_popup_h,
+        if needs_scroll:
+            body = ctk.CTkScrollableFrame(
+                holder, fg_color="transparent", corner_radius=0,
+                height=self.DROPDOWN_VISIBLE_ROWS * self.DROPDOWN_ROW_H,
+                scrollbar_button_color=SCROLL_BTN, scrollbar_button_hover_color=SCROLL_BTN_HOVER,
             )
-            scroll_area.pack(fill="both", expand=True)
-            _build_buttons(scroll_area)
-            dropdown.update_idletasks()
-            h = max_popup_h
+            body.pack(fill="x", padx=(6, 2), pady=6)
         else:
-            h = natural_h
+            body = ctk.CTkFrame(holder, fg_color="transparent")
+            body.pack(fill="x", padx=6, pady=6)
 
-        # 2026-09-26(멍푸 피드백, 실제 화면: "옵션 크기안에 들어가게 해,
-        # 빠져나오게 하지마" -- 이 팝업이 버튼(anchor_widget)과 같은 폭(w)
-        # 으로 뜨도록 위에서 이미 계산했는데도, 실제 그녀 컴퓨터에서는
-        # 왼쪽 패널 폭을 넘어 오른쪽 미리보기 화면까지 삐져나왔다. 원인:
-        # 안의 옵션 버튼들(예: "직사각형", "정사각형")은 폭을 따로 고정
-        # 하지 않고 글자 크기에 맞춰 저절로 커지는데, 이 카드(card)가 원래
-        # "자식이 더 넓으면 나(card)도 같이 커진다"는 기본 동작(pack
-        # propagate)을 그대로 갖고 있어서, 그 순간 card가(그리고 card를
-        # 담은 이 팝업 창까지) w보다 넓게 저절로 늘어날 수 있었다 --
-        # Linux 환경에서는 글꼴 렌더링 폭이 우연히 w 안에 들어가 재현이
-        # 안 됐지만, 실제 Windows 폰트 렌더링에서는 그 폭을 넘어설 수
-        # 있다는 뜻. 이제 card 크기를 w(가로)로 못박고(propagate 끔), 그
-        # 안의 버튼이 아무리 넓어지려 해도 이 카드 밖으로는 못 나가게
-        # 한다 -- 글자가 넓으면 카드 안에서 잘려 보일지언정, 옆 화면을
-        # 침범하는 일은 없다.
-        card.pack_propagate(False)
-        card.configure(width=w, height=h)
-
-        # 2026-09-26(실제 화면으로 확인, "옵션도 다 잘려" -- 도무송 세부
-        # 옵션처럼 버튼이 창 아래쪽에 있으면 팝업이 화면 밖으로 넘어가
-        # 아래쪽 옵션(사각형/타원형/원형 등)이 안 보이고 클릭도 안 됐다):
-        # 팝업 높이(h)가 버튼 개수만큼 늘어나는데, 여기선 화면 경계를 전혀
-        # 확인 안 하고 항상 "버튼 바로 아래"에만 띄웠다. 화면 아래쪽에
-        # 붙어있는 버튼일수록 팝업 전체가 화면 밖(또는 작업표시줄 아래)으로
-        # 나가버려, 뒤쪽 옵션일수록 안 보이고 안 눌리는 문제가 실제로
-        # 재현됨. 화면 높이 안에 들어가도록: 아래에 자리가 부족하면 먼저
-        # 버튼 위쪽에 띄우는 걸 시도하고, 위쪽에도 다 안 들어가면(팝업
-        # 자체가 화면보다 큰 경우) 화면 위/아래 여백 안에서 y를 눌러 담아
-        # 최소한 위쪽 옵션이라도 화면 안에 들어오게 한다.
-        screen_h = dropdown.winfo_screenheight()
-        margin = 8
-        y_below = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 4
-        y_above = anchor_widget.winfo_rooty() - h - 4
-        if y_below + h <= screen_h - margin:
-            y = y_below
-        elif y_above >= margin:
-            y = y_above
-        else:
-            y = max(margin, min(y_below, screen_h - margin - h))
-
-        # 2026-09-26(6차): 세로(y)는 위에서 이미 화면 높이 기준으로 눌러
-        # 담는데, 가로(x)는 지금까지 anchor_widget의 화면 좌표를 그대로
-        # 써서 화면 폭 기준 점검이 아예 없었다 -- 창이 화면 오른쪽 끝에
-        # 가깝게 있으면(작은 화면, 창을 오른쪽으로 옮겨둔 경우 등) 팝업이
-        # 화면 오른쪽 바깥으로 밀려나 옵션이 화면 밖으로 "이탈"할 수 있다.
-        # 세로와 똑같은 방식으로 가로도 화면 폭 안에 눌러 담는다.
-        screen_w = dropdown.winfo_screenwidth()
-        if x + w > screen_w - margin:
-            x = screen_w - margin - w
-        if x < margin:
-            x = margin
-        dropdown.geometry(f"{w}x{h}+{x}+{y}")
-
-        # 위 주석 참고: 이 팝업 자체가 실제로 입력을 받도록 강제한다 --
-        # 그냥 띄우기만 하고 포커스/grab을 넘기지 않으면 화면엔 맨 위로
-        # 보여도 클릭이 아래 깔린 메인 창으로 새어나갈 수 있었다.
-        try:
-            dropdown.lift()
-            dropdown.focus_force()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            dropdown.grab_set()
-        except Exception:  # noqa: BLE001
-            pass
-
-        self._open_dropdown = dropdown
-        self._dropdown_anchor = anchor_widget
-
-        def _on_global_click(event):
-            dd = getattr(self, "_open_dropdown", None)
-            if dd is None:
-                return
+        made = []
+        text_wrap = int(max(120, LEFT_TEXT_WRAP - 70) * self._glass_scale())
+        for i, (value, label) in enumerate(rows):
+            bg, fg = self._PILL_COLORS[i % len(self._PILL_COLORS)]
+            selected = value == variable.get()
+            b = ctk.CTkButton(
+                body, text=label, command=lambda v=value: _pick(v), font=self.font_body,
+                fg_color=bg, hover_color=ACCENT_SOFT if not selected else bg, text_color=fg,
+                anchor="w", corner_radius=14, height=self.DROPDOWN_ROW_H - 6,
+                border_width=2 if selected else 0, border_color=ACCENT,
+            )
+            b.pack(fill="x", padx=2, pady=3)
+            made.append(b)
+        if show_clear:
+            b = ctk.CTkButton(
+                body, text="✕ 선택 해제", command=lambda: _pick(""), font=self.font_caption,
+                fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
+                anchor="w", corner_radius=14, height=self.DROPDOWN_ROW_H - 10,
+            )
+            b.pack(fill="x", padx=2, pady=(3, 2))
+            made.append(b)
+        for b in made:
+            # 글자가 길면 칸 안에서 줄바꿈(옆으로 넘치지 않게)
             try:
-                dx, dy = dd.winfo_rootx(), dd.winfo_rooty()
-                dw, dh = dd.winfo_width(), dd.winfo_height()
+                if b._text_label is not None:
+                    b._text_label.configure(wraplength=text_wrap, justify="left")
             except Exception:  # noqa: BLE001
-                self._close_open_dropdown()
-                return
-            inside_dropdown = dx <= event.x_root <= dx + dw and dy <= event.y_root <= dy + dh
-            if not inside_dropdown and event.widget is not anchor_widget:
-                self._close_open_dropdown()
+                pass
 
-        self.bind_all("<Button-1>", _on_global_click, add="+")
-        # 2026-09-08 피드백 대응: Esc 키로도 언제든 열린 드롭다운을 닫을 수
-        # 있게 함(위 docstring 참고) -- 클릭 감지가 어떤 이유로든 놓치는
-        # 경우를 위한 비상 탈출구.
-        self.bind_all("<Escape>", lambda _e: self._close_open_dropdown(), add="+")
-        self._dropdown_click_bound = True
+        if needs_scroll:
+            # 목록 안에서 휠을 굴리면 목록만 스크롤(바깥 왼쪽 패널까지 같이 움직이지 않게)
+            canvas = body._parent_canvas
+
+            def _wheel(event):
+                if getattr(event, "num", None) == 4:
+                    step = -1
+                elif getattr(event, "num", None) == 5:
+                    step = 1
+                else:
+                    step = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+                return "break"
+
+            targets = [canvas, body] + made
+            for b in made:
+                targets += [getattr(b, "_canvas", None), getattr(b, "_text_label", None)]
+            for w in targets:
+                if w is None:
+                    continue
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    try:
+                        tk.Misc.bind(w, seq, _wheel, "+")
+                    except Exception:  # noqa: BLE001
+                        pass
+            # 지금 고른 옵션이 보이게 스크롤
+            try:
+                idx = [v for v, _ in rows].index(variable.get())
+                if idx >= self.DROPDOWN_VISIBLE_ROWS:
+                    holder.update_idletasks()
+                    canvas.yview_moveto(max(0.0, (idx - 1) / max(1, n_rows)))
+            except ValueError:
+                pass
+
+        holder.pack(after=anchor_widget, fill="x", pady=(4, 2))
+        self._open_dropdown_body = body
+        self._open_dropdown = holder
+        self._dropdown_anchor = anchor_widget
+        if not getattr(self, "_dropdown_esc_bound", False):
+            self.bind_all("<Escape>", lambda _e: self._close_open_dropdown(), add="+")
+            self._dropdown_esc_bound = True
+        self.after(150, lambda: self._scroll_left_panel_to_show(holder))
+
+    def _scroll_left_panel_to_show(self, widget):
+        """펼친 목록이 왼쪽 패널 아래로 가려져 있으면, 목록 끝까지 보이게 패널을 스크롤."""
+        try:
+            if widget is None or not widget.winfo_exists():
+                return
+            inner = self._left_col
+            canvas = inner._parent_canvas
+            content_h = max(1, inner.winfo_height())
+            view_h = canvas.winfo_height()
+            top = canvas.canvasy(0)
+            y0 = widget.winfo_rooty() - inner.winfo_rooty()
+            y1 = y0 + widget.winfo_height()
+            if y1 > top + view_h:
+                canvas.yview_moveto(max(0.0, (y1 - view_h + 8) / content_h))
+            elif y0 < top:
+                canvas.yview_moveto(max(0.0, (y0 - 8) / content_h))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _wrap_checkbox(self, cb, wraplength=LEFT_TEXT_WRAP - 40):
         """CTkCheckBox는 줄바꿈 옵션이 없어 긴 글이 카드 밖으로 잘린다 -- 안쪽 글자
@@ -2248,18 +2056,27 @@ class CutLineApp(ctk.CTk):
         ctk.CTkLabel(
             precision_row, text="정밀도(업샘플)", font=self.font_body, text_color=TEXT_PRIMARY,
         ).pack(side="left")
-        precision_display = tk.StringVar(value=str(self.precision.get()))
+        # 2026-09-29(멍푸: "칸에 맞게 스크롤방식으로 선택형 모두 변경"): 예전 콤보박스는
+        # 누르면 칸 밖으로 따로 뜨는 목록이었음 -> 칸 안에서 바로 고르는 1·2·3·4 버튼 묶음
+        # (참고 이미지의 Segmented Control 모양).
+        self.precision_segment = ctk.CTkSegmentedButton(
+            precision_row, values=["1", "2", "3", "4"],
+            command=lambda choice: self.precision.set(int(choice)),
+            font=self.font_body, height=32, corner_radius=16,
+            fg_color=CONTROL_FILL, selected_color="#BFE8DA", selected_hover_color="#A9DECB",
+            unselected_color=CONTROL_FILL, unselected_hover_color=ACCENT_SOFT,
+            text_color=TEXT_PRIMARY,
+        )
+        self.precision_segment.set(str(self.precision.get()))
+        self.precision_segment.pack(side="left", padx=(8, 0))
 
-        def _on_precision_selected(choice):
-            self.precision.set(int(choice))
+        def _sync_precision(*_):
+            try:
+                self.precision_segment.set(str(int(self.precision.get())))
+            except Exception:  # noqa: BLE001
+                pass
 
-        ctk.CTkComboBox(
-            precision_row, values=["1", "2", "3", "4"], variable=precision_display,
-            command=_on_precision_selected, width=70, height=30, corner_radius=15,
-            border_width=1, border_color=BORDER, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER, dropdown_hover_color=ACCENT_SOFT,
-            font=self.font_body, state="readonly",
-        ).pack(side="left", padx=(8, 0))
+        self.precision.trace_add("write", _sync_precision)
         ctk.CTkLabel(
             precision_row, text="x", font=self.font_caption, text_color=TEXT_SECONDARY,
         ).pack(side="left", padx=(6, 0))
@@ -2547,6 +2364,10 @@ class CutLineApp(ctk.CTk):
         # .ai는 아래에서 내부용 래스터 경로로 self.input_path가 바뀌므로,
         # 여기서 미리 기억해둠(_on_export에서 사용).
         self._export_basename = os.path.splitext(os.path.basename(path))[0]
+        # AI 이미지가 AI 대지 어디에 어떤 크기로 놓였는지(SVG를 원본 대지에 맞춰 저장할 때 씀,
+        # 2026-09-29 "svg 파일 원본 이미지 크기에 맞게")
+        self._source_raster_dpi = None
+        self._ai_placement = None
 
         if path.lower().endswith(".ai"):
             self.is_vector.set(False)
@@ -2581,7 +2402,16 @@ class CutLineApp(ctk.CTk):
             from core.ai_import import load_ai_as_raster
 
             raster_path = os.path.join(_work_file_dir(), "_ai_source_raster.png")
-            load_ai_as_raster(ai_path, raster_path, dpi=self.dpi.get())
+            _raster_dpi = float(self.dpi.get())
+            load_ai_as_raster(ai_path, raster_path, dpi=_raster_dpi)
+            self._source_raster_dpi = _raster_dpi
+            try:
+                from core.ai_import import ai_raster_placement
+
+                self._ai_placement = ai_raster_placement(ai_path, dpi=_raster_dpi)
+            except Exception:  # noqa: BLE001 -- 실패하면 이미지 크기 기준으로 저장(예전보다 나쁘지 않음)
+                traceback.print_exc()
+                self._ai_placement = None
 
             # 2026-09-07 피드백("모든 스티커는 인쇄 여백을 아끼려고 서로
             # 거의 맞닿을 만큼 촘촘하게 배치해, 격자는 모든 스티커 발주
@@ -5031,6 +4861,8 @@ class CutLineApp(ctk.CTk):
 
         self.generate_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
+        self._ai_placement = None
+        self._source_raster_dpi = None
         self.status.set("화면을 초기화했습니다. 도안 파일을 다시 선택하세요.")
         # 2026-09-29: 초기화 뒤에는 왼쪽 패널을 맨 위("도안 파일")로 -- 스크롤이 아래에
         # 남아 있으면 무엇부터 해야 할지 안 보였다(PC에서 확인).
@@ -6077,7 +5909,9 @@ class CutLineApp(ctk.CTk):
         if not out_path:
             return
         try:
-            export_svg(self._last_result, out_path)
+            # 2026-09-29: 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장
+            export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
+                       placement=getattr(self, "_ai_placement", None))
             self.status.set(f"저장됨: {out_path}")
             self._show_note_dialog("SVG로 저장했습니다", [out_path], kind="info")
         except Exception as e:  # noqa: BLE001

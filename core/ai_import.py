@@ -90,3 +90,39 @@ def load_ai_as_raster(ai_path: str, out_path: str, dpi: float = 300.0, page_inde
         return out_path
     finally:
         doc.close()
+
+
+def ai_raster_placement(ai_path: str, dpi: float = 300.0, page_index: int = 0) -> dict:
+    """load_ai_as_raster가 만든 이미지의 픽셀이 AI 대지(페이지) 어디에, 어떤 크기로
+    놓이는지(2026-09-29, 멍푸: "svg 파일 원본 이미지 크기에 맞게 적용되게 해줘").
+
+    심긴 인쇄 이미지를 그대로 꺼낸 경우 그 이미지는 대지 전체가 아니라 대지 안의 한
+    자리에 놓여 있다(예: 대지 1315x893pt 중 왼쪽 위 (74.6, 66.2)pt부터). 그래서 SVG를
+    원본 대지와 겹치게 저장하려면 이 위치와 배율이 필요하다. 페이지를 통째로 렌더링한
+    경우는 대지 전체 = 이미지이고 1px = 72/dpi pt.
+
+    Returns dict: page_w_pt, page_h_pt, x0_pt, y0_pt(이미지 왼쪽 위, 대지 왼쪽 위 기준),
+    pt_per_px, placements(같은 이미지가 대지에 놓인 횟수)."""
+    import fitz
+
+    doc = fitz.open(ai_path)
+    try:
+        page = doc[page_index]
+        pr = page.rect
+        out = {"page_w_pt": pr.width, "page_h_pt": pr.height, "x0_pt": 0.0, "y0_pt": 0.0,
+               "pt_per_px": 72.0 / max(float(dpi), 1.0), "placements": 1}
+        images = page.get_images(full=True)
+        distinct_xrefs = {entry[0] for entry in images}
+        if images and len(distinct_xrefs) == 1:
+            xref = images[0][0]
+            info = doc.extract_image(xref)
+            rects = page.get_image_rects(xref)
+            if rects and info.get("width"):
+                r = rects[0]
+                out.update({
+                    "x0_pt": r.x0 - pr.x0, "y0_pt": r.y0 - pr.y0,
+                    "pt_per_px": r.width / float(info["width"]), "placements": len(rects),
+                })
+        return out
+    finally:
+        doc.close()

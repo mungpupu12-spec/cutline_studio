@@ -146,58 +146,66 @@ def test_dropdown_build_failure_leaves_no_ghost_window():
     print("[OK] a failure while building the dropdown destroys it instead of leaving a stuck ghost window")
 
 
-def test_dropdown_is_truly_modal_and_closes_every_way():
-    """2026-09-08(8차) 후속 확인: 멍푸님이 "그냥 옵션을 고르려던 중"이었는데도
-    (드문 예외 상황이 아니라 평소 사용 중에) 드롭다운이 멈췄다고 확인해주신
-    뒤 추가한 진짜 수정 -- 이 팝업이 실제로 앱의 입력을 붙잡는(grab_set)
-    진짜 모달 창이 됐는지, 그리고 그걸 닫는 모든 경로(배경 클릭/Esc/재오픈)가
-    다 제대로 동작하는지 확인한다."""
+def test_dropdown_opens_inline_inside_its_card_and_closes_every_way():
+    """2026-09-29(멍푸: "옵션 창 위치 벗어나는 공백 없애고 칸에 맞게 스크롤방식으로
+    선택형 모두 변경"): 옵션 목록은 이제 따로 뜨는 팝업 창이 아니라, 버튼 바로 아래
+    같은 카드 안에 펼쳐진다 -- 새 창이 생기지 않고(유령 창/위치 이탈 불가), 폭이
+    카드 폭을 넘지 않으며, 옵션이 많으면 그 칸 안에서 스크롤. 고르기/다시 누르기/Esc로
+    닫힌다. (예전 8차 수정의 "팝업이 입력을 붙잡는지(grab)" 검사는 팝업 창 자체가
+    없어져 의미가 없어짐.)"""
     app = CutLineApp()
     app.withdraw()
-    anchor = ctk.CTkButton(app, text="anchor2")
+    card = ctk.CTkFrame(app, width=300)
+    card.pack(fill="x")
+    anchor = ctk.CTkButton(card, text="anchor2")
+    anchor.pack(fill="x")
     variable = tk.StringVar(value="")
+    toplevels_before = [w for w in app.winfo_children() if isinstance(w, tk.Toplevel)]
+    many = [(str(i), f"옵션 {i}") for i in range(8)]
 
-    # ---- 1) normal open (the REAL code path, not monkeypatched) grabs input ----
-    app._toggle_category_dropdown(anchor, [("A", "옵션 A"), ("B", "옵션 B")], variable, None, False)
+    # ---- 1) opens inline, right under the button, in the same card ----
+    app._toggle_category_dropdown(anchor, many, variable, None, False)
     dd = app._open_dropdown
     check("dropdown opens and is tracked", dd is not None and dd.winfo_exists())
-    check(
-        "the dropdown actually holds the application's grab (this is the fix for "
-        "'선택도 안 됨' -- clicks can no longer leak through to the window underneath)",
-        app.grab_current() is dd,
-    )
-
-    # ---- 2) clicking blank space INSIDE the dropdown (not a button) closes it,
-    #      WITHOUT picking any value ----
-    card = dd.winfo_children()[0]
-    card.event_generate("<Button-1>")
+    check("the list lives inside the same card as its button (no separate popup window)",
+          dd.master is anchor.master)
+    check("no new Toplevel window was created",
+          [w for w in app.winfo_children() if isinstance(w, tk.Toplevel)] == toplevels_before)
+    packed = card.pack_slaves()
+    check("the list is placed directly below its button", packed.index(dd) == packed.index(anchor) + 1)
     app.update_idletasks()
-    check("clicking blank dropdown space closes it", app._open_dropdown is None)
-    check("the grab is released again once closed", app.grab_current() is None)
-    check("closing via blank-space click never picked a value", variable.get() == "")
+    check("the list is never wider than its card", dd.winfo_reqwidth() <= max(card.winfo_width(), card.winfo_reqwidth()))
+    check("8 options scroll inside a fixed-height box",
+          isinstance(app._open_dropdown_body, ctk.CTkScrollableFrame))
 
-    # ---- 3) Escape closes a freshly-reopened dropdown too ----
+    # ---- 2) pressing the same button again just closes it ----
+    app._toggle_category_dropdown(anchor, many, variable, None, False)
+    check("pressing the button again closes it", app._open_dropdown is None and not dd.winfo_exists())
+
+    # ---- 3) picking an option sets the value and closes ----
     app._toggle_category_dropdown(anchor, [("A", "옵션 A"), ("B", "옵션 B")], variable, None, False)
-    check("dropdown re-opens fine after the previous close", app._open_dropdown is not None)
+    buttons = [w for w in app._open_dropdown.winfo_children()[0].winfo_children() if isinstance(w, ctk.CTkButton)]
+    buttons[1].invoke()
+    check("picking an option sets the value", variable.get() == "B")
+    check("picking an option closes the list", app._open_dropdown is None)
+
+    # ---- 4) Esc closes too, and it can be reopened cleanly ----
+    app._toggle_category_dropdown(anchor, [("A", "옵션 A"), ("B", "옵션 B")], variable, None, True)
     app.event_generate("<Escape>")
     app.update_idletasks()
-    check("Esc closes the dropdown", app._open_dropdown is None)
-    check("the grab is released after Esc too", app.grab_current() is None)
-
-    # ---- 4) opening it again afterwards still works (no grab left stuck) ----
-    app._toggle_category_dropdown(anchor, [("A", "옵션 A"), ("B", "옵션 B")], variable, None, False)
-    check(
-        "a third open still succeeds cleanly (no leftover grab blocking future opens)",
-        app._open_dropdown is not None and app.grab_current() is app._open_dropdown,
-    )
+    check("Esc closes the list", app._open_dropdown is None)
+    app._toggle_category_dropdown(anchor, [("A", "옵션 A"), ("B", "옵션 B")], variable, None, True)
+    opts = [w.cget("text") for w in app._open_dropdown.winfo_children()[0].winfo_children()
+            if isinstance(w, ctk.CTkButton)]
+    check("'✕ 선택 해제' is the LAST row so option positions never shift", opts[-1] == "✕ 선택 해제" and opts[0] == "옵션 A")
     app._close_open_dropdown()
-    print("[OK] the dropdown is a real modal popup and every close path (option/blank-click/Esc) works")
+    print("[OK] the option list opens inline in its card, scrolls in place, and every close path works")
 
 
 def main():
     test_pan_mode_does_not_touch_selection()
     test_dropdown_build_failure_leaves_no_ghost_window()
-    test_dropdown_is_truly_modal_and_closes_every_way()
+    test_dropdown_opens_inline_inside_its_card_and_closes_every_way()
     print("\nAll pan-mode / dropdown-safety checks passed.")
 
 
