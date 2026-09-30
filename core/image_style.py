@@ -246,6 +246,25 @@ def _restore_long_tips(content, line, inset_px: float, min_len_factor: float = 2
         return line
 
 
+def _trim_edge_extras(obj, design, region_edge):
+    """obj에서 design 밖으로 붙은 조각 중 region_edge(영역 가장자리 띠)에 닿는 것을 뗀다."""
+    try:
+        extra = obj.difference(design)
+        if extra.is_empty or not extra.intersects(region_edge):
+            return obj
+        # 실루엣 가장자리를 따라 남은 1~2px 실 같은 틈이 몸통 조각과 배경 조각을 이어 붙이지
+        # 않도록 살짝 열어서(끊어서) 조각을 나눈다.
+        opened = extra.buffer(-3.0).buffer(3.0)
+        parts = [p for p in getattr(opened, "geoms", [opened]) if p.geom_type == "Polygon" and not p.is_empty]
+        keep = [p for p in parts if not p.intersects(region_edge)]
+        # 여는 과정에서 생긴 실루엣 둘레의 가는 틈은 다시 메우되 원래 덩어리 밖으로는 안 나감
+        out = unary_union([obj.intersection(design)] + keep).buffer(4.0).buffer(-4.0)
+        out = out.intersection(obj).buffer(0)
+        return out if not out.is_empty else obj
+    except Exception:  # noqa: BLE001
+        return obj
+
+
 def _fill_art_pockets_from_background_flood(
     image_path: str, design, selection_px, sibling_boxes_px=None, art_region_px=None,
     dpi: float = 300.0,
@@ -297,6 +316,11 @@ def _fill_art_pockets_from_background_flood(
     # 소품은 크림색 테두리 띠가 몸통에 비해 넓어(넓이 2배 안팎) 예전 "1.8배 이하"
     # 조건에 걸려 띠를 못 넣고 그림 속 좁은 곳을 잘랐다. 크기 비율 대신 "실루엣에서
     # 4mm 넘게 벗어나지 않는가"로 판단한다(배경이 새어 들어오면 훨씬 멀리 퍼짐).
+    # 2026-09-30(멍푸 실제 사용 피드백 -- 줄무늬 바탕 위 매트에 누운 캐릭터 칼선이 몸통을
+    # 빼고 매트만 돌았다): 매트 옆에서 토막 난 줄무늬 조각이 덩어리에 붙어 영역 가장자리에
+    # 닿는 바람에 위 가장자리 조건으로 메우기가 통째로 취소됐다. 실루엣 *밖*으로 붙은 부분
+    # 중 영역 가장자리에 닿는 조각(= 가장자리까지 이어진 배경)만 떼고 나머지로 판단한다.
+    objs = [_trim_edge_extras(o, design, region_edge) for o in objs]
     comp = max(objs, key=lambda o: o.intersection(design).area)
     reach = 4.0 * dpi / 25.4
     if comp.intersection(design).area > 0.6 * design.area and (
@@ -395,6 +419,15 @@ def _extend_with_border_band(image_path: str, design, dpi: float, max_w_mm: floa
     near = np.linalg.norm(lab - c_h, axis=2) <= tol
     if near[ring0].mean() < 0.6:
         return design  # 둘레 대부분이 한 가지 색 띠가 아님
+    # 2026-09-30(멍푸 실제 사용 피드백 -- 하늘색 그라데이션 바탕 위 흰 꽃 칼선이 꽃 둘레
+    # 하늘까지 크게 돌았다): 그라데이션 바탕은 둘레 0.6mm가 "밝은 한 가지 색"처럼 보이고
+    # 3mm 바깥도 조금씩만 달라져 띠로 오인됐다. 둘레 색이 고르지 않고(90% 지점 색 차 12
+    # 초과) 둘레 대표색이 3mm 바깥 대표색과 비슷하면(색 차 15 미만) 띠가 아니라 바탕이다.
+    # 실측: 그라데이션 18.2/8.5, 크림색 띠 7.3/12.6·2.2/37.3, 흰 테두리 90.8/90.1.
+    far_color = np.median(lab[far], axis=0)
+    spread90 = float(np.percentile(np.linalg.norm(lab[ring0] - c_h, axis=1), 90))
+    if spread90 > 12.0 and float(np.linalg.norm(c_h - far_color)) < 15.0:
+        return design
     if near[far].mean() > 0.35:
         return design  # 띠가 끝나지 않음 = 사실상 배경색(이미 띠가 실루엣 안)
     zone = _mask(design.buffer(wmax)) & ~body
@@ -475,6 +508,84 @@ def _light_border_band_width_px(image_path: str, design, dpi: float, tol: float 
     return w
 
 
+def _band_core_px(image_path: str, design, dpi: float, tol: float = 8.0):
+    """테두리 띠를 뺀 요소 몸통(그림 본체) 도형. 못 구하면 None.
+
+    띠 색은 가장자리 0.25~0.6mm 안쪽에서 잰다(맨 바깥 가장자리는 배경과 섞인 색이라 몸통
+    색과 구분이 흐려짐). 띠 색과 같은 색이 가장자리에서 이어지는 부분 = 띠, 나머지 = 몸통."""
+    if design is None or design.is_empty:
+        return None
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    H, W = img.shape[:2]
+    px = dpi / 25.4
+    x0, y0, x1, y1 = [int(v) for v in design.bounds]
+    bx0, by0, bx1, by1 = max(0, x0 - 4), max(0, y0 - 4), min(W, x1 + 4), min(H, y1 + 4)
+    if bx1 - bx0 < 8 or by1 - by0 < 8:
+        return None
+    lab = cv2.cvtColor(cv2.GaussianBlur(img[by0:by1, bx0:bx1], (3, 3), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    def _mask(geom):
+        m = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+        for p in (geom.geoms if hasattr(geom, "geoms") else [geom]):
+            if p.is_empty or p.geom_type != "Polygon":
+                continue
+            cv2.fillPoly(m, [np.int32([(x - bx0, y - by0) for x, y in p.exterior.coords])], 255)
+        return m > 0
+
+    body = _mask(design)
+    edge = body & ~_mask(design.buffer(-0.4 * px))
+    rim = _mask(design.buffer(-0.25 * px)) & ~_mask(design.buffer(-0.6 * px))
+    if edge.sum() < 30:
+        return None
+    c_b = np.median(lab[rim if rim.sum() >= 30 else edge], axis=0)
+    near = (np.linalg.norm(lab - c_b, axis=2) <= tol) & body
+    n, labels = cv2.connectedComponents(near.astype(np.uint8), connectivity=8)
+    band = np.zeros_like(near)
+    for k in range(1, n):
+        comp = labels == k
+        if (comp & edge).sum() > 0.05 * edge.sum():
+            band |= comp
+    core = (body & ~band).astype(np.uint8) * 255
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    polys = []
+    for c in cs:
+        if len(c) >= 3:
+            p = Polygon([(float(q[0][0]) + bx0, float(q[0][1]) + by0) for q in c]).buffer(0)
+            if not p.is_empty and p.area > 0.02 * design.area:
+                polys.append(p)
+    if not polys:
+        return None
+    out = unary_union(polys)
+    return out if out.area >= 0.2 * design.area else None
+
+
+def _band_uniform_cut(image_path: str, design, band_w: float, dpi: float):
+    """테두리 띠가 있는 요소의 칼선: 몸통에서 고른 간격(띠 폭의 절반, 0.3~1.0mm)만큼 바깥,
+    띠 안쪽(실루엣 0.25mm 안)으로. 못 만들면 None(기존 방식으로).
+
+    2026-09-30(멍푸 실제 사용 피드백 -- 씨앗·체크무늬 소품 칼선이 "적합하지 않다", 선을
+    직접 그려 줌): 띠 바깥 경계에서 안쪽으로 줄이던 방식은 띠가 한쪽만 두껍거나 배경으로
+    살짝 번진 곳에서 칼선이 울퉁불퉁 불룩해졌다. 원본 손 칼선은 몸통에서 고른 간격이다
+    (실제 파일 18개 요소 대조: 평균 거리 0.2~0.3mm로 가까워짐, 예전 0.3~1.6mm)."""
+    core = _band_core_px(image_path, design, dpi)
+    if core is None:
+        return None
+    px = dpi / 25.4
+    d = min(1.0 * px, max(0.3 * px, 0.5 * band_w))
+    R = 0.5 * px
+    c = core.buffer(R, join_style=1).buffer(-2 * R, join_style=1).buffer(R, join_style=1)
+    if c.is_empty:
+        return None
+    line = c.buffer(d, join_style=1).intersection(design.buffer(-0.25 * px, join_style=1))
+    line = _drop_tiny_parts(line)
+    if line is None or line.is_empty:
+        return None
+    return line
+
+
 def _borderless_inward_from_silhouette(
     image_path: str,
     selection_px: tuple,
@@ -550,24 +661,20 @@ def _borderless_inward_from_silhouette(
                 "무테 칼선: 요소가 영역을 거의 꽉 채워(카드형) 사각형 자체를 기준으로 안쪽으로 줄였습니다."
             )
         return rect.buffer(-inset_px, join_style=2)
-    # 2026-09-29(멍푸 실제 사용 피드백 "너무 좁은 영역"): 요소 가장자리에 밝은 테두리
-    # 띠(번짐)가 있으면 칼선을 띠 한가운데에 둔다 -- 띠가 좁은데 1.2mm를 그대로 줄이면
-    # 칼선이 그림 몸통에 붙어 버렸다(원본 손 칼선은 몸통 약 0.5~1mm 바깥, 띠 안).
-    band_w = _light_border_band_width_px(image_path, design, dpi)
-    use_inset = inset_px
-    if band_w > 0:
-        use_inset = max(0.5 * dpi / 25.4, min(inset_px, 0.5 * band_w))
-    line = _inset_inside_art(design, use_inset)
-    if band_w > 0 and line is not None and not line.is_empty:
-        # 테두리 띠가 있는 요소는 꽃잎 사이 같은 오목한 홈을 2mm 반경으로 메워 칼선을
-        # 부드럽게 한다 -- 띠(그림) 안에서만(실루엣 0.3mm 안쪽까지) 메우므로 배경은
-        # 여전히 자르지 않는다(멍푸: "칼선이 부드럽지 않고").
-        R = 2.0 * dpi / 25.4
-        smooth = line.buffer(R, join_style=1).buffer(-R, join_style=1)
-        smooth = smooth.intersection(design.buffer(-0.3 * dpi / 25.4, join_style=1))
-        smooth = _drop_tiny_parts(smooth)
-        if smooth is not None and not smooth.is_empty and smooth.area >= line.area:
-            line = unary_union([line, smooth])
+    pieces = None
+    if precomputed_content_px is None:
+        pieces = _split_touching_flat_art(image_path, design, selection_px, art_region_px, dpi)
+    if pieces:
+        lines = [_inward_line_for_design(image_path, p, inset_px, dpi) for p in pieces]
+        lines = [ln for ln in lines if ln is not None and not ln.is_empty]
+        line = unary_union(lines) if lines else None
+        if line is not None and not line.is_empty and note_sink is not None:
+            note_sink.append(
+                f"무테 칼선: 서로 맞닿게 그린 단색 그림 {len(pieces)}개(잎·꽃 등)를 "
+                "요소마다 따로 그림 안쪽으로 줄였습니다."
+            )
+    else:
+        line = _inward_line_for_design(image_path, design, inset_px, dpi)
     if line is None or line.is_empty:
         if note_sink is not None:
             note_sink.append(
@@ -580,6 +687,194 @@ def _borderless_inward_from_silhouette(
         note_sink.append(
             "무테 칼선: 요소 실루엣을 따라 그림 안쪽으로 줄였습니다(배경은 자르지 않음)."
         )
+    return line
+
+
+def _split_touching_flat_art(image_path: str, design, selection_px, art_region_px=None,
+                            dpi: float = 300.0, min_piece_mm2: float = 16.0):
+    """실루엣이 서로 맞닿게 그린 *단색* 그림 여러 개(예: 흰 꽃 뒤에 겹쳐 그린 초록 잎)이면
+    그림별 조각 목록, 아니면 None.
+
+    2026-09-30(멍푸 실제 사용 피드백 -- 흰 꽃 옆 잎 두 장이 꽃과 한 칼선으로 이어졌다, 잎·꽃을
+    각각 선으로 그려 줌): 잎 끝이 꽃에 닿아 한 요소로 잡혔고, 실루엣 추적(GrabCut)은 그 사이
+    오목한 배경까지 한 덩어리로 잡았다. 원본 손 칼선은 잎·꽃마다 따로다. 배경 채우기
+    (detect_elements_by_background_flood_px)로 찾은 배경을 뺀 그림이 한 덩어리일 때만
+    _split_flat_color_layers로 단색 그림별로 나눈다. 배경을 빼면 여러 조각이 되는 경우는
+    (배경과 비슷한 흰 셔츠가 빠져 머리·몸이 갈라진 실제 파일) 나누지 않는다."""
+    from .multi_design import detect_elements_by_background_flood_px
+
+    try:
+        x0, y0, x1, y1 = selection_px
+        m = max(20.0, 0.08 * min(x1 - x0, y1 - y0))
+        img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        if art_region_px is not None:
+            region = tuple(float(v) for v in art_region_px)
+        else:
+            region = (max(0.0, x0 - m), max(0.0, y0 - m), min(float(w), x1 + m), min(float(h), y1 + m))
+        objs = detect_elements_by_background_flood_px(image_path, region)
+    except Exception:  # noqa: BLE001
+        return None
+    if not objs:
+        return None
+    px = dpi / 25.4
+    min_piece = max(min_piece_mm2 * px * px, 0.1 * design.area)
+    try:
+        art = design.intersection(unary_union(objs).buffer(1.0))
+        # 한두 픽셀로 맞닿은 곳은 끊어서 본다
+        art = art.buffer(-2.0).buffer(2.0)
+        parts = [p for p in getattr(art, "geoms", [art]) if p.geom_type == "Polygon" and p.area >= min_piece]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(parts) >= 2:
+        # 배경을 빼면 여러 조각으로 나뉘는 경우는 나누지 않는다 -- 실제 파일에서 캐릭터의 흰
+        # 셔츠가 크림색 배경과 거의 같은 색이라 "배경"으로 빠져 머리와 몸이 갈라졌다.
+        return None
+    # 배경을 빼도 한 덩어리이면: 서로 거의 닿기만 한(겹쳐 그린) 단색 그림 여러 개인지 본다
+    if art.is_empty or art.area < 0.7 * design.area:
+        return None
+    layers = _split_flat_color_layers(img, art, dpi)
+    if not layers:
+        return None
+    return [design.intersection(p).buffer(0) for p in layers]
+
+
+def _kmeans_lab(samples, k: int = 6, iters: int = 15):
+    """작은 k-평균(결과가 매번 같도록 고정된 시작점) -- 색 무리 중심 목록."""
+    rng = np.random.default_rng(0)
+    centers = [samples[rng.integers(len(samples))]]
+    for _ in range(1, k):
+        d = np.min([np.sum((samples - c) ** 2, axis=1) for c in centers], axis=0)
+        centers.append(samples[int(np.argmax(d))])
+    centers = np.array(centers, np.float32)
+    for _ in range(iters):
+        lab_i = np.argmin(((samples[:, None, :] - centers[None, :, :]) ** 2).sum(-1), axis=1)
+        for c in range(k):
+            sel = samples[lab_i == c]
+            if len(sel):
+                centers[c] = sel.mean(axis=0)
+    return centers
+
+
+def _split_flat_color_layers(img_bgr, art, dpi: float):
+    """art(배경을 뺀 실루엣)가 서로 거의 닿기만 한 *단색* 그림 여러 개(예: 흰 꽃 뒤에 겹쳐
+    그린 초록 잎)이면 그림별 도형 목록, 아니면 None.
+
+    한 그림의 부분(얼굴·옷·팔 등)을 잘못 나누지 않도록 기준을 엄격하게 둔다: 각 조각이
+    거의 한 가지 색(90% 이상, 안쪽 구멍 채움), 볼록한 모양(볼록 껍질 대비 85% 이상),
+    반지름 2mm 이상 두께, 서로 닿는 길이가 작은 쪽 둘레의 12% 이하, 조각들이 그림의 90%
+    이상을 덮음. 실제 파일: 잎·꽃은 닿는 길이 0~9%, 매트에 누운 캐릭터는 매트가 오목해(볼록
+    83%) 나누지 않음. 머리가 몸에 얹힌 합성 그림은 닿는 길이 약 25%(나누지 않음)."""
+    px = dpi / 25.4
+    H, W = img_bgr.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in art.bounds]
+    bx0, by0, bx1, by1 = max(0, x0 - 3), max(0, y0 - 3), min(W, x1 + 3), min(H, y1 + 3)
+    if bx1 - bx0 < 16 or by1 - by0 < 16:
+        return None
+    crop = img_bgr[by0:by1, bx0:bx1]
+    lab = cv2.cvtColor(cv2.GaussianBlur(crop, (3, 3), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+    body = np.zeros(crop.shape[:2], np.uint8)
+    for p in getattr(art, "geoms", [art]):
+        if p.geom_type != "Polygon" or p.is_empty:
+            continue
+        cv2.fillPoly(body, [np.int32([(x - bx0, y - by0) for x, y in p.exterior.coords])], 1)
+    bb = body > 0
+    n_body = int(bb.sum())
+    if n_body < 500:
+        return None
+    pts = lab[bb]
+    rng = np.random.default_rng(0)
+    samp = pts[rng.choice(len(pts), min(4000, len(pts)), replace=False)]
+    K = 6
+    centers = _kmeans_lab(samp, K)
+    par = list(range(K))
+
+    def _f(a):
+        while par[a] != a:
+            a = par[a]
+        return a
+
+    for a in range(K):
+        for b in range(a + 1, K):
+            if np.linalg.norm(centers[a] - centers[b]) < 15:
+                par[_f(b)] = _f(a)
+    nearest = np.argmin(((lab[:, :, None, :] - centers[None, None, :, :]) ** 2).sum(-1), axis=2)
+    labels = np.array([_f(i) for i in range(K)])[nearest]
+    min_area = max(0.12 * n_body, 25.0 * px * px)
+    k3 = np.ones((3, 3), np.uint8)
+    layers = []
+    for c in sorted(set(_f(i) for i in range(K))):
+        m = ((labels == c) & bb).astype(np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k3)
+        n, lb, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for i in range(1, n):
+            if st[i, 4] < min_area:
+                continue
+            comp = (lb == i).astype(np.uint8)
+            cs, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cnt = max(cs, key=cv2.contourArea)
+            filled = np.zeros_like(comp)
+            cv2.drawContours(filled, [cnt], -1, 1, -1)
+            a = float(filled.sum())
+            flat = float((comp & filled).sum()) / max(1.0, a)
+            sol = a / max(1.0, cv2.contourArea(cv2.convexHull(cnt)))
+            rin = cv2.distanceTransform(filled, cv2.DIST_L2, 5).max() / px
+            if flat < 0.9 or sol < 0.85 or rin < 2.0:
+                return None
+            layers.append({"mask": filled > 0, "cnt": cnt, "area": a, "per": cv2.arcLength(cnt, True)})
+    if not 2 <= len(layers) <= 6:
+        return None
+    union = np.zeros_like(bb)
+    for L in layers:
+        union |= L["mask"]
+    if float((union & bb).sum()) < 0.9 * n_body:
+        return None
+    polys = [Polygon([(float(q[0][0]), float(q[0][1])) for q in L["cnt"]]).buffer(0) for L in layers]
+    for i in range(len(layers)):
+        for j in range(i + 1, len(layers)):
+            A, B = layers[i], layers[j]
+            if float((A["mask"] & B["mask"]).sum()) > 0.05 * min(A["area"], B["area"]):
+                return None
+            # 경계의 섞인 색 픽셀(2~3px)은 어느 조각에도 안 들어가므로, 상대 조각에서 4px 안에
+            # 있는 둘레 길이를 맞닿은 길이로 본다
+            pa, pb = polys[i], polys[j]
+            contact = max(
+                pb.exterior.intersection(pa.buffer(4.0)).length,
+                pa.exterior.intersection(pb.buffer(4.0)).length,
+            )
+            if contact > 0.12 * min(pa.length, pb.length):
+                return None
+    out = []
+    for L in layers:
+        P = Polygon([(float(q[0][0]) + bx0, float(q[0][1]) + by0) for q in L["cnt"]]).buffer(0)
+        # 조각 사이 번짐(경계 색) 픽셀은 가까운 조각이 1px 정도 가져가게 살짝 넓힘
+        out.append(P.buffer(1.5))
+    return out
+
+
+def _inward_line_for_design(image_path: str, design, inset_px: float, dpi: float):
+    """실루엣 하나의 무테 칼선(테두리 띠가 있으면 띠 안, 없으면 그림 안쪽으로 inset_px)."""
+    # 2026-09-29(멍푸 실제 사용 피드백 "너무 좁은 영역"): 요소 가장자리에 밝은 테두리
+    # 띠(번짐)가 있으면 칼선을 띠 한가운데에 둔다 -- 띠가 좁은데 1.2mm를 그대로 줄이면
+    # 칼선이 그림 몸통에 붙어 버렸다(원본 손 칼선은 몸통 약 0.5~1mm 바깥, 띠 안).
+    band_w = _light_border_band_width_px(image_path, design, dpi)
+    use_inset = inset_px
+    if band_w > 0:
+        use_inset = max(0.5 * dpi / 25.4, min(inset_px, 0.5 * band_w))
+    uniform = _band_uniform_cut(image_path, design, band_w, dpi) if band_w > 0 else None
+    line = uniform if uniform is not None else _inset_inside_art(design, use_inset)
+    if band_w > 0 and uniform is None and line is not None and not line.is_empty:
+        # 테두리 띠가 있는 요소는 꽃잎 사이 같은 오목한 홈을 2mm 반경으로 메워 칼선을
+        # 부드럽게 한다 -- 띠(그림) 안에서만(실루엣 0.3mm 안쪽까지) 메우므로 배경은
+        # 여전히 자르지 않는다(멍푸: "칼선이 부드럽지 않고").
+        R = 2.0 * dpi / 25.4
+        smooth = line.buffer(R, join_style=1).buffer(-R, join_style=1)
+        smooth = smooth.intersection(design.buffer(-0.3 * dpi / 25.4, join_style=1))
+        smooth = _drop_tiny_parts(smooth)
+        if smooth is not None and not smooth.is_empty and smooth.area >= line.area:
+            line = unary_union([line, smooth])
     return line
 
 

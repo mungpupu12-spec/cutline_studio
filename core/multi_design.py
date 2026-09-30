@@ -1242,6 +1242,39 @@ def _detect_boxes_from_gray(
     return boxes
 
 
+def add_uncovered_content_strips_px(image_path: str, cells, dpi: float = 300.0, min_mm: float = 10.0):
+    """재단선 격자 칸 바깥(칸들을 둘러싼 사각형의 왼쪽·오른쪽·위·아래 띠)에 그림이 있으면
+    그 띠를 칸으로 더한 목록. 그림이 없으면 원래 칸 그대로.
+
+    2026-09-30(멍푸 실제 사용 피드백 -- 시트 오른쪽 세로줄의 부적 모양 스티커 5개에 칼선이
+    하나도 없었다): 그 파일의 재단선 격자는 왼쪽 4열만 있고 오른쪽 세로줄은 격자 밖이라
+    "칸 안만 자르는" 자동 인식에서 통째로 빠졌다. 띠 판단은 칸 판단과 같은
+    (image_outer_region_px: 배경이 아닌 그림이 있는가) 기준 -- 인쇄 여백(검은 바탕·재단
+    표시)만 있는 띠는 더하지 않는다(실제 파일 2개로 확인)."""
+    from .interactive_cutline import image_outer_region_px
+
+    if not cells:
+        return cells
+    with Image.open(image_path) as im:
+        W, H = im.size
+    x0 = min(c[0] for c in cells)
+    y0 = min(c[1] for c in cells)
+    x1 = max(c[2] for c in cells)
+    y1 = max(c[3] for c in cells)
+    need = min_mm * dpi / 25.4
+    strips = [(0, 0, x0, H), (x1, 0, W, H), (x0, 0, x1, y0), (x0, y1, x1, H)]
+    out = list(cells)
+    for s in strips:
+        if s[2] - s[0] < need or s[3] - s[1] < need:
+            continue
+        try:
+            if image_outer_region_px(image_path, tuple(float(v) for v in s)) is not None:
+                out.append(tuple(float(v) for v in s))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 @_image_cache.file_memo  # 2026-09-30 속도: 같은 칸 반복 계산 방지(결과는 True/False)
 def cell_has_content_px(
     image_path: str,

@@ -2421,6 +2421,15 @@ class CutLineApp(ctk.CTk):
                 grid_cells = grid_result.cells_px
             except Exception:  # noqa: BLE001
                 grid_cells = None
+            if grid_cells:
+                # 격자 밖(오른쪽 세로줄 등)에 그림이 있으면 그 띠도 칸으로(자세한 이유는
+                # core.multi_design.add_uncovered_content_strips_px 참고).
+                try:
+                    from core.multi_design import add_uncovered_content_strips_px
+
+                    grid_cells = add_uncovered_content_strips_px(raster_path, grid_cells)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
 
             # 2026-09-26(성능 회귀 대응, 피드백 "파일 불러오니까 무거워지면서
             # 렉걸렸어"): 마우스를 캔버스 위에서 처음 움직이는 순간(_on_canvas_
@@ -5757,6 +5766,10 @@ class CutLineApp(ctk.CTk):
         살짝 줄인다(줄이면 너무 많이 깎이면 합친다). 실제 손 칼선 8개 파일에서
         교차·이중 칼선은 0건, 최소 간격은 약 2mm였다(core.cut_check 참고)."""
         try:
+            self._split_necked_items(start_idx)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        try:
             self._tidy_cut_parts(start_idx)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
@@ -5768,6 +5781,23 @@ class CutLineApp(ctk.CTk):
             self._separate_too_close_cuts(start_idx)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def _split_necked_items(self, start_idx):
+        """두 요소가 아주 가는 목으로 이어진 칼선을 목에서 끊어 요소마다 따로 둔다
+        (core.cut_split 참고 -- 2026-09-30 말풍선 꼬리가 옆 스티커에 닿은 실제 파일).
+        끊긴 조각은 서로 다른 항목이 되어, 아래 "같은 요소 조각 잇기"에 다시 붙지 않는다."""
+        from core.cut_split import split_result_at_necks
+
+        dpi = self.dpi.get()
+        n = 0
+        for i in range(start_idx, len(self._accumulated)):
+            outs = split_result_at_necks(self._accumulated[i], dpi)
+            if not outs:
+                continue
+            self._accumulated[i] = outs[0]
+            self._accumulated.extend(outs[1:])
+            n += len(outs) - 1
+        return n
 
     def _tidy_cut_parts(self, start_idx, min_gap_mm=2.0):
         """한 요소의 칼선 안쪽 구멍(창 모양으로 뚫리는 칼선)을 없애고, 같은 요소가
