@@ -99,6 +99,7 @@ from core.cut_check import check_cut_spacing, summarize_cut_spacing
 from core.preview import render_preview
 from core.accumulate import combine_results
 from core import license_client as lic
+from core import glass_theme
 
 try:
     from PIL import Image, ImageTk
@@ -329,24 +330,34 @@ def _missing_body_warning_notes(suspicious_regions_px: list) -> list[str]:
 # "장식용 브랜드 컬러"가 아니므로 그대로 둠(장식 팔레트와 기능 신호는 다른
 # 것이므로 섞지 않음).
 # ---------------------------------------------------------------------------
-BG_APP = "#F5F5F6"        # 창 배경 (거의 흰색에 가까운 그레이) -- 카드가 그 위에 뜬 느낌
-BG_CARD = "#FFFFFF"       # 섹션 카드 배경 (순백)
-BORDER = "#E2E2E5"        # 카드/입력창 테두리 (그레이)
-# 2026-08-27 피드백: "프로그램 글자색 블랙으로 통일, 서브 컬러는 진한
-# 회색" -- 기존엔 거의 검정에 가까운 값(#0A0A0C)이었는데 완전한 검정으로,
-# 보조 텍스트는 눈에 덜 띄던 회색(#6E6E74)에서 대비가 뚜렷한 진한 회색으로.
-TEXT_PRIMARY = "#000000"   # 순검정
-# 2026-08-31 피드백("글자들이 잘 안보여 -- 폰트와 색상 진하게"): 보조
-# 텍스트(설명 문구)가 연한 회색이라 잘 안 보인다는 피드백에 따라 훨씬 짙은
-# 회색으로 한 번 더 진하게 함(#45454A -> #202024, 검정에 아주 가까움).
-TEXT_SECONDARY = "#202024"  # 진한 회색(거의 검정)
-ACCENT = "#0047AB"        # 브랜드 포인트 컬러 (코발트 블루)
-ACCENT_HOVER = "#003682"
-ACCENT_SOFT = "#E8F0FB"   # 보조 버튼 hover / 배경 강조용 아주 연한 코발트 톤
+# 2026-09-29 멍푸 요청("첨부한 파일처럼 블러 효과와 투명 글래스로 프로그램
+# 디자인 변경"): 참고 이미지(민트/핑크 글래스 UI 키트, 흐릿한 음료 사진,
+# 빛나는 색 도형 포스터)에 맞춰 코발트 블루 + 흑백에서 "흐릿한 파스텔 배경 +
+# 유리 판 + 흰 카드 + 민트 포인트"로 바꿈. 글자색은 2026-08-27/31 피드백
+# ("블랙으로 통일", "진하게") 그대로 유지. 세이프티/칼선/블리딩 색(초록/빨강/
+# 파랑)은 인쇄 실무 신호라 그대로 둠. 배경 그림과 유리 판은 core/glass_theme.py.
+BG_APP = "#F3F5F4"        # 창/대화상자 바탕 (배경 그림이 아직 없을 때의 색)
+GLASS_FILL = "#F1F5F4"    # 큰 유리 판(헤더/왼쪽 패널/미리보기 패널) 안쪽 색 -- 배경 그림 속 판과 같은 색
+BG_CARD = "#FFFFFF"       # 유리 판 위의 흰 카드
+BORDER = "#DFE8E5"        # 카드/입력창 테두리 (민트빛 연회색)
+CONTROL_FILL = "#F4F8F7"  # 보조 버튼/입력창 바탕 (흰 카드 위에서 살짝 들어간 느낌)
+TEXT_PRIMARY = "#000000"   # 순검정 (2026-08-27 피드백)
+TEXT_SECONDARY = "#202024"  # 진한 회색 (2026-08-31 피드백 "글자가 잘 안 보여")
+ACCENT = "#1E8770"        # 포인트 컬러 (진한 민트 -- 흰 글자가 잘 읽히는 명도)
+ACCENT_HOVER = "#176B59"
+ACCENT_SOFT = "#E3F5EF"   # 선택/hover 배경용 아주 연한 민트
 COLOR_SAFETY = "#16A44A"
 COLOR_CUT = "#DC2626"
 COLOR_BLEED = "#2563EB"
-CANVAS_BG = "#EFEFF1"
+CANVAS_BG = "#F7F9F8"
+SCROLL_BTN = "#CFDCD8"
+SCROLL_BTN_HOVER = "#AFC4BE"
+GLASS_RADIUS = 22         # 큰 유리 판 모서리 반지름(px, 배경 그림 기준)
+GLASS_OUTSET = 7          # 판을 위젯보다 크게 그리는 폭 -- >= 0.293 * GLASS_RADIUS
+# 왼쪽 조작 패널 폭(논리 px)과 그 안 설명 글 줄바꿈 폭. 2026-09-29: 가로 1456px 화면에서
+# DPI 입력칸("300.0")과 설명 글이 잘려 보였음 -> 380에서 넓힘.
+LEFT_PANEL_WIDTH = 410
+LEFT_TEXT_WRAP = 364
 FONT_FAMILY = "Malgun Gothic"
 
 # 2026-08-26 추가 피드백: "폰트 0.8 포인트 키우고"에 이어, 2026-08-27
@@ -504,7 +515,9 @@ class CutLineApp(ctk.CTk):
         # 화면 정중앙 좌표를 직접 계산해서 명시적으로 배치(튜토리얼 대화상자는
         # 이 메인 창 위치 기준으로 가운데 정렬되므로, 이렇게 하면 같이 따라
         # 중앙에 온다. _open_tutorial_dialog 참고).
-        self.geometry(self._centered_geometry(1000, 760, top_margin_px=30))
+        # 2026-09-29 글래스 디자인: 왼쪽 패널을 넓히면서 1000px 폭에서는 미리보기 위의
+        # 확대/축소/이동 버튼이 잘렸다(멍푸 PC에서 확인) -> 화면이 충분히 넓으면 1120으로.
+        self.geometry(self._centered_geometry(self._initial_window_width(), 760, top_margin_px=30))
         self.minsize(920, 680)
         try:
             self.configure(fg_color=BG_APP)
@@ -561,6 +574,10 @@ class CutLineApp(ctk.CTk):
         self.cut_mm = tk.DoubleVar(value=2.0)
         self.bleed_mm = tk.DoubleVar(value=3.0)
         self.status = tk.StringVar(value="파일을 선택하세요 (주 형식: 어도비 일러스트 .ai / PNG / JPG)")
+        # 화면 표시용으로 줄인 상태 문구(헤더 한 줄 / 왼쪽 아래 상태 카드) -- _on_status_changed
+        self.status_short = tk.StringVar(value=self.status.get())
+        self.status_detail = tk.StringVar(value=self.status.get())
+        self.status.trace_add("write", self._on_status_changed)
 
         # 작업 종류(2026-09-07 개편, "칼선의 종류는 크게 무테/유테/도무송/
         # 조각스티커 이렇게 있는데 지금은 그런 옵션이 잘 표현 되지 않고
@@ -878,6 +895,137 @@ class CutLineApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             pass
 
+    # ------------------------------------------------------------------
+    # 2026-09-29 글래스 디자인: 배경 그림(흐린 파스텔 + 유리 판) 다시 그리기,
+    # 빈 미리보기 그림, 긴 상태 문구 줄이기.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _shorten_status_text(text, limit=90):
+        """상태 문구를 화면용으로 줄인다: 긴 파일 경로는 파일 이름만 남기고,
+        줄바꿈은 한 칸으로, limit 글자를 넘으면 끝을 "…"로. (2026-09-29: 저장
+        경로나 오류 원문이 그대로 나와 상태 칸이 몇 줄씩 늘어나던 문제.)"""
+        import re
+        t = " ".join(str(text or "").split())
+        t = re.sub(r'(?:[A-Za-z]:[\\/]|(?:(?<=\s)|^)/(?=[^\s/]))(?:[^\\/\n]*[\\/])+', "", t)
+        if len(t) > limit:
+            t = t[:limit - 1].rstrip() + "…"
+        return t
+
+    def _on_status_changed(self, *_):
+        try:
+            full = self.status.get()
+            self.status_short.set(self._shorten_status_text(full, 90))
+            self.status_detail.set(self._shorten_status_text(full, 240))
+        except Exception:  # noqa: BLE001 -- 표시용일 뿐
+            pass
+
+    def _glass_scale(self):
+        try:
+            return float(self._get_widget_scaling())
+        except Exception:  # noqa: BLE001
+            return 1.0
+
+    def _schedule_glass_repaint(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if getattr(self, "_glass_bg_label", None) is None:
+            return
+        if self._glass_paint_job is not None:
+            try:
+                self.after_cancel(self._glass_paint_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._glass_paint_job = self.after(60, self._repaint_glass_backdrop)
+
+    def _repaint_glass_backdrop(self):
+        """창 크기와 패널 위치에 맞춰 배경 그림을 다시 만든다(같은 크기면 건너뜀).
+        실패해도 앱 동작과 무관한 장식이므로 조용히 넘어간다."""
+        self._glass_paint_job = None
+        try:
+            from PIL import ImageTk
+
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 50 or h < 50:
+                return
+            rx, ry = self.winfo_rootx(), self.winfo_rooty()
+            rects = []
+            for p in self._glass_panels:
+                if p.winfo_ismapped():
+                    rects.append((p.winfo_rootx() - rx, p.winfo_rooty() - ry, p.winfo_width(), p.winfo_height()))
+            key = (w, h, tuple(rects))
+            if key == self._glass_paint_key:
+                return
+            if self._glass_backdrop_cache is None or self._glass_backdrop_cache[0] != (w, h):
+                self._glass_backdrop_cache = ((w, h), glass_theme.make_backdrop(w, h))
+            sc = self._glass_scale()
+            img = glass_theme.paint_glass_panels(
+                self._glass_backdrop_cache[1], rects, glass_theme.hex_to_rgb(GLASS_FILL),
+                radius=GLASS_RADIUS * sc, outset=GLASS_OUTSET * sc,
+            )
+            self._glass_photo = ImageTk.PhotoImage(img)
+            self._glass_bg_label.configure(image=self._glass_photo)
+            self._glass_paint_key = key
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+    def _draw_canvas_placeholder(self):
+        """도안을 열기 전 빈 미리보기 칸: 가운데에 부드럽게 번진 색 덩어리 +
+        짧은 안내(참고 이미지의 빛나는 색 도형 포스터 느낌)."""
+        c = self.preview_canvas
+        c.delete("all")
+        w, h = max(200, c.winfo_width()), max(150, c.winfo_height())
+        try:
+            from PIL import ImageTk
+
+            art = glass_theme.make_placeholder_art(w, h, base_rgb=glass_theme.hex_to_rgb(CANVAS_BG))
+            self._placeholder_photo = ImageTk.PhotoImage(art)
+            c.create_image(0, 0, anchor="nw", image=self._placeholder_photo, tags=("placeholder",))
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        self._canvas_placeholder = c.create_text(
+            w // 2, h // 2 - 14, anchor="center", text="미리보기가 여기에 표시됩니다",
+            fill=TEXT_PRIMARY, font=self.font_canvas, tags=("placeholder",),
+        )
+        c.create_text(
+            w // 2, h // 2 + 22, anchor="center", text="✳  왼쪽 '도안 파일'에서 찾아보기를 눌러 시작하세요",
+            fill=TEXT_SECONDARY, font=self.font_caption, tags=("placeholder",),
+        )
+        c.configure(scrollregion=(0, 0, w, h))
+        c.xview_moveto(0)
+        c.yview_moveto(0)
+        self._placeholder_size = (w, h)
+
+    def _on_preview_canvas_configure(self, _event=None):
+        c = getattr(self, "preview_canvas", None)
+        if c is None or not c.find_withtag("placeholder"):
+            return
+        if getattr(self, "_placeholder_size", None) == (c.winfo_width(), c.winfo_height()):
+            return
+        job = getattr(self, "_placeholder_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._placeholder_job = self.after(80, self._redraw_placeholder_if_shown)
+
+    def _redraw_placeholder_if_shown(self):
+        self._placeholder_job = None
+        if self.preview_canvas.find_withtag("placeholder"):
+            self._draw_canvas_placeholder()
+
+    def _initial_window_width(self, preferred=1120, minimum=1000):
+        """처음 창 폭(논리 px). 화면(배율 적용 후) 폭에서 여유 60px를 뺀 값 안에서."""
+        try:
+            try:
+                sc = float(self._get_window_scaling())
+            except Exception:  # noqa: BLE001
+                sc = 1.0
+            logical_sw = self.winfo_screenwidth() / max(sc, 0.1)
+            return int(max(minimum, min(preferred, logical_sw - 60)))
+        except Exception:  # noqa: BLE001
+            return minimum
+
     def _centered_geometry(self, w, h, shift_up_ratio=0.0, top_margin_px=None):
         """가로 w x 세로 h 크기로 창 위치를 정하는 "WxH+X+Y" 문자열을 만든다.
         가로는 항상 화면 정중앙.
@@ -1005,8 +1153,8 @@ class CutLineApp(ctk.CTk):
     # ------------------------------------------------------------------
     def _section(self, parent, title, subtitle=None):
         """카드형 섹션 하나를 만들고, 내용물을 채워 넣을 내부 프레임을 반환."""
-        card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=14, border_width=1, border_color=BORDER)
-        card.pack(fill="x", pady=(0, 10), padx=2)
+        card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=18, border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=(0, 10), padx=(2, 6))
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=12)
         ctk.CTkLabel(
@@ -1016,7 +1164,7 @@ class CutLineApp(ctk.CTk):
         if subtitle:
             ctk.CTkLabel(
                 inner, text=subtitle, font=self.font_caption, text_color=TEXT_SECONDARY,
-                anchor="w", justify="left", wraplength=330,
+                anchor="w", justify="left", wraplength=LEFT_TEXT_WRAP,
             ).pack(fill="x", pady=(3, 0))
         return inner
 
@@ -1027,8 +1175,9 @@ class CutLineApp(ctk.CTk):
         쓰는 좀 더 절제된 라운드(16px)와 "중간" 높이로 축소."""
         return ctk.CTkButton(
             parent, text=text, command=command, font=self.font_button,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
-            corner_radius=16, height=40 + BUTTON_SIZE_BUMP_PX,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF", text_color_disabled="#BFDCD3",
+            # 2026-09-29 글래스 디자인: 참고 이미지처럼 양끝이 완전히 둥근 알약 모양
+            corner_radius=(40 + BUTTON_SIZE_BUMP_PX) // 2, height=40 + BUTTON_SIZE_BUMP_PX,
         )
 
     def _refresh_domusong_yn_buttons(self):
@@ -1044,7 +1193,7 @@ class CutLineApp(ctk.CTk):
                 b.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF",
                             border_width=0)
             else:
-                b.configure(fg_color="transparent", hover_color=ACCENT_SOFT,
+                b.configure(fg_color=CONTROL_FILL, hover_color=ACCENT_SOFT,
                             text_color=TEXT_PRIMARY, border_width=1)
 
     def _btn_secondary(self, parent, text, command):
@@ -1052,8 +1201,8 @@ class CutLineApp(ctk.CTk):
         축소(20 -> 12, 36 -> 32 + 소폭 bump)."""
         return ctk.CTkButton(
             parent, text=text, command=command, font=self.font_body,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=12,
+            fg_color=CONTROL_FILL, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=(32 + BUTTON_SIZE_BUMP_PX) // 2,
             height=32 + BUTTON_SIZE_BUMP_PX,
         )
 
@@ -1067,7 +1216,7 @@ class CutLineApp(ctk.CTk):
     # 다른 색(파랑/초록/주황/보라/분홍)을 돌아가며 쓰던 것을, 하나의 파스텔
     # 블루로 통일함(원래 있던 팔레트 중 첫 번째 색 그대로 재사용).
     _PILL_COLORS = [
-        ("#E8F0FB", "#1D4E96"),
+        ("#E3F5EF", "#14584A"),  # 2026-09-29 글래스 디자인: 파스텔 블루 -> 파스텔 민트
     ]
 
     def _make_category_picker(self, parent, current_label_var, options, variable, popup_title,
@@ -1082,7 +1231,7 @@ class CutLineApp(ctk.CTk):
             parent, textvariable=current_label_var,
             command=lambda: self._toggle_category_dropdown(btn, options, variable, on_change, allow_clear),
             font=self.font_button, anchor="w",
-            corner_radius=10, height=38 + BUTTON_SIZE_BUMP_PX,
+            corner_radius=(38 + BUTTON_SIZE_BUMP_PX) // 2, height=38 + BUTTON_SIZE_BUMP_PX,
         )
 
         def _refresh_look(*_args):
@@ -1090,7 +1239,7 @@ class CutLineApp(ctk.CTk):
                 btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#FFFFFF", border_width=0)
             else:
                 btn.configure(
-                    fg_color="#FFFFFF", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
+                    fg_color=CONTROL_FILL, hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
                     border_width=1, border_color=BORDER,
                 )
 
@@ -1305,14 +1454,6 @@ class CutLineApp(ctk.CTk):
         # 수 있게 한다.
         def _build_buttons(parent):
             first = True
-            if allow_clear and variable.get():
-                _clamp_button_width(ctk.CTkButton(
-                    parent, text="✕ 선택 해제", command=lambda: _pick(""), font=self.font_caption,
-                    fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
-                    anchor="w", corner_radius=8, height=30,
-                )).pack(fill="x", padx=8, pady=(8, 2))
-                first = False
-
             for i, (value, label) in enumerate(options):
                 bg, fg = self._PILL_COLORS[i % len(self._PILL_COLORS)]
                 selected = value == variable.get()
@@ -1322,6 +1463,16 @@ class CutLineApp(ctk.CTk):
                     height=36, border_width=2 if selected else 0, border_color=ACCENT,
                 )).pack(fill="x", padx=8, pady=(8 if first else 3, 3))
                 first = False
+
+            # 2026-09-29: "✕ 선택 해제"가 목록 맨 위에 있으면, 값을 고른 뒤 다시 열 때마다
+            # 옵션들이 한 줄씩 아래로 밀려 같은 자리를 눌러도 다른 옵션이 골라졌다(실제
+            # 사용 중 확인) -> 맨 아래로 옮겨 옵션 위치가 항상 같게.
+            if allow_clear and variable.get():
+                _clamp_button_width(ctk.CTkButton(
+                    parent, text="✕ 선택 해제", command=lambda: _pick(""), font=self.font_caption,
+                    fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_SECONDARY,
+                    anchor="w", corner_radius=8, height=30,
+                )).pack(fill="x", padx=8, pady=(4, 2))
 
             ctk.CTkFrame(parent, fg_color="transparent", height=6).pack()
 
@@ -1454,6 +1605,16 @@ class CutLineApp(ctk.CTk):
         self.bind_all("<Escape>", lambda _e: self._close_open_dropdown(), add="+")
         self._dropdown_click_bound = True
 
+    def _wrap_checkbox(self, cb, wraplength=LEFT_TEXT_WRAP - 40):
+        """CTkCheckBox는 줄바꿈 옵션이 없어 긴 글이 카드 밖으로 잘린다 -- 안쪽 글자
+        라벨에 직접 줄바꿈 폭을 준다(실패해도 표시만 달라질 뿐)."""
+        try:
+            sc = self._glass_scale()
+            cb._text_label.configure(wraplength=int(wraplength * sc), justify="left")
+        except Exception:  # noqa: BLE001
+            pass
+        return cb
+
     def _make_number_field(self, parent, label, var, unit="mm", from_=0.0, to=1000.0,
                             increment=0.5, color=None):
         """숫자 입력 한 줄: (선택) 색상 스와치 + 라벨 + [-][입력칸][+] + 단위.
@@ -1464,12 +1625,14 @@ class CutLineApp(ctk.CTk):
             swatch = ctk.CTkFrame(row, width=12, height=12, corner_radius=3, fg_color=color)
             swatch.pack(side="left", padx=(0, 8))
             swatch.pack_propagate(False)
-        ctk.CTkLabel(
-            row, text=label, font=self.font_body, text_color=TEXT_PRIMARY, anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-
+        # 2026-09-29: 숫자 칸(−/값/+/단위)을 먼저 오른쪽에 붙이고 이름은 남는 폭에서
+        # 줄바꿈 -- 예전엔 이름이 먼저 자리를 차지해 오른쪽 "mm"가 카드 밖으로 잘렸다.
         stepper = ctk.CTkFrame(row, fg_color="transparent")
         stepper.pack(side="right")
+        ctk.CTkLabel(
+            row, text=label, font=self.font_body, text_color=TEXT_PRIMARY, anchor="w",
+            justify="left", wraplength=118,
+        ).pack(side="left", fill="x", expand=True)
 
         def _step(delta):
             try:
@@ -1481,19 +1644,20 @@ class CutLineApp(ctk.CTk):
             var.set(new_val)
 
         ctk.CTkButton(
-            stepper, text="−", width=30, height=30, corner_radius=10,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            stepper, text="−", width=28, height=28, corner_radius=14,
+            fg_color=CONTROL_FILL, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
             border_width=1, border_color=BORDER, font=self.font_body,
             command=lambda: _step(-increment),
         ).pack(side="left")
         ctk.CTkEntry(
-            stepper, textvariable=var, width=60, height=30, corner_radius=10,
-            border_width=1, border_color=BORDER, fg_color="#FFFFFF", justify="center",
+            # 2026-09-29: 60px에서는 Windows 글꼴로 "300.0"이 "300.("처럼 잘려 보였음 -> 넓힘
+            stepper, textvariable=var, width=80, height=30, corner_radius=8,
+            border_width=1, border_color=BORDER, fg_color=CONTROL_FILL, justify="center",
             font=self.font_body,
         ).pack(side="left", padx=4)
         ctk.CTkButton(
-            stepper, text="+", width=30, height=30, corner_radius=10,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            stepper, text="+", width=28, height=28, corner_radius=14,
+            fg_color=CONTROL_FILL, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
             border_width=1, border_color=BORDER, font=self.font_body,
             command=lambda: _step(increment),
         ).pack(side="left")
@@ -1872,63 +2036,60 @@ class CutLineApp(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _build_layout(self):
-        # --- 상단 헤더 바 (브랜드 + 짧은 설명) ---------------------------------
-        # 2026-08-27: 창 크기 20% 확대에 맞춰 헤더 높이도 비례 확대(68 -> 82).
-        header_bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=82)
-        header_bar.pack(side="top", fill="x")
+        # --- 2026-09-29 글래스 디자인 ---------------------------------------
+        # 창 전체에 흐릿한 파스텔 배경 그림을 깔고(맨 아래 층), 헤더/왼쪽 패널/
+        # 미리보기 패널을 그 위에 띄운다. 각 패널 자리에는 배경 그림 안에 둥근
+        # 유리 판이 함께 그려진다(_repaint_glass_backdrop, core/glass_theme.py).
+        # 패널 사이 여백으로 번진 색이 비쳐 보여 "유리 위에 떠 있는" 느낌이 난다.
+        self._glass_bg_label = tk.Label(self, bd=0, highlightthickness=0, background=BG_APP)
+        self._glass_bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self._glass_bg_label.lower()
+        self._glass_panels = []
+        self._glass_backdrop_cache = None
+        self._glass_paint_key = None
+        self._glass_paint_job = None
+        self._glass_photo = None
+
+        # --- 상단 헤더 (제목 + 진행 상태 한 줄 + 화면 초기화) ---------------------
+        # 예전엔 제목 바(82px)와 상태 바(34px) 두 줄이었는데 유리 판 하나로 합쳐
+        # 세로 공간을 아낌. 상태 줄은 스크롤 위치와 무관하게 항상 보인다
+        # (2026-09-08 피드백 "자동 인식 처리중을 상단으로 고정해" 그대로 유지).
+        header_bar = ctk.CTkFrame(self, fg_color=GLASS_FILL, corner_radius=0, height=58)
+        header_bar.pack(side="top", fill="x", padx=22, pady=(18, 12))
         header_bar.pack_propagate(False)
+        self._glass_panels.append(header_bar)
         title_wrap = ctk.CTkFrame(header_bar, fg_color="transparent")
-        title_wrap.pack(side="left", padx=24, pady=10)
-        # 2026-09-08 피드백("컷라인 스튜디오 밑에 설명글 지워"): 제목
-        # 바로 아래에 있던 부제(설명) 글줄을 없앰 -- 제목만 남긴다.
+        title_wrap.pack(side="left", padx=(8, 16))
+        # 2026-09-08 피드백("컷라인 스튜디오 밑에 설명글 지워"): 제목만 남긴다.
         ctk.CTkLabel(
             title_wrap, text=APP_TITLE, font=self.font_title, text_color=TEXT_PRIMARY,
         ).pack(anchor="w")
-        # 2026-09-07 피드백("화면과 파일 초기화 리셋 버튼을 오른쪽 상단에
-        # 만들어"): 지금까지 고른 파일/선택 영역/누적된 칼선/작업 종류 등
-        # 화면에 남아있는 모든 상태를 프로그램을 막 실행했을 때와 같은 빈
-        # 상태로 되돌리는 버튼. 실제 파일을 디스크에서 지우는 게 아니라
-        # 화면과 내부 상태만 초기화 -- 오른쪽 위, 헤더 바 안에 배치.
+        # 2026-09-07 피드백("화면과 파일 초기화 리셋 버튼을 오른쪽 상단에"): 화면과
+        # 내부 상태만 처음 상태로(디스크의 파일은 건드리지 않음).
         self._btn_secondary(header_bar, "화면 초기화", self._on_reset_all).pack(
-            side="right", padx=24, pady=10,
+            side="right", padx=(12, 4),
         )
-        ctk.CTkFrame(header_bar, fg_color=BORDER, height=1, corner_radius=0).pack(
-            side="bottom", fill="x"
-        )
-
-        # 2026-09-08 피드백("자동 인식 처리중을 상단으로 고정해 안 보이니까
-        # 작업하는지 몰라"): 기존 상태 메시지(self.status)는 왼쪽 스크롤
-        # 패널의 맨 아래, 모든 섹션 다음에만 있어서 섹션이 많으면 스크롤을
-        # 끝까지 내려야 보이는 위치였다 -- 자동 인식처럼 몇 초 이상 걸리는
-        # 작업 중에는 그 위치가 화면 밖으로 스크롤돼 있어서 지금 작업 중인지
-        # 전혀 알 수 없었다. 헤더 바로 아래, 스크롤 위치와 무관하게 항상
-        # 화면에 보이는 위치에 같은 self.status를 그대로 미러링하는 얇은
-        # 배너를 추가한다(기존 하단 상태 카드는 자세한 안내를 위해 그대로
-        # 둠 -- 둘 다 같은 self.status를 보여주므로 항상 서로 일치한다).
-        top_status_bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=34)
-        top_status_bar.pack(side="top", fill="x")
-        top_status_bar.pack_propagate(False)
+        # 진행 상태 한 줄: 경로/오류 원문처럼 긴 문구는 짧게 줄여서(_on_status_changed).
+        status_pill = ctk.CTkFrame(header_bar, fg_color=BG_CARD, corner_radius=17, height=36,
+                                   border_width=1, border_color=BORDER)
+        status_pill.pack(side="left", fill="x", expand=True, pady=11)
+        status_pill.pack_propagate(False)
         ctk.CTkLabel(
-            top_status_bar, textvariable=self.status, font=self.font_caption,
+            status_pill, textvariable=self.status_short, font=self.font_caption,
             text_color=TEXT_SECONDARY, anchor="w", justify="left",
-        ).pack(fill="x", padx=24, pady=6)
-        ctk.CTkFrame(top_status_bar, fg_color=BORDER, height=1, corner_radius=0).pack(
-            side="bottom", fill="x"
-        )
+        ).pack(fill="both", expand=True, padx=16, pady=2)
 
-        # --- 본문: 왼쪽 스크롤 조작 패널 + 오른쪽 미리보기 카드 -------------------
-        body = ctk.CTkFrame(self, fg_color=BG_APP, corner_radius=0)
-        body.pack(side="top", fill="both", expand=True)
-
-        # 조작 패널을 CTkScrollableFrame으로 감싼 게 이번 개편의 핵심 -- 섹션이
-        # 몇 개가 되든, 창 높이가 얼마든, 스크롤바가 항상 생기므로 버튼이
-        # 화면 밖으로 잘려서 눌리지 않는 문제 자체가 구조적으로 사라진다.
-        # 2026-08-27: 창 크기 20% 확대에 맞춰 좌측 패널 폭도 비례 확대(380 -> 456).
+        # --- 본문: 왼쪽 스크롤 조작 패널 + 오른쪽 미리보기 패널 -------------------
+        # 예전의 불투명한 본문 프레임은 없앰 -- 패널 사이로 배경이 비쳐야 하므로 두
+        # 패널을 창에 바로 배치한다. 조작 패널은 CTkScrollableFrame이라 섹션이 몇
+        # 개든, 창 높이가 얼마든 스크롤로 전부 닿는다.
         left_col = ctk.CTkScrollableFrame(
-            body, width=380, fg_color=BG_APP, corner_radius=0,
-            scrollbar_button_color=BORDER, scrollbar_button_hover_color=TEXT_SECONDARY,
+            self, width=LEFT_PANEL_WIDTH, fg_color=GLASS_FILL, corner_radius=0, border_width=0,
+            scrollbar_button_color=SCROLL_BTN, scrollbar_button_hover_color=SCROLL_BTN_HOVER,
         )
-        left_col.pack(side="left", fill="y", padx=(12, 6), pady=12)
+        left_col.pack(side="left", fill="y", padx=(22, 12), pady=(12, 22))
+        # CTkScrollableFrame 자신은 안쪽 스크롤 내용이고, 화면에 놓이는 바깥 틀은 _parent_frame
+        self._glass_panels.append(getattr(left_col, "_parent_frame", left_col))
         # 2026-09-08(10차) 피드백("프로그램 시작하고 도안 찾는 버튼이
         # 사라졌다가 수 초 후에 나타나") 대응을 위해 self에 보관 -- 이
         # 왼쪽 패널 전체를 만드는 동안 창은 아직 self.withdraw()로 숨겨져
@@ -1946,16 +2107,15 @@ class CutLineApp(ctk.CTk):
         # 뒤의 진짜 크기 기준으로 다시 맞춘다.
         self._left_col = left_col
 
-        right_col = ctk.CTkFrame(
-            body, fg_color=BG_CARD, corner_radius=16, border_width=1, border_color=BORDER,
-        )
-        right_col.pack(side="left", fill="both", expand=True, padx=(6, 12), pady=12)
+        right_col = ctk.CTkFrame(self, fg_color=GLASS_FILL, corner_radius=0, border_width=0)
+        right_col.pack(side="left", fill="both", expand=True, padx=(12, 22), pady=(12, 22))
+        self._glass_panels.append(right_col)
 
         preview_header_row = ctk.CTkFrame(right_col, fg_color="transparent")
-        preview_header_row.pack(fill="x", padx=20, pady=(18, 8))
-        ctk.CTkLabel(
+        preview_header_row.pack(fill="x", padx=6, pady=(2, 10))
+        preview_title = ctk.CTkLabel(
             preview_header_row, text="미리보기", font=self.font_section, text_color=TEXT_PRIMARY, anchor="w",
-        ).pack(side="left")
+        )
         # 2026-09-07(7차) 피드백("키스컷 이미지 축소 되어 전체 화면이 보이지
         # 않음. 칼선이 잘 됐는지 확대해서 볼 수 있는 기능 필요"): 미리보기
         # 섹션 제목 오른쪽에 확대/축소/원본크기 버튼 + 현재 배율(%) 표시.
@@ -1966,19 +2126,19 @@ class CutLineApp(ctk.CTk):
         )
         ctk.CTkButton(
             zoom_row, text="확대 +", command=self._on_zoom_in, font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=56, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=56, height=28,
         ).pack(side="left", padx=(0, 6))
         self.zoom_pct_label.pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             zoom_row, text="축소 −", command=self._on_zoom_out, font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=56, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=56, height=28,
         ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             zoom_row, text="원본크기", command=self._on_zoom_reset, font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=64, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=64, height=28,
         ).pack(side="left")
         # 2026-09-08 피드백("확대 축소 기능에 손바닥 모양의 이동할 수 있는
         # 기능 추가"): 확대된 상태에서 스크롤바만으로 원하는 부분을 찾아
@@ -1990,13 +2150,17 @@ class CutLineApp(ctk.CTk):
         # 돌아간다 -- _on_toggle_pan_mode 참고.
         self.pan_mode_btn = ctk.CTkButton(
             zoom_row, text="🖐 이동", command=self._on_toggle_pan_mode, font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=60, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=60, height=28,
         )
         self.pan_mode_btn.pack(side="left", padx=(6, 0))
+        # 2026-09-29: 버튼 줄을 먼저 배치하고 제목은 남는 자리에 -- 폭이 좁으면 버튼
+        # 대신 제목이 줄어든다(버튼이 잘려 눌리지 않던 문제).
+        preview_title.pack(side="left", fill="x", expand=True)
 
-        canvas_wrap = ctk.CTkFrame(right_col, fg_color=CANVAS_BG, corner_radius=12)
-        canvas_wrap.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        canvas_wrap = ctk.CTkFrame(right_col, fg_color=CANVAS_BG, corner_radius=18,
+                                   border_width=1, border_color=BORDER)
+        canvas_wrap.pack(fill="both", expand=True, padx=2, pady=(0, 2))
         # 확대(zoom > 100%) 시 이미지가 보이는 영역보다 커질 수 있으므로,
         # 가로/세로 스크롤바를 함께 넣어 어느 부분이든 이동해서 볼 수 있게
         # 한다(2026-09-07 7차 피드백). grid로 배치해야 캔버스 오른쪽/아래에
@@ -2012,18 +2176,22 @@ class CutLineApp(ctk.CTk):
         canvas_wrap.grid_rowconfigure(0, weight=1)
         canvas_wrap.grid_columnconfigure(0, weight=1)
         self.preview_canvas = tk.Canvas(canvas_wrap, background=CANVAS_BG, highlightthickness=0)
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=(2, 0))
-        self._preview_vbar = tk.Scrollbar(canvas_wrap, orient="vertical", command=self.preview_canvas.yview)
-        self._preview_vbar.grid(row=0, column=1, sticky="ns", pady=(2, 0))
-        self._preview_hbar = tk.Scrollbar(canvas_wrap, orient="horizontal", command=self.preview_canvas.xview)
-        self._preview_hbar.grid(row=1, column=0, sticky="ew", padx=(2, 0))
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=(10, 0))
+        # 2026-09-29 글래스 디자인: 운영체제 기본 회색 스크롤바 대신 얇은 둥근 스크롤바.
+        self._preview_vbar = ctk.CTkScrollbar(
+            canvas_wrap, orientation="vertical", command=self.preview_canvas.yview,
+            button_color=SCROLL_BTN, button_hover_color=SCROLL_BTN_HOVER, fg_color="transparent", width=14,
+        )
+        self._preview_vbar.grid(row=0, column=1, sticky="ns", pady=(10, 0), padx=(0, 4))
+        self._preview_hbar = ctk.CTkScrollbar(
+            canvas_wrap, orientation="horizontal", command=self.preview_canvas.xview,
+            button_color=SCROLL_BTN, button_hover_color=SCROLL_BTN_HOVER, fg_color="transparent", height=14,
+        )
+        self._preview_hbar.grid(row=1, column=0, sticky="ew", padx=(10, 0), pady=(0, 4))
         self.preview_canvas.configure(
             yscrollcommand=self._preview_vbar.set, xscrollcommand=self._preview_hbar.set,
         )
-        self._canvas_placeholder = self.preview_canvas.create_text(
-            10, 10, anchor="nw", text="미리보기가 여기에 표시됩니다", fill=TEXT_SECONDARY,
-            font=self.font_canvas,
-        )
+        self._draw_canvas_placeholder()
         self.preview_canvas.bind("<ButtonPress-1>", self._on_canvas_press)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
@@ -2032,6 +2200,9 @@ class CutLineApp(ctk.CTk):
         # 예비 모양을 보여준다 -- 단일 선택 화면과 무테/유테+도무송(①②③)
         # 화면 둘 다에서 동작(핸들러 안에서 모드별로 분기).
         self.preview_canvas.bind("<Motion>", self._on_canvas_hover)
+        self.preview_canvas.bind("<Configure>", self._on_preview_canvas_configure, add="+")
+        # 창 크기가 바뀌면 배경(흐린 파스텔 + 유리 판)을 다시 그림 -- 2026-09-29 글래스 디자인
+        self.bind("<Configure>", self._schedule_glass_repaint, add="+")
         self.preview_canvas.bind("<Leave>", self._on_canvas_hover_leave)
 
         # ---- 0. 도안 파일 (기본 흐름: 파일 하나 고르면 바로 칼선 작업 시작) --------
@@ -2050,15 +2221,15 @@ class CutLineApp(ctk.CTk):
         file_row = ctk.CTkFrame(sec1, fg_color="transparent")
         file_row.pack(fill="x", pady=(8, 4))
         ctk.CTkEntry(
-            file_row, textvariable=self.input_path, font=self.font_body, corner_radius=12,
-            border_width=1, border_color=BORDER, fg_color="#FFFFFF", height=34,
+            file_row, textvariable=self.input_path, font=self.font_body, corner_radius=17,
+            border_width=1, border_color=BORDER, fg_color=CONTROL_FILL, height=34,
         ).pack(side="left", fill="x", expand=True)
         self._btn_secondary(file_row, "찾아보기", self._choose_file).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
             sec1,
             text="AI는 원본 그대로 추출 · PNG/JPG도 가능",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
-            wraplength=330,
+            wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x")
 
         # ---- 2. 작업 해상도 ------------------------------------------------------
@@ -2084,7 +2255,7 @@ class CutLineApp(ctk.CTk):
 
         ctk.CTkComboBox(
             precision_row, values=["1", "2", "3", "4"], variable=precision_display,
-            command=_on_precision_selected, width=70, height=30, corner_radius=12,
+            command=_on_precision_selected, width=70, height=30, corner_radius=15,
             border_width=1, border_color=BORDER, button_color=ACCENT,
             button_hover_color=ACCENT_HOVER, dropdown_hover_color=ACCENT_SOFT,
             font=self.font_body, state="readonly",
@@ -2099,13 +2270,13 @@ class CutLineApp(ctk.CTk):
         ctk.CTkLabel(
             sec2, text="클수록 정밀하지만 느려집니다 (기본 4)",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
-            wraplength=330,
+            wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(3, 0))
         ctk.CTkLabel(
             sec2,
             text="너무 크면 속도 보호로 자동 조정될 수 있음",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
-            wraplength=330,
+            wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(4, 0))
 
         # ---- 0. 도무송 여부 -------------------------------------------------------
@@ -2144,7 +2315,7 @@ class CutLineApp(ctk.CTk):
             sec0,
             text="도무송 선택 후, 도안에 맞는 칼선 무테/유테/아웃라인으로 선택 작업합니다",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
-            wraplength=330,
+            wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(6, 0))
 
         # ---- 작업 종류 (칼선 기준) --------------------------------------------------
@@ -2262,18 +2433,19 @@ class CutLineApp(ctk.CTk):
             ),
             allow_clear=True,
         ).pack(fill="x", pady=(2, 0))
-        ctk.CTkCheckBox(
+        # 2026-09-29: 체크박스 글이 길어 카드 오른쪽 밖으로 잘려 보였음 -> 줄바꿈(_wrap_checkbox)
+        self._wrap_checkbox(ctk.CTkCheckBox(
             sec6, text="유색/복잡한 배경에서도 자동 분리 (GrabCut)", variable=self.use_grabcut,
             font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-        ).pack(anchor="w", pady=(6, 0))
+        )).pack(anchor="w", pady=(6, 0))
         # 2026-09-07 피드백("도무송과 무테를 동시에 선택할 수 있게 다중선택
         # 기능을 만들고"): 도무송 도형 칼선과, 같은 영역의 무테(사각형)
         # 칼선을 한 번에 함께 추가하는 다중선택 체크박스.
-        ctk.CTkCheckBox(
+        self._wrap_checkbox(ctk.CTkCheckBox(
             sec6, text="같은 영역에 무테 칼선도 함께 추가 (도무송+무테 동시 적용)",
             variable=self.domusong_also_borderless,
             font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-        ).pack(anchor="w", pady=(6, 0))
+        )).pack(anchor="w", pady=(6, 0))
 
         # ---- 오프셋 간격 (조각 스티커/도무송) ---------------------------------------
         sec4 = self._section(
@@ -2297,10 +2469,11 @@ class CutLineApp(ctk.CTk):
         # 고르므로(위 sec3), 여기 있던 별도의 유테/무테 하위 선택 콤보박스는
         # 없앰 -- 간격(mm) 값 하나만 남김.
         sec5 = self._section(
-            left_col, "유테/무테 간격", "무테/유테 선택 시에만 적용"
+            left_col, "유테/무테 간격", "무테/유테 선택 시에만 · 기본 1.2mm"
         )
+        # 2026-09-29: 단위 칸의 "(기본 1.2)"가 카드 밖으로 잘려 보였음 -> 설명 줄로 옮김
         self._make_number_field(
-            sec5, "유테/무테 간격", self.style_margin_mm, unit="mm (기본 1.2)",
+            sec5, "간격", self.style_margin_mm, unit="mm",
             from_=0.1, to=20.0, increment=0.1,
         )
 
@@ -2338,12 +2511,12 @@ class CutLineApp(ctk.CTk):
 
         # ---- 상태 메시지 카드 --------------------------------------------------------
         status_card = ctk.CTkFrame(
-            left_col, fg_color=BG_CARD, corner_radius=14, border_width=1, border_color=BORDER
+            left_col, fg_color=BG_CARD, corner_radius=18, border_width=1, border_color=BORDER
         )
-        status_card.pack(fill="x", pady=(0, 4), padx=2)
+        status_card.pack(fill="x", pady=(0, 4), padx=(2, 6))
         ctk.CTkLabel(
-            status_card, textvariable=self.status, font=self.font_caption,
-            text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=310,
+            status_card, textvariable=self.status_detail, font=self.font_caption,
+            text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", padx=16, pady=12)
 
     # ------------------------------------------------------------------
@@ -2602,7 +2775,7 @@ class CutLineApp(ctk.CTk):
         else:
             self.preview_canvas.configure(cursor="")
             self.pan_mode_btn.configure(
-                fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+                fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
                 border_width=1, border_color=BORDER,
             )
             self.status.set("선택 모드로 돌아왔습니다 -- 캔버스에서 드래그하면 영역을 선택합니다.")
@@ -2832,8 +3005,8 @@ class CutLineApp(ctk.CTk):
         self._hint_fg_btn.pack(side="left")
         self._hint_bg_btn = ctk.CTkButton(
             mode_row, text="🔴 배경 점", font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=110, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=110, height=28,
             command=lambda: self._set_hint_label("bg"),
         )
         self._hint_bg_btn.pack(side="left", padx=(8, 0))
@@ -2842,8 +3015,8 @@ class CutLineApp(ctk.CTk):
         action_row.pack(fill="x", padx=18, pady=(0, 8))
         ctk.CTkButton(
             action_row, text="초기화", font=self.font_caption,
-            fg_color="transparent", hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
-            border_width=1, border_color=BORDER, corner_radius=8, width=90, height=28,
+            fg_color=BG_CARD, hover_color=ACCENT_SOFT, text_color=TEXT_PRIMARY,
+            border_width=1, border_color=BORDER, corner_radius=14, width=90, height=28,
             command=self._clear_hint_points,
         ).pack(side="left")
 
@@ -4852,16 +5025,53 @@ class CutLineApp(ctk.CTk):
         self.domusong_also_borderless.set(False)
 
         self.preview_canvas.delete("all")
-        self._canvas_placeholder = self.preview_canvas.create_text(
-            10, 10, anchor="nw", text="미리보기가 여기에 표시됩니다", fill=TEXT_SECONDARY,
-            font=self.font_canvas,
-        )
+        self._draw_canvas_placeholder()
         self._preview_photo = None
         self._display_scale = 1.0
 
         self.generate_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
         self.status.set("화면을 초기화했습니다. 도안 파일을 다시 선택하세요.")
+        # 2026-09-29: 초기화 뒤에는 왼쪽 패널을 맨 위("도안 파일")로 -- 스크롤이 아래에
+        # 남아 있으면 무엇부터 해야 할지 안 보였다(PC에서 확인).
+        try:
+            self._left_col._parent_canvas.yview_moveto(0.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _add_dialog_lines(self, wrap, lines):
+        """대화상자 본문 줄들("1. ...", "2. ..."). 2026-09-29: 줄이 많거나 화면이 작으면
+        대화상자가 화면 밖으로 넘쳐 아래 버튼이 가려졌다 -> 화면 높이의 45%를 넘으면
+        스크롤 영역에 담아 버튼이 항상 보이게 한다."""
+        sc = self._glass_scale()
+        try:
+            max_h = int(self.winfo_screenheight() * 0.45 / sc)
+        except Exception:  # noqa: BLE001
+            max_h = 360
+
+        def _fill(parent, wraplength):
+            for i, line in enumerate(lines, start=1):
+                ctk.CTkLabel(
+                    parent, text=f"{i}. {line}", font=self.font_note, text_color=TEXT_PRIMARY,
+                    anchor="w", justify="left", wraplength=wraplength,
+                ).pack(fill="x", pady=(0, 4))
+
+        holder = ctk.CTkFrame(wrap, fg_color="transparent")
+        holder.pack(fill="x", padx=18)
+        _fill(holder, 380)
+        try:
+            holder.update_idletasks()
+            too_tall = holder.winfo_reqheight() > max_h * sc
+        except Exception:  # noqa: BLE001
+            too_tall = False
+        if too_tall:
+            holder.destroy()
+            area = ctk.CTkScrollableFrame(
+                wrap, fg_color="transparent", height=max_h, width=392,
+                scrollbar_button_color=SCROLL_BTN, scrollbar_button_hover_color=SCROLL_BTN_HOVER,
+            )
+            area.pack(fill="x", padx=(18, 8))
+            _fill(area, 370)
 
     def _show_note_dialog(self, heading, lines, kind="info"):
         """오류/경고 등 "설명"을 보여주는 자체 대화상자.
@@ -4904,11 +5114,7 @@ class CutLineApp(ctk.CTk):
             anchor="w", justify="left", wraplength=380,
         ).pack(fill="x", padx=18, pady=(16, 8))
 
-        for i, line in enumerate(lines, start=1):
-            ctk.CTkLabel(
-                wrap, text=f"{i}. {line}", font=self.font_note, text_color=TEXT_PRIMARY,
-                anchor="w", justify="left", wraplength=380,
-            ).pack(fill="x", padx=18, pady=(0, 4))
+        self._add_dialog_lines(wrap, lines)
 
         self._btn_primary(wrap, "확인", dialog.destroy).pack(fill="x", padx=18, pady=(12, 16))
 
@@ -5072,11 +5278,7 @@ class CutLineApp(ctk.CTk):
             anchor="w", justify="left", wraplength=380,
         ).pack(fill="x", padx=18, pady=(16, 8))
 
-        for i, line in enumerate(lines, start=1):
-            ctk.CTkLabel(
-                wrap, text=f"{i}. {line}", font=self.font_note, text_color=TEXT_PRIMARY,
-                anchor="w", justify="left", wraplength=380,
-            ).pack(fill="x", padx=18, pady=(0, 4))
+        self._add_dialog_lines(wrap, lines)
 
         btn_row = ctk.CTkFrame(wrap, fg_color="transparent")
         btn_row.pack(fill="x", padx=18, pady=(12, 16))
