@@ -69,7 +69,7 @@ try {
         Set-ItemProperty -Path $Reg -Name NoRepair -Value 1 -Type DWord
     }
 
-    $r = Show-Msg "설치가 끝났습니다 (버전 $Version).`n`n바탕화면의 '컷라인 스튜디오'로 실행하고, 처음 실행할 때 받은 라이선스 키를 입력해주세요.`n`n지금 실행할까요?" 'YesNo' 'Information'
+    $r = Show-Msg "설치가 끝났습니다 (버전 $Version).`n`n바탕화면의 '컷라인 스튜디오'로 실행하고, 처음 실행할 때 받은 베타 코드(또는 라이선스 키)를 입력해주세요.`n`n지금 실행할까요?" 'YesNo' 'Information'
     if ($r -eq 'Yes') { Start-Process -FilePath $Exe -WorkingDirectory $Dest }
     exit 0
 }

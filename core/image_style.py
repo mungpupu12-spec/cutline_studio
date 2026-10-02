@@ -322,6 +322,32 @@ def _fill_art_pockets_from_background_flood(
     # 중 영역 가장자리에 닿는 조각(= 가장자리까지 이어진 배경)만 떼고 나머지로 판단한다.
     objs = [_trim_edge_extras(o, design, region_edge) for o in objs]
     comp = max(objs, key=lambda o: o.intersection(design).area)
+    # 2026-10-02(멍푸 실제 사용 -- 흰 종이 테두리 스티커 시트): 아래쪽 절반이 흰 이불인 타원
+    # 스티커를 GrabCut이 남색 밤하늘 부분만 잡아, 칼선이 이불 위를 가로질렀다. 단색 배경 위에
+    # 흰 테두리로 둘러싸인 스티커면 "배경이 아닌 덩어리"가 곧 스티커 모양이다 -- 옆 스티커와
+    # 테두리가 맞닿아 같이 잡혀도 칼선은 스티커마다 따로 돈다(_white_ring_cut).
+    try:
+        if (
+            comp.intersection(design).area > 0.5 * design.area
+            and comp.area <= 6.0 * design.area
+            and _white_ring_width_px(image_path, comp, dpi) > 0
+        ):
+            # 테두리가 맞닿은 *옆 요소*(따로 인식된 스티커)까지 끌어오면 두 칼선이 하나로 합쳐진다
+            # (실제 파일 확인) -- 실루엣에 없던 옆 요소 영역을 가져오게 되면 쓰지 않는다.
+            brings_sibling = False
+            for b in sibling_boxes_px or []:
+                bb = shapely_box(*b)
+                got = comp.intersection(bb).area
+                if bb.area > 0 and got > 0.1 * bb.area and design.intersection(bb).area < 0.5 * got:
+                    brings_sibling = True
+                    break
+            # GrabCut 실루엣은 맞닿은 두 스티커 사이 배경 틈까지 메워 잡기도 해서(실측), 덩어리
+            # 자체(배경이 아닌 곳 전부 = 스티커 모양 그대로)를 쓴다.
+            cand = comp.buffer(0)
+            if not brings_sibling and _edge_frac(cand) - base_edge <= 0.03:
+                return cand
+    except Exception:  # noqa: BLE001
+        pass
     reach = 4.0 * dpi / 25.4
     if comp.intersection(design).area > 0.6 * design.area and (
         comp.area <= 1.8 * design.area
@@ -508,6 +534,191 @@ def _light_border_band_width_px(image_path: str, design, dpi: float, tol: float 
     return w
 
 
+def _white_ring_measure(image_path: str, design, dpi: float, tol: float = 10.0):
+    """흰 테두리(종이 여백) 스티커이면 (테두리 두께 px, 그림 몸통 도형), 아니면 (0.0, None).
+
+    테두리 두께 = 실루엣 가장자리에서 그림(흰 종이색이 아닌 곳)까지 거리의 중앙값. 가장자리에서
+    6mm 안에 그림이 보이는 곳이 둘레의 30% 이상일 때만(그런 곳들로만) 잰다.
+
+    2026-10-02(멍푸 실제 사용 -- 흰 테두리 스티커 시트, 표시해 줌): 아래쪽 절반이 흰 이불인
+    타원 스티커는 흰 그림이 흰 테두리와 이어져 띠 판정이 0이 되어 칼선이 스티커 외곽에
+    붙었고, 캐릭터 두 다리 사이 흰 틈으로는 칼선이 파고들었다. 원본 손 칼선(72개)은 그림에서
+    약 1mm 바깥, 스티커 외곽에서는 고른 깊이로 돈다."""
+    if design is None or design.is_empty:
+        return 0.0, None
+    img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return 0.0, None
+    H, W = img.shape[:2]
+    px = dpi / 25.4
+    x0, y0, x1, y1 = [int(v) for v in design.bounds]
+    pad = int(2.0 * px) + 4
+    bx0, by0, bx1, by1 = max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad)
+    if bx1 - bx0 < 16 or by1 - by0 < 16:
+        return 0.0, None
+    lab = cv2.cvtColor(cv2.GaussianBlur(img[by0:by1, bx0:bx1], (3, 3), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    def _mask(geom):
+        m = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+        for p in (geom.geoms if hasattr(geom, "geoms") else [geom]):
+            if p.is_empty or p.geom_type != "Polygon":
+                continue
+            cv2.fillPoly(m, [np.int32([(x - bx0, y - by0) for x, y in p.exterior.coords])], 255)
+        return m > 0
+
+    rim = _mask(design.buffer(-0.3 * px)) & ~_mask(design.buffer(-0.8 * px))
+    if rim.sum() < 30:
+        return 0.0, None
+    c_e = np.median(lab[rim], axis=0)
+    # 흰 종이색(밝고 무채색)만 -- 크림색 번짐 띠는 기존 띠 방식(_band_uniform_cut)으로
+    if c_e[0] < 225 or abs(c_e[1] - 128) > 8 or abs(c_e[2] - 128) > 8:
+        return 0.0, None
+    white = np.linalg.norm(lab - c_e, axis=2) <= tol
+    if white[rim].mean() < 0.6:
+        return 0.0, None
+    # 바깥 배경이 흰 종이와 뚜렷이 달라야 "배경 위 흰 테두리 스티커"다(연회색 바탕 위 흰 쪽지
+    # 그림 같은 흰 그림 자체는 아님 -- 2026-10-02 실제 파일에서 확인).
+    outside = _mask(design.buffer(1.5 * px)) & ~_mask(design.buffer(0.5 * px))
+    if outside.sum() < 30:
+        return 0.0, None
+    c_bg = np.median(lab[outside], axis=0)
+    if np.linalg.norm(c_bg - c_e) < 30.0:
+        return 0.0, None
+    core = (_mask(design.buffer(-0.5 * px)) & ~white).astype(np.uint8)
+    core = cv2.morphologyEx(core, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    if core.sum() < 50:
+        return 0.0, None
+    dist = cv2.distanceTransform((core == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    samples = []
+    for p in (design.geoms if hasattr(design, "geoms") else [design]):
+        if p.is_empty or p.geom_type != "Polygon":
+            continue
+        c = np.asarray(p.exterior.coords, float)
+        seg = np.linalg.norm(np.diff(c, axis=0), axis=1)
+        s_cum = np.concatenate([[0.0], np.cumsum(seg)])
+        if s_cum[-1] <= 0:
+            continue
+        n = max(16, int(s_cum[-1] / 3.0))
+        tq = np.linspace(0.0, s_cum[-1], n, endpoint=False)
+        samples.append(np.stack([np.interp(tq, s_cum, c[:, 0]), np.interp(tq, s_cum, c[:, 1])], axis=1))
+    if not samples:
+        return 0.0, None
+    sp = np.vstack(samples)
+    xi = np.clip(np.round(sp[:, 0]).astype(int) - bx0, 0, bx1 - bx0 - 1)
+    yi = np.clip(np.round(sp[:, 1]).astype(int) - by0, 0, by1 - by0 - 1)
+    all_t = dist[yi, xi].astype(float)
+    n_all = len(all_t)
+    ts = all_t[all_t <= 6.0 * px]
+    if n_all == 0 or len(ts) < 0.3 * n_all:
+        return 0.0, None
+    # 테두리 두께가 고른지(가운데 절반이 중앙값의 0.5~1.6배 안) -- 흰 그림 가운데에만 무늬가
+    # 있는 경우(두께가 들쭉날쭉)는 흰 테두리 스티커가 아님
+    q25, q50, q75 = np.percentile(ts, [25, 50, 75])
+    if q50 <= 0 or q25 < 0.5 * q50 or q75 > 1.6 * q50:
+        return 0.0, None
+    cs, _ = cv2.findContours(core * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in cs:
+        if len(c) >= 3 and cv2.contourArea(c) >= 4.0:
+            q = Polygon([(float(v[0][0]) + bx0, float(v[0][1]) + by0) for v in c]).buffer(0)
+            if not q.is_empty:
+                polys.append(q)
+    core_poly = unary_union(polys) if polys else None
+    return float(np.median(ts)), core_poly
+
+
+def _white_ring_blob_for_selection(image_path: str, selection_px, sibling_boxes_px=None, art_region_px=None,
+                                   dpi: float = 300.0):
+    """선택 박스의 요소가 단색 배경 위 흰 종이 테두리 스티커이면 그 스티커 모양(배경 채우기로 구한
+    "배경이 아닌 덩어리"), 아니면 None. 옆 요소(따로 인식된 스티커)를 끌어오거나 칸 가장자리에
+    닿는 덩어리는 쓰지 않는다."""
+    from .multi_design import detect_elements_by_background_flood_px
+
+    try:
+        x0, y0, x1, y1 = [float(v) for v in selection_px]
+        img = _image_cache.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        m = max(20.0, 0.08 * min(x1 - x0, y1 - y0))
+        if art_region_px is not None:
+            region = tuple(float(v) for v in art_region_px)
+        else:
+            region = (max(0.0, x0 - m), max(0.0, y0 - m), min(float(w), x1 + m), min(float(h), y1 + m))
+        objs = detect_elements_by_background_flood_px(image_path, region)
+        if not objs:
+            return None
+        rect = shapely_box(x0, y0, x1, y1)
+        comp = max(objs, key=lambda o: o.intersection(rect).area)
+        inter = comp.intersection(rect).area
+        if inter < 0.3 * rect.area or inter < 0.6 * comp.area:
+            return None
+        if comp.geom_type != "Polygon":
+            return None
+        # 칸 가장자리까지 이어진 배경 띠를 막는 기준 -- 스티커를 칸에 꽉 채워 붙인 시트는 외곽이 칸
+        # 경계에 조금 닿는다(실측 둘레의 약 9%). 흰 테두리 판정이 따로 있으므로 12%까지 둔다.
+        edge = shapely_box(*region).exterior.buffer(3.0)
+        if comp.exterior.intersection(edge).length > 0.12 * comp.exterior.length:
+            return None
+        for b in sibling_boxes_px or []:
+            bb = shapely_box(*b)
+            got = comp.intersection(bb).area
+            if bb.area > 0 and got > 0.1 * bb.area and rect.intersection(bb).area < 0.5 * got:
+                return None
+        if _white_ring_width_px(image_path, comp, dpi) <= 0:
+            return None
+        return comp.buffer(0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _white_ring_width_px(image_path: str, design, dpi: float) -> float:
+    return _white_ring_measure(image_path, design, dpi)[0]
+
+
+def _white_ring_cut(image_path: str, design, dpi: float):
+    """흰 테두리 스티커의 칼선: 스티커 외곽에서 (테두리 두께 - 1mm)만큼 고르게 안쪽, 단 그림에서
+    1mm(테두리 절반을 넘지 않게) 안으로는 들어가지 않음. 흰 테두리가 아니면 None.
+
+    외곽을 따라 고른 깊이로 돌기 때문에 그림 사이 흰 틈(다리 사이 등)으로 파고들지 않고, 흰
+    그림이 테두리와 이어진 곳(흰 이불)도 외곽과 같은 깊이로 지나간다. 서로 테두리가 맞닿은 두
+    스티커도 각자 외곽에서 같은 깊이만큼 들어가 칼선이 떨어진다."""
+    if design is None or design.is_empty:
+        return None
+    px = dpi / 25.4
+    t, core = _white_ring_measure(image_path, design, dpi)
+    if t <= 0:
+        return None
+    d = min(1.0 * px, max(0.3 * px, 0.5 * t))
+    inside = design.buffer(-0.25 * px, join_style=1)
+    outer_in = design.buffer(-max(0.3 * px, t - d), join_style=1)
+    # 테두리끼리 맞닿은 두 스티커 사이에 남는 가는 뿔(0.75mm 미만 폭)은 없앤다
+    r = 0.75 * px
+    outer_in = outer_in.buffer(-r, join_style=1).buffer(r, join_style=1)
+    parts = [outer_in]
+    if core is not None and not core.is_empty:
+        parts.append(core.buffer(d, join_style=1))
+    line = unary_union(parts).intersection(inside)
+    # 0.3mm보다 가는 뾰족한 끝·잔부스러기 정리(칼로 못 따라감)
+    r = 0.3 * px
+    line = line.buffer(-r, join_style=1).buffer(r, join_style=1)
+    line = _drop_tiny_parts(line)
+    if line is None or line.is_empty:
+        return None
+    # 테두리가 겹쳐 맞닿은 두 스티커는 칼선이 1.2mm 미만 목으로 이어질 수 있다 -- 목에서 끊어
+    # 스티커마다 따로(흰 테두리 스티커 외곽은 그림보다 테두리 두께만큼 넓어 이런 가는 목은
+    # 한 스티커 안에서는 생기지 않는다).
+    try:
+        from .cut_split import split_narrow_necks
+
+        pieces = split_narrow_necks(line, dpi, neck_mm=1.2)
+        if len(pieces) > len([g for g in getattr(line, "geoms", [line]) if g.geom_type == "Polygon"]):
+            line = MultiPolygon([q for q in pieces if q.geom_type == "Polygon" and not q.is_empty])
+    except Exception:  # noqa: BLE001
+        pass
+    return line
+
+
 def _band_core_px(image_path: str, design, dpi: float, tol: float = 8.0):
     """테두리 띠를 뺀 요소 몸통(그림 본체) 도형. 못 구하면 None.
 
@@ -611,6 +822,7 @@ def _borderless_inward_from_silhouette(
     줄이면 사라질 만큼 가는 요소(선 장식 등)는 배경을 자르지 않도록 칼선을
     만들지 않고(빈 도형) 알린다. GrabCut 자체가 실패하면 None(기존 경로로)."""
     rect = _rect_from_bounds(selection_px)
+    blob = None
     if precomputed_content_px is not None:
         design = precomputed_content_px
         if note_sink is not None:
@@ -618,21 +830,34 @@ def _borderless_inward_from_silhouette(
                 "사람이 직접 확인/보정한 실루엣(트라이맵 힌트)을 기준으로 안쪽으로 줄였습니다."
             )
     else:
-        try:
-            design = segment_design_in_region(
-                image_path, selection_px, margin_px=grabcut_margin_px,
-                supersample=supersample, note_sink=note_sink,
+        # 2026-10-02(멍푸: "칼선 속도 5초이내로"): 단색 배경 위 흰 종이 테두리 스티커는 배경
+        # 채우기로 구한 덩어리가 곧 스티커 모양이라(아래 _fill_art_pockets_from_background_flood도
+        # 결국 그 덩어리를 쓴다) 가장 느린 GrabCut(요소당 약 0.4초)을 건너뛴다.
+        blob = _white_ring_blob_for_selection(image_path, selection_px, sibling_boxes_px, art_region_px, dpi)
+        if blob is not None:
+            design = blob
+        else:
+            try:
+                design = segment_design_in_region(
+                    image_path, selection_px, margin_px=grabcut_margin_px,
+                    supersample=supersample, note_sink=note_sink,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            design = _drop_sibling_spillover_fragments(design, sibling_boxes_px)
+            design = _grow_design_into_low_contrast_halo_px(
+                image_path, design, note_sink=note_sink, sibling_boxes_px=sibling_boxes_px,
+                own_box_px=selection_px,
             )
-        except Exception:  # noqa: BLE001
-            return None
-        design = _drop_sibling_spillover_fragments(design, sibling_boxes_px)
-        design = _grow_design_into_low_contrast_halo_px(
-            image_path, design, note_sink=note_sink, sibling_boxes_px=sibling_boxes_px,
-            own_box_px=selection_px,
-        )
     if design is None or design.is_empty:
         return None
-    if precomputed_content_px is None:
+    if blob is not None:
+        bx = blob.bounds
+        rb = rect.bounds
+        rect = _rect_from_bounds((min(bx[0], rb[0]), min(bx[1], rb[1]), max(bx[2], rb[2]), max(bx[3], rb[3])))
+        if art_region_px is not None:
+            rect = rect.intersection(_rect_from_bounds(art_region_px))
+    if precomputed_content_px is None and blob is None:
         filled = _fill_art_pockets_from_background_flood(
             image_path, design, selection_px, sibling_boxes_px, art_region_px, dpi
         )
@@ -662,17 +887,23 @@ def _borderless_inward_from_silhouette(
             )
         return rect.buffer(-inset_px, join_style=2)
     pieces = None
+    piece_note = ""
     if precomputed_content_px is None:
-        pieces = _split_touching_flat_art(image_path, design, selection_px, art_region_px, dpi)
+        # 흰 종이 테두리 스티커는 한 장으로 자른다(타원 안 남색 밤하늘과 흰 이불을 "맞닿은 단색
+        # 그림"으로 보고 둘로 나눠, 칼선이 이불 위를 가로질렀다 -- 2026-10-02 실제 파일).
+        if _white_ring_width_px(image_path, design, dpi) <= 0:
+            pieces = _split_touching_flat_art(image_path, design, selection_px, art_region_px, dpi)
+        if pieces:
+            piece_note = (
+                f"무테 칼선: 서로 맞닿게 그린 단색 그림 {len(pieces)}개(잎·꽃 등)를 "
+                "요소마다 따로 그림 안쪽으로 줄였습니다."
+            )
     if pieces:
         lines = [_inward_line_for_design(image_path, p, inset_px, dpi) for p in pieces]
         lines = [ln for ln in lines if ln is not None and not ln.is_empty]
         line = unary_union(lines) if lines else None
         if line is not None and not line.is_empty and note_sink is not None:
-            note_sink.append(
-                f"무테 칼선: 서로 맞닿게 그린 단색 그림 {len(pieces)}개(잎·꽃 등)를 "
-                "요소마다 따로 그림 안쪽으로 줄였습니다."
-            )
+            note_sink.append(piece_note)
     else:
         line = _inward_line_for_design(image_path, design, inset_px, dpi)
     if line is None or line.is_empty:
@@ -859,6 +1090,20 @@ def _inward_line_for_design(image_path: str, design, inset_px: float, dpi: float
     # 2026-09-29(멍푸 실제 사용 피드백 "너무 좁은 영역"): 요소 가장자리에 밝은 테두리
     # 띠(번짐)가 있으면 칼선을 띠 한가운데에 둔다 -- 띠가 좁은데 1.2mm를 그대로 줄이면
     # 칼선이 그림 몸통에 붙어 버렸다(원본 손 칼선은 몸통 약 0.5~1mm 바깥, 띠 안).
+    # 2026-10-02: 흰 종이 테두리 스티커는 테두리 두께 기준으로 고르게(_white_ring_cut 참고).
+    # 떨어진 조각(스티커) 여러 개면 조각마다 따로 판단한다(테두리 두께가 서로 다름).
+    polys = [p for p in getattr(design, "geoms", [design]) if p.geom_type == "Polygon" and not p.is_empty]
+    if len(polys) > 1:
+        big = max(q.area for q in polys)
+        polys = [q for q in polys if q.area >= 0.02 * big]
+        if len(polys) > 1:
+            lines = [_inward_line_for_design(image_path, q, inset_px, dpi) for q in polys]
+            lines = [ln for ln in lines if ln is not None and not ln.is_empty]
+            return _drop_tiny_parts(unary_union(lines)) if lines else None
+        design = polys[0]
+    ring_line = _white_ring_cut(image_path, design, dpi)
+    if ring_line is not None and not ring_line.is_empty:
+        return ring_line
     band_w = _light_border_band_width_px(image_path, design, dpi)
     use_inset = inset_px
     if band_w > 0:

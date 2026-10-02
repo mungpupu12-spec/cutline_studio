@@ -5,6 +5,8 @@
 (dist\\컷라인 스튜디오)를 zip 하나로 묶어 넣고 설치 스크립트(install.ps1)가 풀어 준다.
 
 결과: dist\\컷라인스튜디오_베타_설치_<날짜>.exe
+--edition sales(판매용_설치파일_만들기.bat): dist\\컷라인스튜디오_설치_<날짜>.exe -- 프로그램은 같고,
+설치 창 문구·안내 파일·"앱 및 기능" 이름만 판매용(라이선스 키 입력 안내)으로 바뀐다(2026-10-02).
 """
 import datetime
 import hashlib
@@ -42,7 +44,26 @@ def _build_app():
     return r.returncode == 0
 
 
+# 판매용 설치 파일에서 바꾸는 문구(설치 스크립트 원문 -> 판매용)
+_SALES_PS1 = [
+    ("$Title = '컷라인 스튜디오 베타 설치'", "$Title = '컷라인 스튜디오 설치'"),
+    ("'beta_readme.txt'", "'readme.txt'"),
+    ("'베타 테스터 안내.txt'", "'사용 안내.txt'"),
+    ('"$AppName (베타)"', '"$AppName"'),
+    ("받은 베타 코드(또는 라이선스 키)를 입력해주세요.", "구매할 때 받은 라이선스 키를 입력해주세요."),
+]
+
+
+def _edition():
+    if "--edition" in sys.argv:
+        i = sys.argv.index("--edition")
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return "beta"
+
+
 def main():
+    sales = _edition() == "sales"
     if "--build" in sys.argv and not _build_app():
         print("[오류] 프로그램 빌드에 실패했습니다. 위 메시지를 확인해주세요.")
         return 1
@@ -50,7 +71,7 @@ def main():
         print("[오류] 빌드된 프로그램이 없습니다:", os.path.join(APP_DIR, EXE_NAME))
         return 1
     today = datetime.date.today()
-    version = f"beta-{today:%Y%m%d}"
+    version = f"1.0.{today:%Y%m%d}" if sales else f"beta-{today:%Y%m%d}"
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
     os.makedirs(WORK)
@@ -66,14 +87,23 @@ def main():
                 n += 1
     print(f"    파일 {n}개, {os.path.getsize(zpath) / 1e6:.0f}MB")
 
-    _write_text(os.path.join(WORK, "install.ps1"), _read("install.ps1"), bom=True)
+    ps1 = _read("install.ps1")
+    readme_name = "beta_readme.txt"
+    if sales:
+        for a, b in _SALES_PS1:
+            if a not in ps1:
+                print("[오류] 설치 스크립트에서 바꿀 문구를 찾지 못했습니다:", a)
+                return 1
+            ps1 = ps1.replace(a, b)
+        readme_name = "readme.txt"
+    _write_text(os.path.join(WORK, "install.ps1"), ps1, bom=True)
     _write_text(os.path.join(WORK, "uninstall.ps1"), _read("uninstall.ps1"), bom=True)
     _write_text(os.path.join(WORK, "install.cmd"), _read("install.cmd"))
-    _write_text(os.path.join(WORK, "beta_readme.txt"), _read("beta_readme.txt"), bom=True)
+    _write_text(os.path.join(WORK, readme_name), _read("sales_readme.txt" if sales else "beta_readme.txt"), bom=True)
     _write_text(os.path.join(WORK, "version.txt"), version + "\n")
 
     print("2/3 설치 파일을 만드는 중(IExpress, 몇 분 걸릴 수 있음)...")
-    files = ["app.zip", "install.ps1", "uninstall.ps1", "install.cmd", "beta_readme.txt", "version.txt"]
+    files = ["app.zip", "install.ps1", "uninstall.ps1", "install.cmd", readme_name, "version.txt"]
     sed = [
         "[Version]", "Class=IEXPRESS", "SEDVersion=3",
         "[Options]", "PackagePurpose=InstallApp", "ShowInstallProgramWindow=1", "HideExtractAnimation=0",
@@ -84,7 +114,7 @@ def main():
         "AdminQuietInstCmd=%AdminQuietInstCmd%", "UserQuietInstCmd=%UserQuietInstCmd%",
         "SourceFiles=SourceFiles",
         "[Strings]", "InstallPrompt=", "DisplayLicense=", "FinishMessage=",
-        f"TargetName={TMP_TARGET}", "FriendlyName=CutLine Studio Beta Setup",
+        f"TargetName={TMP_TARGET}", "FriendlyName=CutLine Studio " + ("Setup" if sales else "Beta Setup"),
         "AppLaunched=cmd.exe /c install.cmd", "PostInstallCmd=<None>",
         "AdminQuietInstCmd=", "UserQuietInstCmd=",
     ]
@@ -103,7 +133,7 @@ def main():
         return 1
 
     print("3/3 이름 정리...")
-    final = os.path.join(ROOT, "dist", f"컷라인스튜디오_베타_설치_{today:%Y%m%d}.exe")
+    final = os.path.join(ROOT, "dist", f"컷라인스튜디오_{'' if sales else '베타_'}설치_{today:%Y%m%d}.exe")
     if os.path.exists(final):
         os.remove(final)
     os.replace(TMP_TARGET, final)

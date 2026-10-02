@@ -35,6 +35,7 @@ def render_preview(
     original_image_path: str | None = None,
     line_width: int = 3,
     margin_px: int = 40,
+    async_save: bool = False,
 ) -> str:
     canvas_w = result.width_px + margin_px * 2
     canvas_h = result.height_px + margin_px * 2
@@ -59,11 +60,40 @@ def render_preview(
             draw, geom, (margin_px, margin_px), COLORS_RGB[name], line_width
         )
 
-    # 2026-09-30 속도: 화면 표시용 임시 파일이라 압축을 약하게(저장 1.1초 -> 약 0.2초)
-    canvas.save(out_path, compress_level=1)
     _LAST_RENDERED.clear()
     _LAST_RENDERED[out_path] = canvas
+    # 2026-09-30 속도: 화면 표시용 임시 파일이라 압축을 약하게(저장 1.1초 -> 약 0.2초)
+    # 2026-10-02 속도(멍푸: "칼선 속도 5초이내로"): 큰 시트는 그래도 약 0.8초 -- 화면은 메모리의
+    # 그림(open_rendered)을 쓰므로 파일은 뒤에서 쓴다(같은 파일을 다시 그리면 마지막 것만 남음).
+    if async_save:
+        _save_async(canvas, out_path)
+    else:
+        canvas.save(out_path, compress_level=1)
     return out_path
+
+
+import threading as _threading
+
+_SAVE_LOCK = _threading.Lock()
+
+
+def _save_async(img, out_path):
+    def _run():
+        with _SAVE_LOCK:
+            if _LAST_RENDERED.get(out_path) is not img:
+                return  # 그새 더 새 그림이 그려짐
+            try:
+                img.save(out_path, compress_level=1)
+            except Exception:  # noqa: BLE001
+                pass
+
+    _threading.Thread(target=_run, daemon=True).start()
+
+
+def wait_saved():
+    """뒤에서 쓰던 미리보기 파일 저장이 끝날 때까지(시험·종료용)."""
+    with _SAVE_LOCK:
+        pass
 
 
 # 방금 그린 미리보기(파일로도 저장했지만, 화면에 띄울 때 다시 읽지 않도록 메모리에 하나 보관)

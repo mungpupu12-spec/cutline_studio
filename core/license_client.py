@@ -271,6 +271,38 @@ def reactivate(license_key: str, reactivation_code: str) -> LicenseResult:
     return LicenseResult(True, "valid", "", payload)
 
 
+def claim_beta(invite_code: str) -> LicenseResult:
+    """2026-09-30(멍푸: "다운로드 받는 사람 수에 자동으로 1대 1명"): 모든 베타 테스터에게 같은
+    "베타 코드"를 알려주면, 처음 실행할 때 그 코드를 넣은 컴퓨터 전용 라이선스(1대, 만료 없음)를
+    서버가 자동으로 만들어 준다(서버 /beta/claim). 같은 컴퓨터에서 다시 넣으면 전에 받은 키를
+    그대로 돌려받는다. 받은 키는 보통 라이선스처럼 저장돼 다음 실행부터는 입력 없이 확인된다."""
+    code = (invite_code or "").strip()
+    if not code:
+        return LicenseResult(False, "invalid_code", "베타 코드를 입력해주세요.")
+    resp = _post_with_wake_retry(
+        "/beta/claim",
+        {"invite_code": code, "device_fingerprint": get_device_fingerprint(), "device_name": get_device_name()},
+    )
+    if resp is None:
+        return LicenseResult(False, "network_error", "라이선스 서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.")
+    if resp.status_code == 404:
+        return LicenseResult(False, "beta_unavailable", "지금은 베타 코드로 발급받을 수 없습니다. 발급처에 문의해주세요.")
+    try:
+        data = resp.json()
+    except ValueError:
+        return LicenseResult(False, "network_error", "라이선스 서버 응답을 읽을 수 없습니다. 잠시 후 다시 시도해주세요.")
+    if not data.get("ok"):
+        return LicenseResult(False, data.get("reason", "invalid_code"), data.get("message", "베타 코드가 올바르지 않습니다."))
+    _save_cache(data["license_key"], data["token"])
+    payload = _verify_token(data["token"])
+    return LicenseResult(True, "valid", "", payload)
+
+
+def looks_like_license_key(text: str) -> bool:
+    """입력칸 하나로 라이선스 키와 베타 코드를 함께 받기 위한 구분(키는 CLS-로 시작)."""
+    return (text or "").strip().upper().startswith("CLS-")
+
+
 def report_error(error_type: str, message: str, traceback_str: str = "", context: str = "") -> bool:
     """2026-09-12(56차) 피드백("발생한 오류를 프로그램이 자동적으로 나한테
     전달하는 게 필요해"): 예외가 발생한 곳(주로 gui.app의 각 except 블록)에서

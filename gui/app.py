@@ -101,6 +101,7 @@ from core.preview import render_preview
 from core.accumulate import combine_results
 from core import license_client as lic
 from core import glass_theme
+from gui.path_editor import PathEditorMixin
 
 try:
     from PIL import Image, ImageTk
@@ -480,7 +481,7 @@ ctk.set_default_color_theme("blue")
 
 
 
-class CutLineApp(ctk.CTk):
+class CutLineApp(PathEditorMixin, ctk.CTk):
     def __init__(self):
         super().__init__()
         # 2026-08-31 피드백("검정 화면이 또 뜨고 없애면 모든 창이 꺼져"):
@@ -686,6 +687,8 @@ class CutLineApp(ctk.CTk):
         # 영역 드래그-선택 모드로 돌아간다 -- _on_canvas_press/_drag/_release
         # 에서 이 값에 따라 분기.
         self._pan_mode = False
+        # 2026-10-02: 칼선 수정(어도비 패스처럼) 모드 상태 -- gui/path_editor.py
+        self._pe_init_state()
         self._selection_canvas_rect = None  # (x0,y0,x1,y1) in CANVAS px, while dragging
         self._selection_px = None  # (x0,y0,x1,y1) in ORIGINAL IMAGE px, once released
         # 2026-09-07 피드백: .ai 파일 안에 작가 본인이 이미 그려 놓은 진짜
@@ -729,6 +732,7 @@ class CutLineApp(ctk.CTk):
         # None을 돌려받아 화면을 멈추지 않고(잠깐 미리보기만 안 뜸), 백그라운드
         # 스레드(blocking=True)만 실제로 계산이 끝날 때까지 기다린다.
         self._design_boxes_locks = {}  # (path, mtime) -> threading.Lock
+        self._design_boxes_futures = {}  # (path, mtime) -> 작업 프로세스 Future(2026-10-02)
         self._design_boxes_locks_guard = threading.Lock()
 
         # 2026-09-10(35/36차 이어서) 피드백("도무송, 무테 동시 다중 선택하고
@@ -1085,8 +1089,10 @@ class CutLineApp(ctk.CTk):
             inner, text=title_text, font=self.font_section, text_color=TEXT_PRIMARY, anchor="w",
         ).pack(fill="x", pady=(0, 6))
 
+        is_locked = result.state == "locked"
+        default_msg = "받은 라이선스 키 또는 베타 코드를 입력해주세요."
         status_label = ctk.CTkLabel(
-            inner, text=result.message or "라이선스 키를 입력해주세요.", font=self.font_body,
+            inner, text=result.message or default_msg, font=self.font_body,
             text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=310,
         )
         status_label.pack(fill="x", pady=(0, 14))
@@ -1094,7 +1100,10 @@ class CutLineApp(ctk.CTk):
         # 2026-08-27 피드백: "가로 길이를 조금 넓이고" -- 입력창/버튼 모두
         # 이 inner 프레임 폭을 기준으로 채워지므로(pack fill="x"), 입력창
         # 폭을 340 -> 400으로 넓히면 버튼 가로 길이도 함께 넓어짐.
-        ctk.CTkLabel(inner, text="라이선스 키", font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w").pack(fill="x")
+        # 2026-09-30(베타 자동 발급): 잠긴 경우가 아니면 한 칸에 라이선스 키(CLS-로 시작) 또는 베타
+        # 코드를 넣는다 -- 베타 코드면 서버가 이 컴퓨터 전용 키를 만들어 준다(core.license_client.claim_beta).
+        key_label = "라이선스 키" if is_locked else "라이선스 키 또는 베타 코드"
+        ctk.CTkLabel(inner, text=key_label, font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w").pack(fill="x")
         key_var = tk.StringVar(value=lic.get_cached_license_key())
         key_entry = ctk.CTkEntry(inner, textvariable=key_var, width=400, height=36, corner_radius=10)
         key_entry.pack(fill="x", pady=(2, 12))
@@ -1112,7 +1121,8 @@ class CutLineApp(ctk.CTk):
             key = key_var.get().strip()
             code = code_var.get().strip()
             if not key:
-                status_label.configure(text="라이선스 키를 입력해주세요.", text_color=COLOR_CUT)
+                status_label.configure(text=default_msg if not is_locked else "라이선스 키를 입력해주세요.",
+                                       text_color=COLOR_CUT)
                 return
             # 2026-08-27 피드백: 서버 확인이 몇 초 걸리는 동안 버튼을 눌러도
             # 아무 반응이 없는 것처럼 보였음. 클릭 즉시 상태 문구를 바꾸고
@@ -1123,6 +1133,8 @@ class CutLineApp(ctk.CTk):
             self.update_idletasks()
             if code:
                 r = lic.reactivate(key, code)
+            elif not is_locked and not lic.looks_like_license_key(key):
+                r = lic.claim_beta(key)
             else:
                 r = lic.activate(key)
             if r.ok:
@@ -1951,6 +1963,13 @@ class CutLineApp(ctk.CTk):
             border_width=1, border_color=BORDER, corner_radius=14, width=60, height=28,
         )
         self.pan_mode_btn.pack(side="left", padx=(6, 0))
+        # 2026-10-02(멍푸: "수정 하는 거 너무 어려워, 어도비 패스 기능 같은거로"): 칼선을 기준점·
+        # 핸들로 고치는 모드(gui/path_editor.py).
+        self._pe_build_button(
+            zoom_row, font=self.font_caption, fg_color=BG_CARD, hover_color=ACCENT_SOFT,
+            text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER, corner_radius=14,
+            width=86, height=28,
+        ).pack(side="left", padx=(6, 0))
         # 2026-09-29: 버튼 줄을 먼저 배치하고 제목은 남는 자리에 -- 폭이 좁으면 버튼
         # 대신 제목이 줄어든다(버튼이 잘려 눌리지 않던 문제).
         preview_title.pack(side="left", fill="x", expand=True)
@@ -1958,6 +1977,10 @@ class CutLineApp(ctk.CTk):
         canvas_wrap = ctk.CTkFrame(right_col, fg_color=CANVAS_BG, corner_radius=18,
                                    border_width=1, border_color=BORDER)
         canvas_wrap.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        self._pe_build_toolbar(
+            right_col, canvas_wrap, self.font_caption,
+            (BG_CARD, ACCENT_SOFT, TEXT_PRIMARY, BORDER, ACCENT, ACCENT_HOVER),
+        )
         # 확대(zoom > 100%) 시 이미지가 보이는 영역보다 커질 수 있으므로,
         # 가로/세로 스크롤바를 함께 넣어 어느 부분이든 이동해서 볼 수 있게
         # 한다(2026-09-07 7차 피드백). grid로 배치해야 캔버스 오른쪽/아래에
@@ -2001,6 +2024,7 @@ class CutLineApp(ctk.CTk):
         # 창 크기가 바뀌면 배경(흐린 파스텔 + 유리 판)을 다시 그림 -- 2026-09-29 글래스 디자인
         self.bind("<Configure>", self._schedule_glass_repaint, add="+")
         self.preview_canvas.bind("<Leave>", self._on_canvas_hover_leave)
+        self._pe_bind_keys()
 
         # ---- 0. 도안 파일 (기본 흐름: 파일 하나 고르면 바로 칼선 작업 시작) --------
         # 2026-08-27 피드백: "가이드를 작업 파일로 변경 ... 보통 가이드가
@@ -2113,6 +2137,7 @@ class CutLineApp(ctk.CTk):
         )
         self._yn_no_btn.pack(side="left", fill="x", expand=True)
         self.job_type.trace_add("write", lambda *_: self._refresh_domusong_yn_buttons())
+        self.job_type.trace_add("write", lambda *_: self._maybe_prefetch_auto())
         self._refresh_domusong_yn_buttons()
         # 2026-09-26(같은 날 재요청, 첨부 스크린샷에서 이 설명 문구를 직접
         # 동그라미 치고 "도무송 선택 후, 도안에 맞는 칼선 무테/유테/
@@ -2454,9 +2479,28 @@ class CutLineApp(ctk.CTk):
             # 빠르게 뜨고, 캐시는 그 뒤로도 계속 백그라운드에서 마저 준비돼
             # 첫 마우스 이동 전에 끝날 가능성이 높다(실측 재확인: 순서만
             # 바꿔도 두 동작 모두 그대로 유지됨).
+            if grid_cells:
+                # 2026-10-02 속도: 칸 안 요소 나누기·작업 프로세스 그림 읽기를 화면 갱신을 기다리지 않고
+                # 바로 시작(_on_ai_loaded에서 하던 것을 앞당김).
+                try:
+                    if not os.environ.get("CUTLINE_NO_WARM"):
+                        _procpool.broadcast_async(("warm_image", (raster_path,)))
+                except Exception:  # noqa: BLE001
+                    pass
+                threading.Thread(
+                    target=self._auto_boxes_for, args=(raster_path, list(grid_cells)), daemon=True
+                ).start()
+                self._start_supplement_prefetch(raster_path, list(grid_cells))
             self.after(0, self._on_ai_loaded, ai_path, raster_path, grid_cells)
             try:
-                self._get_cached_design_boxes(raster_path)
+                # 별도 작업 프로세스에서 시작만 시킨다(기다리지 않음 -- 위 _get_cached_design_boxes 참고).
+                # 격자 파일은 호버용이라 급하지 않아, 칼선 미리 계산이 먼저 코어를 쓰도록 20초 뒤에.
+                if grid_cells:
+                    threading.Timer(
+                        20.0, lambda: self._get_cached_design_boxes(raster_path, blocking=False)
+                    ).start()
+                else:
+                    self._get_cached_design_boxes(raster_path, blocking=False)
             except Exception:  # noqa: BLE001
                 pass
         except Exception as e:  # noqa: BLE001
@@ -2482,6 +2526,115 @@ class CutLineApp(ctk.CTk):
                 self._load_source_preview(raster_path)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
+        if grid_cells:
+            # 2026-10-02 속도(멍푸: "칼선 속도 5초이내로"): 칸 안 요소 나누기는 작업 종류와 상관없이
+            # 파일마다 같으므로 불러오는 스레드에서 이미 시작했다(_run_load_ai, 그림 읽기는 작업
+            # 프로세스마다 -- 칸 배경 채우기는 프로세스마다 자기가 맡은 칸만, procpool._assign).
+            # 자동 인식용 작업 종류가 골라져 있으면 요소 칼선도 미리.
+            self._maybe_prefetch_auto()
+
+    def _maybe_prefetch_auto(self):
+        """격자 파일에서 "아니오(도무송 없음)" 등 자동 인식용 작업 종류가 골라져 있으면, 사용자가 버튼을
+        누르기 전에 요소 칼선을 작업 프로세스들이 뒤에서 미리 계산해 둔다(결과는 각 프로세스가 기억 --
+        core.element_jobs.run_task). 누를 때 설정이 같으면 기억한 결과를 바로 쓰고, 다르면 새로
+        계산한다(칼선은 똑같음, 시간만 줄어듦)."""
+        try:
+            job = self.job_type.get()
+            cells = list(self._real_grid_cells_px or [])
+            path = self.input_path.get().strip()
+            if job not in self._PURE_AUTO_JOBS or not cells or not path or self.is_vector.get():
+                return
+            dpi, margin, precision = self.dpi.get(), self.style_margin_mm.get(), self.precision.get()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return
+        key = (path, mt, job, dpi, margin, precision, tuple(tuple(c) for c in cells))
+        if getattr(self, "_auto_prefetch_key", None) == key:
+            return
+        self._auto_prefetch_key = key
+
+        def _run():
+            try:
+                _grid, boxes, groups, _sus = self._auto_boxes_for(path, cells)
+                tasks = self._auto_tasks(path, job, boxes, groups, dpi, margin, precision)
+                _procpool.prefetch_async(tasks)
+            except Exception:  # noqa: BLE001 -- 미리 계산은 실패해도 누를 때 그대로 계산함
+                traceback.print_exc()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _auto_tasks(self, path, job, boxes, groups, dpi, margin, precision):
+        """자동 인식 대표 요소들의 계산 작업 목록(미리 계산과 실제 계산이 똑같은 목록을 쓴다)."""
+        tasks = []
+        for group in groups:
+            primary_idx = group[0]
+            sel = tuple(boxes[primary_idx])
+            siblings = [tuple(b) for j, b in enumerate(boxes) if j != primary_idx]
+            tasks.append(("auto", (path, job, sel, siblings, self._grid_cell_containing(sel), dpi, margin, precision)))
+        return tasks
+
+    def _auto_boxes_for(self, path, cells):
+        """격자 파일의 "자동으로 여러 개 인식" 요소 박스(빈 칸 거르기 + 칸 안 요소 나누기 + 같은 그림
+        묶기) -> (빈 칸 뺀 칸 목록, 박스, 묶음, 의심 영역). 같은 파일·같은 칸이면 한 번만 계산하고,
+        다른 스레드가 계산 중이면 그 결과를 기다린다."""
+        try:
+            key = (path, os.path.getmtime(path), tuple(tuple(round(float(v), 2) for v in c) for c in cells))
+        except OSError:
+            key = None
+        cache = self.__dict__.setdefault("_auto_boxes_cache", {})
+        guard = self.__dict__.setdefault("_auto_boxes_guard", threading.Lock())
+        with guard:
+            ent = cache.get(key) if key is not None else None
+            if ent is None:
+                ent = {"event": threading.Event(), "value": None, "owner": True}
+                if key is not None:
+                    cache.clear()  # 파일 하나만 기억
+                    cache[key] = ent
+                mine = True
+            else:
+                mine = False
+        if not mine:
+            ent["event"].wait()
+            if ent["value"] is not None:
+                return ent["value"]
+        try:
+            # (작업 프로세스에서 돌려 보니 PC에서 오히려 5배 느려 -- 프로세스 안 OpenCV 스레드 1개 --
+            # 여기 스레드에서 한다)
+            grid_cells = [c for c in cells if image_outer_region_px(path, c) is not None]
+            suspicious: list = []
+            boxes, groups = detect_repeat_aware_sub_element_boxes_px(
+                path, grid_cells, suspicious_regions=suspicious,
+            )
+            value = (grid_cells, boxes, groups, suspicious)
+        except Exception:  # noqa: BLE001
+            value = None
+            with guard:
+                if key is not None and cache.get(key) is ent:
+                    del cache[key]
+            if mine:
+                ent["event"].set()
+            raise
+        ent["value"] = value
+        ent["event"].set()
+        return value
+
+    @staticmethod
+    def _start_supplement_prefetch(path, cells):
+        """무테 보조 탐지의 "요소 찾기"(칸만 있으면 됨)를 부가 계산용 작업 프로세스에서 미리 시작."""
+        try:
+            from core import element_jobs as _ej
+
+            skey = _ej.supplement_key(path, cells)
+            if skey is not None and skey not in _ej._SUP_FUTURES:
+                f2 = _procpool.submit_background(("supplement_detect", (path, [tuple(c) for c in cells])))
+                if f2 is not None:
+                    _ej._SUP_FUTURES.clear()
+                    _ej._SUP_FUTURES[skey] = f2
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
 
     def _preview_viewport_size(self):
         """실제로 미리보기 캔버스가 화면에서 차지하는 크기(px)를 구함.
@@ -2552,6 +2705,8 @@ class CutLineApp(ctk.CTk):
         self._nav_highlight_rect_id = None
         self._nav_highlight_halo_id = None
         self.zoom_pct_label.configure(text=f"{round(self._preview_zoom * 100)}%")
+        if self._pe_active:
+            self._pe_redraw_all()
 
     _ZOOM_STEPS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0]
 
@@ -3085,7 +3240,7 @@ class CutLineApp(ctk.CTk):
 
             combined = combine_results(self._accumulated)
             preview_png = os.path.join(_work_file_dir(), "_last_preview.png")
-            render_preview(combined, preview_png, original_image_path=path)
+            render_preview(combined, preview_png, original_image_path=path, async_save=True)
             self._last_result = combined
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("힌트 보정 재계산 처리 중")
@@ -3106,6 +3261,8 @@ class CutLineApp(ctk.CTk):
         """Show the raw (not-yet-processed) image on the canvas so the
         artist can drag a selection rectangle over one design BEFORE
         generating -- this is the "영역을 드래그 해서 생성" workflow."""
+        if self._pe_active:
+            self._pe_exit(rerender=False)
         img = Image.open(path).convert("RGBA")
         self._source_image = img
         self._preview_full_image = img
@@ -3272,6 +3429,33 @@ class CutLineApp(ctk.CTk):
         if self._design_boxes_cache_key == key and self._design_boxes_cache is not None:
             return self._design_boxes_cache
 
+        # 2026-10-02 속도(멍푸: "칼선 속도 5초이내로" -- 실제 PC에서 큰 시트 자동 인식 35초): 파일을
+        # 불러온 직후 이 계산(큰 시트 15~30초)이 같은 프로그램 안 스레드에서 돌면서 파이썬 실행 권한
+        # (GIL)을 나눠 써, 그동안 누른 칼선 생성이 몇 배 느려졌다. 이제는 별도 작업 프로세스에서
+        # 계산하고(화면·칼선 생성과 안 겹침), 호버처럼 기다리면 안 되는 곳은 결과가 올 때까지
+        # None을 받는다.
+        fut = self._design_boxes_futures.get(key)
+        if fut is None:
+            try:
+                fut = _procpool.submit_background(("design_boxes", (path,)))
+            except Exception:  # noqa: BLE001
+                fut = None
+            if fut is not None:
+                self._design_boxes_futures[key] = fut
+        if fut is not None:
+            if not blocking and not fut.done():
+                return None
+            try:
+                boxes = fut.result()
+                self._design_boxes_cache_key = key
+                self._design_boxes_cache = boxes
+                return boxes
+            except Exception:  # noqa: BLE001 -- 작업 프로세스가 안 되면 예전처럼 여기서
+                self._design_boxes_futures[key] = None
+                traceback.print_exc()
+        if not blocking:
+            return None
+
         with self._design_boxes_locks_guard:
             lock = self._design_boxes_locks.get(key)
             if lock is None:
@@ -3334,6 +3518,8 @@ class CutLineApp(ctk.CTk):
             self.preview_canvas.coords(self._hover_preview_rect_id, x0, y0, x1, y1)
 
     def _on_canvas_hover(self, event):
+        if self._pe_active:
+            return
         if self._pan_mode or self._drag_start is not None:
             return
         cx = self.preview_canvas.canvasx(event.x)
@@ -3365,6 +3551,9 @@ class CutLineApp(ctk.CTk):
             self._mixed_clear_hover()
 
     def _on_canvas_press(self, event):
+        if self._pe_active and not self._pan_mode:
+            self._pe_on_press(event)
+            return
         if self._hint_mode_active:
             # 힌트 그리기 모드에서는 클릭이 곧 힌트 점 하나이므로(드래그 X),
             # 눌렀을 때는 아무 것도 하지 않고 뗄 때(_on_canvas_release)만 처리.
@@ -3422,6 +3611,9 @@ class CutLineApp(ctk.CTk):
         self._draw_selection_rect(cx, cy, cx, cy)
 
     def _on_canvas_drag(self, event):
+        if self._pe_active and not self._pan_mode:
+            self._pe_on_drag(event)
+            return
         if self._hint_mode_active:
             return
         if self._pan_mode:
@@ -3441,6 +3633,9 @@ class CutLineApp(ctk.CTk):
         self.status.set(f"드래그 중: {w_mm:.1f} × {h_mm:.1f}mm (마우스를 놓으면 선택 완료)")
 
     def _on_canvas_release(self, event):
+        if self._pe_active and not self._pan_mode:
+            self._pe_on_release(event)
+            return
         if self._hint_mode_active:
             cx = self.preview_canvas.canvasx(event.x)
             cy = self.preview_canvas.canvasy(event.y)
@@ -4097,7 +4292,7 @@ class CutLineApp(ctk.CTk):
         try:
             combined = combine_results(self._accumulated)
             preview_png = os.path.join(_work_file_dir(), "_last_preview.png")
-            render_preview(combined, preview_png, original_image_path=path)
+            render_preview(combined, preview_png, original_image_path=path, async_save=True)
             self._last_result = combined
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("칼선 생성/미리보기 처리 중")
@@ -4305,7 +4500,7 @@ class CutLineApp(ctk.CTk):
         try:
             combined = combine_results(self._accumulated)
             preview_png = os.path.join(_work_file_dir(), "_last_preview.png")
-            render_preview(combined, preview_png, original_image_path=path)
+            render_preview(combined, preview_png, original_image_path=path, async_save=True)
             self._last_result = combined
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("칼선 생성/미리보기 처리 중")
@@ -4771,6 +4966,8 @@ class CutLineApp(ctk.CTk):
             self.after(0, self._on_error, str(e))
 
     def _show_preview(self, preview_png, item_result=None):
+        if self._pe_active:
+            self._pe_exit(rerender=False)
         self._clear_selection()
         self._source_image = None  # showing a rendered result now, not a raw source -- no new drag-select until a file is (re)loaded
         if Image is not None:
@@ -5297,18 +5494,9 @@ class CutLineApp(ctk.CTk):
             self._prewarm_segmentation(path, [boxes[g[0]] for g in groups])
             return {}
         dpi, margin, precision = self.dpi.get(), self.style_margin_mm.get(), self.precision.get()
-        tasks = []
-        for group in groups:
-            primary_idx = group[0]
-            sel = tuple(boxes[primary_idx])
-            siblings = [b for j, b in enumerate(boxes) if j != primary_idx]
-            tasks.append((sel, siblings, self._grid_cell_containing(sel)))
-
-        results = _procpool.run_tasks([
-            ("auto", (path, job, sel, [tuple(b) for b in siblings], art_region, dpi, margin, precision))
-            for sel, siblings, art_region in tasks
-        ])
-        return {t[0]: r for t, r in zip(tasks, results) if r is not None}
+        tasks = self._auto_tasks(path, job, boxes, groups, dpi, margin, precision)
+        results = _procpool.run_tasks(tasks)
+        return {t[1][2]: r for t, r in zip(tasks, results) if r is not None}
 
     def _prewarm_segmentation(self, path, boxes_px):
         """boxes_px 각각의 GrabCut 실루엣을 여러 스레드로 미리 계산(결과는 캐시에 남음)."""
@@ -5349,15 +5537,15 @@ class CutLineApp(ctk.CTk):
         # 적용해") 그대로 유지, 격자 없는 파일용 대체 경로(else)는 그대로.
         suspicious_regions_px: list = []
         try:
-            if self._real_grid_cells_px:
+            if self._real_grid_cells_px and self.job_type.get() == "DOMUSONG":
                 # 2026-09-28: 배경색뿐인 칸(이웃 칸 테두리 선이 살짝 걸친 빈 칸
                 # 포함 -- 실제 파일로 확인)은 어떤 작업이든 칼선 대상에서 뺀다
-                # ("배경색이 칼선으로 잡히면 안 됨").
+                # ("배경색이 칼선으로 잡히면 안 됨"). 도무송이 아닌 작업은 아래
+                # _auto_boxes_for 안에서 같은 기준으로 거른다.
                 grid_cells = [
                     c for c in self._real_grid_cells_px
                     if image_outer_region_px(path, c) is not None
                 ]
-            if self._real_grid_cells_px and self.job_type.get() == "DOMUSONG":
                 # 2026-09-28: 도무송은 칸(카드) 단위(9/26 "카드 하나 = 도무송
                 # 하나") -- 칸 이미지 안쪽에 도형 하나("도무송 직접 선택 후 칼선
                 # 종류에 따라 이미지 안쪽으로"). 실제 테스트 파일의 카드 칸 손
@@ -5366,10 +5554,11 @@ class CutLineApp(ctk.CTk):
                 cell_boxes = grid_cells
                 boxes, groups = group_content_cells_px(path, cell_boxes)
             elif self._real_grid_cells_px:
+                # 불러올 때 뒤에서 미리 해 둔 결과(같은 계산 -- _auto_boxes_for 참고)
+                grid_cells, boxes, groups, sus = self._auto_boxes_for(path, list(self._real_grid_cells_px))
+                boxes, groups = list(boxes), [list(g) for g in groups]
+                suspicious_regions_px.extend(sus)
                 cell_boxes = grid_cells
-                boxes, groups = detect_repeat_aware_sub_element_boxes_px(
-                    path, cell_boxes, suspicious_regions=suspicious_regions_px,
-                )
             else:
                 # 2026-09-26: "① 도안 자동 인식"과 같은 이유로 여기도 캐시를
                 # 재사용(위 _run_mixed_detect 주석 참고) -- 이 "자동으로 여러
@@ -5564,7 +5753,7 @@ class CutLineApp(ctk.CTk):
                     suspicious_regions_px
                 )
             preview_png = os.path.join(_work_file_dir(), "_last_preview.png")
-            render_preview(combined, preview_png, original_image_path=path)
+            render_preview(combined, preview_png, original_image_path=path, async_save=True)
             self._last_result = combined
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("칼선 생성/미리보기 처리 중")
@@ -5621,28 +5810,20 @@ class CutLineApp(ctk.CTk):
     @staticmethod
     def _supplement_detect(path, cell_boxes):
         """보조 탐지의 "요소 찾기" 부분(화면 상태 없음 -- 결과는 core.multi_design 안에 기억되어
-        ① 직후 뒤에서 미리 불러 두면 ③에서 다시 계산하지 않음). -> (칸들, 반복 그룹, 그룹별 요소)"""
-        from core.parallel import pmap
+        ① 직후 뒤에서 미리 불러 두면 ③에서 다시 계산하지 않음). -> (칸들, 반복 그룹, 그룹별 요소).
+        2026-10-02 속도: 격자 파일은 불러올 때 작업 프로세스에서 미리 계산해 둔 결과가 있으면 그것을
+        쓴다(_auto_boxes_for 참고, 계산은 core.element_jobs.supplement_detect로 같음)."""
+        from core import element_jobs as _ej
 
-        cells, groups = group_content_cells_px(path, [
-            c for c in cell_boxes if image_outer_region_px(path, c) is not None
-        ])
-
-        def _bg_of(grp):
-            out = []
+        key = _ej.supplement_key(path, cell_boxes)
+        fut = _ej._SUP_FUTURES.get(key) if key is not None else None
+        if fut is not None:
             try:
-                detect_elements_by_background_flood_px(path, cells[grp[0]], bg_colors_out=out)
+                return fut.result(timeout=300)
             except Exception:  # noqa: BLE001
-                pass
-            return out
-
-        # 칸마다 독립 계산이라 동시에(색 모음 순서는 칸 순서 그대로)
-        sheet_bg = [c for part in pmap(_bg_of, list(groups)) for c in part]
-        elements_per_group = pmap(
-            lambda grp: detect_elements_by_background_flood_px(path, cells[grp[0]], known_bg_lab=sheet_bg),
-            list(groups),
-        )
-        return cells, groups, elements_per_group
+                traceback.print_exc()
+                _ej._SUP_FUTURES.pop(key, None)
+        return _ej.supplement_detect(path, cell_boxes)
 
     def _supplement_missing_elements(self, path, start_idx, cell_boxes, auto_style=False):
         """무테 자동 인식 보조(자동 적용): 기존 경로(선 기반 낱개 탐지 +
@@ -6063,6 +6244,8 @@ class CutLineApp(ctk.CTk):
         )
 
     def _on_export(self):
+        if self._pe_active:
+            self._pe_commit_working(push_undo=True)  # 고치던 칼선까지 저장에 넣는다
         if self._last_result is None:
             return
         # 2026-09-29(멍푸: "왜 중첩되면 안 되는지"): 저장 직전 칼선끼리 교차·이중

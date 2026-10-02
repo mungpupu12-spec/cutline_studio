@@ -87,6 +87,45 @@ def _route(task, n):
         return 0
 
 
+def _assign(tasks, n):
+    """[(작업 번호, 작업 프로세스 번호)] -- 같은 작업 목록이면 늘 같은 배정(미리 계산과 실제 계산이
+    같은 프로세스로 가야 기억한 결과를 쓴다).
+
+    2026-10-02 속도: "auto"(자동 인식 요소) 작업은 칸끼리 묶어 덜 바쁜 작업 프로세스로 고르게
+    나눈다(예전: 박스 위치로 정해 24개가 한 프로세스에 6~7개씩 몰리기도 함). "rest" 작업은 예전처럼
+    요소 위치로(① 직후 미리 계산과 같은 프로세스)."""
+    # "auto" 작업은 같은 칸(art_region)끼리 묶어 한 프로세스로 -- 프로세스마다 칸 배경 채우기(PC에서
+    # 칸 하나 약 0.3초)를 자기 칸만 하게(멍푸 PC 실측: 7개 프로세스가 13칸을 모두 하면 4.7초).
+    # 묶음은 큰 것부터 가장 덜 바쁜 프로세스로(부담 = 칸 3 + 작업 수).
+    load = [0.0] * n
+    out = []
+    groups: dict = {}
+    for i, t in enumerate(tasks):
+        if t[0] == "auto":
+            cell = t[1][4] if len(t[1]) > 4 else None
+            key = tuple(round(float(v), 1) for v in cell) if cell is not None else ("solo", i)
+            groups.setdefault(key, []).append(i)
+    for key, idxs in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[1][0])):
+        k = min(range(n), key=lambda q: (load[q], q))
+        load[k] += (0.0 if key and key[0] == "solo" else 3.0) + len(idxs)
+        out.extend((i, k) for i in idxs)
+    for i, t in enumerate(tasks):
+        if t[0] != "auto":
+            out.append((i, _route(t, n)))
+    return out
+
+
+def _task_cost(task):
+    """대략적인 계산량(요소 박스 넓이)."""
+    kind, args = task
+    try:
+        sel = args[2] if kind == "auto" else args[1]
+        x0, y0, x1, y1 = [float(v) for v in sel]
+        return max(1.0, (x1 - x0) * (y1 - y0))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def warm_up_async():
     """프로그램 시작 직후 뒤에서 작업 프로세스들을 미리 띄운다(화면은 기다리지 않음)."""
     def _run():
@@ -97,6 +136,10 @@ def warm_up_async():
             from . import element_jobs
 
             futs = [ex.submit(element_jobs.run_task, ("noop", ())) for ex in exs]
+            # 부가 계산용 프로세스도 미리 띄운다(2026-10-02)
+            fb = submit_background(("noop", ()))
+            if fb is not None:
+                futs.append(fb)
             for f in futs:
                 f.result(timeout=180)
         except Exception:  # noqa: BLE001
@@ -118,12 +161,70 @@ def prefetch_async(tasks):
         try:
             from . import element_jobs
 
-            for t in tasks:
-                exs[_route(t, len(exs))].submit(element_jobs.run_task, t)
+            for i, k in _assign(tasks, len(exs)):
+                exs[k].submit(element_jobs.run_task, tasks[i])
         except Exception:  # noqa: BLE001
             pass
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def broadcast_async(task, skip_first: bool = False):
+    """같은 작업을 모든 작업 프로세스에 하나씩 보낸다(기다리지 않음, 결과 버림 -- 그림 읽기·칸 배경
+    채우기 같은 프로세스별 기억을 미리 채우려고). skip_first면 첫 프로세스는 빼고(그 프로세스엔 바로
+    다른 급한 일을 보낼 때)."""
+    if workers() <= 1:
+        return
+    exs = get_executors()
+    if not exs:
+        return
+    from . import element_jobs
+
+    for ex in exs[1:] if skip_first else exs:
+        try:
+            ex.submit(element_jobs.run_task, task)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def submit_first(task):
+    """첫 작업 프로세스에 작업 하나(Future). 프로세스가 없으면 None."""
+    if workers() <= 1:
+        return None
+    exs = get_executors()
+    if not exs:
+        return None
+    from . import element_jobs
+
+    try:
+        return exs[0].submit(element_jobs.run_task, task)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_bg_executor = None
+
+
+def submit_background(task):
+    """오래 걸리는 부가 계산(호버용 도안 박스 등)을 칼선 계산용과 *따로* 둔 작업 프로세스 하나에서
+    돌린다(2026-10-02 속도). 프로세스를 쓸 수 없으면 None(부르는 쪽이 예전처럼 처리)."""
+    global _bg_executor
+    if _pool_broken:
+        return None
+    from . import element_jobs
+
+    with _pool_lock:
+        if _bg_executor is None:
+            try:
+                from concurrent.futures import ProcessPoolExecutor
+
+                _bg_executor = ProcessPoolExecutor(max_workers=1, mp_context=_context(), initializer=_warm)
+            except Exception:  # noqa: BLE001
+                return None
+    try:
+        return _bg_executor.submit(element_jobs.run_task, task)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 _thread_pool = None
@@ -178,7 +279,9 @@ def run_tasks(tasks, on_progress=None):
         try:
             from concurrent.futures import as_completed
 
-            futs = {exs[_route(t, len(exs))].submit(element_jobs.run_task, t): i for i, t in enumerate(tasks)}
+            futs = {}
+            for i, k in _assign(tasks, len(exs)):
+                futs[exs[k].submit(element_jobs.run_task, tasks[i])] = i
             n = 0
             for fut in as_completed(futs):
                 i = futs[fut]
@@ -213,8 +316,14 @@ def run_tasks(tasks, on_progress=None):
 
 
 def shutdown():
-    global _executors
+    global _executors, _bg_executor
     with _pool_lock:
+        if _bg_executor is not None:
+            try:
+                _bg_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001
+                pass
+            _bg_executor = None
         if _executors is not None:
             for ex in _executors:
                 try:

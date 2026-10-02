@@ -57,8 +57,37 @@ def _with_undersized_fallback(path, result, sel, dpi, margin, precision, bounds=
     return fallback
 
 
+def _lighten_cut(result, tol_px: float = 0.25):
+    """칼선 다각형의 점을 줄인다(원래 선에서 0.25px = 약 0.02mm 이내).
+
+    2026-10-02 속도(멍푸: "칼선 속도 5초이내로"): 안쪽으로 줄인 칼선은 둥근 모서리마다 점이 촘촘해
+    스티커 하나에 점이 1,300개 안팎(시트 전체 10만 개)이라, 뒤이은 겹침 정리·간격 맞추기·미리보기·
+    저장이 모두 이 점 수만큼 느렸다. 같은 모양을 점 약 100개로(약 12분의 1)."""
+    try:
+        cut = result.offsets.get("cut") if result is not None else None
+        if cut is None or cut.is_empty:
+            return result
+        light = cut.simplify(tol_px, preserve_topology=True)
+        if light.is_empty or not light.is_valid:
+            return result
+        from shapely.geometry import MultiPolygon, Polygon
+
+        if isinstance(light, Polygon):
+            light = MultiPolygon([light])
+        if not isinstance(light, MultiPolygon):
+            return result
+        result.offsets = {**result.offsets, "cut": light}
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
 def auto_item(path, job, sel, siblings, art_region, dpi, margin, precision):
     """자동 인식 한 요소(AUTO_STYLE/BORDERLESS/LINE_ART/MASKING_TAPE)."""
+    return _lighten_cut(_auto_item(path, job, sel, siblings, art_region, dpi, margin, precision))
+
+
+def _auto_item(path, job, sel, siblings, art_region, dpi, margin, precision):
     if job == "AUTO_STYLE":
         result = generate_cutline_auto(
             image_path=path, dpi=dpi, selection_px=sel, margin_mm=margin, supersample=precision,
@@ -92,13 +121,117 @@ def rest_fine_item(path, sel, bounds, siblings, dpi, margin, precision):
     )
 
 
+def supplement_detect(path, cell_boxes):
+    """무테 보조 탐지의 "요소 찾기"(gui.app._supplement_detect에서 옮김, 계산 동일) -> (칸들, 반복
+    그룹, 그룹별 요소). 작업 프로세스에서도 돌릴 수 있게 화면 상태 없이."""
+    from .interactive_cutline import image_outer_region_px
+    from .multi_design import detect_elements_by_background_flood_px, group_content_cells_px
+    from .parallel import pmap
+
+    cells, groups = group_content_cells_px(path, [
+        c for c in cell_boxes if image_outer_region_px(path, c) is not None
+    ])
+
+    def _bg_of(grp):
+        out = []
+        try:
+            detect_elements_by_background_flood_px(path, cells[grp[0]], bg_colors_out=out)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    # 칸마다 독립 계산이라 동시에(색 모음 순서는 칸 순서 그대로)
+    sheet_bg = [c for part in pmap(_bg_of, list(groups)) for c in part]
+    elements_per_group = pmap(
+        lambda grp: detect_elements_by_background_flood_px(path, cells[grp[0]], known_bg_lab=sheet_bg),
+        list(groups),
+    )
+    return cells, groups, elements_per_group
+
+
+_SUP_FUTURES: dict = {}
+
+
+def supplement_key(path, cell_boxes):
+    import os
+
+    try:
+        st = os.stat(path)
+        return (os.path.abspath(path), st.st_mtime_ns, st.st_size,
+                tuple(tuple(round(float(v), 3) for v in c) for c in cell_boxes))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_AUTO_MEMO: dict = {}
+
+
+def _auto_memo_key(args):
+    import os
+
+    try:
+        st = os.stat(args[0])
+        return (os.path.abspath(args[0]), st.st_mtime_ns, st.st_size) + tuple(
+            tuple(map(tuple, a)) if isinstance(a, list) else a for a in args[1:]
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def run_task(task):
     """프로세스 풀에서 부르는 입구: (종류, 인자 튜플) -> 결과."""
     kind, args = task
     if kind == "auto":
-        return auto_item(*args)
+        # 2026-10-02 속도: 파일을 불러오고 "아니오(도무송 없음)"를 고르는 사이 뒤에서 같은 작업을
+        # 미리 계산해 둔다(procpool.prefetch_async) -- 같은 입력이면 기억한 결과의 복사본을 준다.
+        import copy
+
+        key = _auto_memo_key(args)
+        if key is not None and key in _AUTO_MEMO:
+            return copy.deepcopy(_AUTO_MEMO[key])
+        res = auto_item(*args)
+        if key is not None:
+            if len(_AUTO_MEMO) > 400:
+                _AUTO_MEMO.clear()
+            _AUTO_MEMO[key] = copy.deepcopy(res)
+        return res
     if kind == "rest":
         return rest_fine_item(*args)
     if kind == "noop":
         return None
+    if kind == "warm_image":
+        from . import image_cache
+
+        image_cache.imread(args[0])
+        return None
+    if kind == "warm_cells":
+        # 2026-10-02 속도: 파일을 불러오자마자 각 작업 프로세스가 그림을 읽고 칸마다 배경 채우기를
+        # 해 둔다(둘 다 프로세스 안에 기억됨) -- 요소 칼선 계산 때 이 둘이 가장 먼저 드는 시간.
+        from . import image_cache
+        from .multi_design import detect_elements_by_background_flood_px
+
+        path, cells = args
+        image_cache.imread(path)
+        for c in cells:
+            try:
+                detect_elements_by_background_flood_px(path, tuple(c))
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+    if kind == "auto_boxes":
+        # 격자 파일 "자동으로 여러 개 인식"의 빈 칸 거르기 + 칸 안 요소 나누기(gui.app._auto_boxes_for)
+        from .interactive_cutline import image_outer_region_px
+        from .multi_design import detect_repeat_aware_sub_element_boxes_px
+
+        path, cells = args
+        grid = [c for c in cells if image_outer_region_px(path, c) is not None]
+        sus: list = []
+        boxes, groups = detect_repeat_aware_sub_element_boxes_px(path, grid, suspicious_regions=sus)
+        return grid, boxes, groups, sus
+    if kind == "supplement_detect":
+        return supplement_detect(*args)
+    if kind == "design_boxes":
+        from .multi_design import detect_design_bboxes_px
+
+        return detect_design_bboxes_px(*args)
     raise ValueError(kind)

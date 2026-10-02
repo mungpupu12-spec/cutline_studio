@@ -43,19 +43,34 @@ def _ring_to_path_d(coords) -> str:
     return d
 
 
-def _polygon_to_path_d(poly: Polygon) -> str:
-    d = _ring_to_path_d(poly.exterior.coords)
+def _polygon_to_path_d(poly: Polygon, curve_tol_px: Optional[float] = None) -> str:
+    d = None
+    if curve_tol_px and not poly.interiors:
+        # 2026-10-02(멍푸: "어도비 패스 기능 같은거로"): 칼선은 수백~수천 개 점의 꺾은선이라
+        # 일러스트레이터에서 열면 기준점이 너무 많아 손볼 수 없었다 -- 곡선(베지어)으로 맞춰
+        # 기준점 십여 개짜리 패스로 쓴다(원래 선에서 벗어남 최대 curve_tol_px). 프로그램에서
+        # 고친 칼선은 고친 그 패스 그대로.
+        try:
+            from .bezier_path import path_for_polygon
+
+            bp = path_for_polygon(poly, tol=curve_tol_px)
+            if bp is not None and len(bp) >= 2:
+                d = bp.svg_d()
+        except Exception:  # noqa: BLE001 -- 실패하면 꺾은선으로
+            d = None
+    if not d:
+        d = _ring_to_path_d(poly.exterior.coords)
     for interior in poly.interiors:
         d += " " + _ring_to_path_d(interior.coords)
     return d
 
 
-def _multipolygon_to_path_d(mp) -> str:
+def _multipolygon_to_path_d(mp, curve_tol_px: Optional[float] = None) -> str:
     if isinstance(mp, Polygon):
         polys = [mp]
     else:
-        polys = list(mp.geoms)
-    return " ".join(_polygon_to_path_d(p) for p in polys)
+        polys = [g for g in mp.geoms if isinstance(g, Polygon)]
+    return " ".join(_polygon_to_path_d(p, curve_tol_px) for p in polys)
 
 
 def svg_size_mm(width_px: float, height_px: float, dpi: float):
@@ -75,6 +90,7 @@ def export_svg(
     margin_px: Optional[float] = None,
     dpi: Optional[float] = None,
     placement: Optional[dict] = None,
+    curves: bool = True,
 ) -> str:
     """2026-09-29(멍푸: "svg 파일 원본 이미지 크기에 맞게 적용되게 해줘" -- 일러스트레이터에서
     칼선 SVG가 원본보다 훨씬 크고 위치도 어긋나 보였음): 예전 SVG는 width/height에 단위가
@@ -132,7 +148,9 @@ def export_svg(
             continue
         color = COLORS[name]
         label = LABELS_KO[name]
-        d = _multipolygon_to_path_d(geom)
+        # 칼선은 곡선 패스로(벗어남 최대 0.1mm), 나머지 선은 예전처럼
+        tol = 0.1 / mm_per_px if (name == "cut" and curves) else None
+        d = _multipolygon_to_path_d(geom, tol)
         parts.append(
             f'<g id="{name}" data-label="{label}">'
             f'<path d="{d}" fill="none" stroke="{color}" '
