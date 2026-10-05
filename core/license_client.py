@@ -22,6 +22,7 @@ evidence trail for enforcement, not as unbreakable DRM.
 """
 
 import os
+import re
 import sys
 import json
 import base64
@@ -71,8 +72,27 @@ def _key_checksum_char(body14: str) -> str:
     return _KEY_ALPHABET[total % len(_KEY_ALPHABET)]
 
 
+_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d\u30fc"
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff"
+_KEY_RE = re.compile(r"CLS-(?:PERS|ENT)(?:-[0-9A-Z]{5}){3}")
+
+
+def normalize_license_key(text: str) -> str:
+    """2026-10-05("새로 업데이트한 설치 파일 라이선스 안 된대"): 구매자가 안내문·메신저·웹페이지에서
+    키를 복사해 붙이면 소문자, 키 사이 공백, 긴 줄표(–), 보이지 않는 문자, "라이선스 키:" 같은 앞뒤
+    글이 섞일 수 있다. 예전엔 앞뒤 공백만 지우고 그대로 서버에 보내서, 소문자로 넣으면 형식 검사는
+    통과(대문자로 비교)하는데 서버는 대소문자를 구분해 "존재하지 않는 라이선스 키"가 됐다. 키 모양
+    (CLS-PERS/ENT-xxxxx-xxxxx-xxxxx)을 찾아 대문자로 돌려준다. 못 찾으면 정리한 글자 그대로."""
+    t = (text or "").upper()
+    for ch in _DASHES:
+        t = t.replace(ch, "-")
+    t = "".join(c for c in t if c not in _INVISIBLE and not c.isspace())
+    m = _KEY_RE.search(t)
+    return m.group(0) if m else t
+
+
 def _looks_like_valid_key(license_key: str) -> bool:
-    key = license_key.strip().upper()
+    key = normalize_license_key(license_key)
     parts = key.split("-")
     if len(parts) != 5 or parts[0] != "CLS" or parts[1] not in ("PERS", "ENT"):
         return False
@@ -227,7 +247,7 @@ def activate(license_key: str) -> LicenseResult:
     fingerprint = get_device_fingerprint()
     resp = _post_with_wake_retry(
         "/activate",
-        {"license_key": license_key.strip(), "device_fingerprint": fingerprint, "device_name": get_device_name()},
+        {"license_key": normalize_license_key(license_key), "device_fingerprint": fingerprint, "device_name": get_device_name()},
     )
     if resp is None:
         return LicenseResult(False, "network_error", "라이선스 서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.")
@@ -238,7 +258,7 @@ def activate(license_key: str) -> LicenseResult:
         reason = data.get("reason", "locked")
         return LicenseResult(False, reason, data.get("message", "라이선스가 잠겨 있습니다."))
     token = data["token"]
-    _save_cache(license_key.strip(), token)
+    _save_cache(normalize_license_key(license_key), token)
     payload = _verify_token(token)
     return LicenseResult(True, "valid", "", payload)
 
@@ -252,7 +272,7 @@ def reactivate(license_key: str, reactivation_code: str) -> LicenseResult:
     resp = _post_with_wake_retry(
         "/reactivate",
         {
-            "license_key": license_key.strip(),
+            "license_key": normalize_license_key(license_key),
             "reactivation_code": reactivation_code.strip(),
             "device_fingerprint": fingerprint,
             "device_name": get_device_name(),
@@ -266,7 +286,7 @@ def reactivate(license_key: str, reactivation_code: str) -> LicenseResult:
         return LicenseResult(False, "invalid_key", "존재하지 않는 라이선스 키입니다.")
     data = resp.json()
     token = data["token"]
-    _save_cache(license_key.strip(), token)
+    _save_cache(normalize_license_key(license_key), token)
     payload = _verify_token(token)
     return LicenseResult(True, "valid", "", payload)
 
@@ -300,7 +320,7 @@ def claim_beta(invite_code: str) -> LicenseResult:
 
 def looks_like_license_key(text: str) -> bool:
     """입력칸 하나로 라이선스 키와 베타 코드를 함께 받기 위한 구분(키는 CLS-로 시작)."""
-    return (text or "").strip().upper().startswith("CLS-")
+    return normalize_license_key(text).startswith("CLS-")
 
 
 def report_error(error_type: str, message: str, traceback_str: str = "", context: str = "") -> bool:
