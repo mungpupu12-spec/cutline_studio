@@ -91,6 +91,7 @@ def export_svg(
     dpi: Optional[float] = None,
     placement: Optional[dict] = None,
     curves: bool = True,
+    white_geom=None,
 ) -> str:
     """2026-09-29(멍푸: "svg 파일 원본 이미지 크기에 맞게 적용되게 해줘" -- 일러스트레이터에서
     칼선 SVG가 원본보다 훨씬 크고 위치도 어긋나 보였음): 예전 SVG는 width/height에 단위가
@@ -106,7 +107,11 @@ def export_svg(
       - 선 두께는 pt 그대로(0.75pt).
       - 칼선 안쪽 채우기 없음(선만). 예전엔 참고용으로 그림 모양을 15% 회색으로 채워 넣었는데,
         일러스트레이터에서 칼선 안에 회색 면이 생겨 "있으면 안 돼"(멍푸) -> 기본값 끔.
-    margin_px를 주면 예전처럼 대지 사방에 여백을 더 둔다(그만큼 원점도 옮김)."""
+    margin_px를 주면 예전처럼 대지 사방에 여백을 더 둔다(그만큼 원점도 옮김).
+
+    2026-10-05: white_geom(화이트 레이어, 이미지 픽셀 좌표)을 주면 "화이트레이어" 그룹에 흰색 면으로 넣는다
+    (칼선보다 아래). AI 대지에 같은 이미지가 여러 번 놓였으면(마스킹테이프 롤 등, placement["tiles"])
+    칼선·화이트를 놓인 자리마다 똑같이 넣는다 -- 예전엔 첫 자리에만 들어갔다."""
     use_dpi = float(dpi) if dpi and dpi > 0 else float(result.dpi or 300.0)
     if placement:
         mm_per_px = float(placement["pt_per_px"]) * PT_TO_MM
@@ -128,16 +133,23 @@ def export_svg(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.4f}mm" height="{H:.4f}mm" '
         f'viewBox="0 0 {W:.4f} {H:.4f}" overflow="visible">'
     )
-    parts.append(
-        f'<g id="offset" transform="translate({x0_mm + margin_mm:.4f},{y0_mm + margin_mm:.4f}) '
-        f'scale({mm_per_px:.8f})">'
-    )
+    tiles = [(x0_mm, y0_mm)]
+    if placement and placement.get("tiles"):
+        tiles = [(float(tx) * PT_TO_MM, float(ty) * PT_TO_MM) for tx, ty in placement["tiles"]] or tiles
+    body = []
 
     if include_artwork_fill:
         d_art = _multipolygon_to_path_d(result.design)
-        parts.append(
+        body.append(
             f'<g id="artwork_reference"><path d="{d_art}" fill="#000000" '
             f'fill-opacity="0.15" stroke="none" fill-rule="evenodd"/></g>'
+        )
+
+    if white_geom is not None and not white_geom.is_empty:
+        d_white = _multipolygon_to_path_d(white_geom)
+        body.append(
+            f'<g id="화이트레이어" data-label="white layer(화이트, C0 M0 Y0 K0)">'
+            f'<path d="{d_white}" fill="#FFFFFF" stroke="none" fill-rule="evenodd"/></g>'
         )
 
     # draw largest (bleed) first so smaller ones render on top and stay visible
@@ -151,13 +163,21 @@ def export_svg(
         # 칼선은 곡선 패스로(벗어남 최대 0.1mm), 나머지 선은 예전처럼
         tol = 0.1 / mm_per_px if (name == "cut" and curves) else None
         d = _multipolygon_to_path_d(geom, tol)
-        parts.append(
+        body.append(
             f'<g id="{name}" data-label="{label}">'
             f'<path d="{d}" fill="none" stroke="{color}" '
             f'stroke-width="{stroke_px:.3f}" fill-rule="evenodd"/></g>'
         )
 
-    parts.append("</g>")
+    for ti, (tx, ty) in enumerate(tiles):
+        gid = "offset" if ti == 0 else f"offset_{ti + 1}"
+        parts.append(
+            f'<g id="{gid}" transform="translate({tx + margin_mm:.4f},{ty + margin_mm:.4f}) '
+            f'scale({mm_per_px:.8f})">'
+        )
+        for frag in body:
+            parts.append(frag if ti == 0 else frag.replace('<g id="', f'<g id="t{ti + 1}_', 1))
+        parts.append("</g>")
     parts.append("</svg>")
 
     svg_content = "\n".join(parts)

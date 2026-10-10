@@ -102,6 +102,7 @@ from core.accumulate import combine_results
 from core import license_client as lic
 from core import glass_theme
 from gui.path_editor import PathEditorMixin
+from gui.white_layer_ui import WhiteLayerMixin
 
 try:
     from PIL import Image, ImageTk
@@ -481,7 +482,7 @@ ctk.set_default_color_theme("blue")
 
 
 
-class CutLineApp(PathEditorMixin, ctk.CTk):
+class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
     def __init__(self):
         super().__init__()
         # 2026-08-31 피드백("검정 화면이 또 뜨고 없애면 모든 창이 꺼져"):
@@ -689,6 +690,7 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
         self._pan_mode = False
         # 2026-10-02: 칼선 수정(어도비 패스처럼) 모드 상태 -- gui/path_editor.py
         self._pe_init_state()
+        self._wl_init_state()
         self._selection_canvas_rect = None  # (x0,y0,x1,y1) in CANVAS px, while dragging
         self._selection_px = None  # (x0,y0,x1,y1) in ORIGINAL IMAGE px, once released
         # 2026-09-07 피드백: .ai 파일 안에 작가 본인이 이미 그려 놓은 진짜
@@ -2341,6 +2343,9 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
         self.export_btn.configure(state="disabled")
         self.export_btn.pack(fill="x")
 
+        # ---- 8. 화이트 레이어(2026-10-05) -----------------------------------------------
+        self._wl_build_section(left_col)
+
         # ---- 상태 메시지 카드 --------------------------------------------------------
         status_card = ctk.CTkFrame(
             left_col, fg_color=BG_CARD, corner_radius=18, border_width=1, border_color=BORDER
@@ -2379,6 +2384,9 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
         # .ai는 아래에서 내부용 래스터 경로로 self.input_path가 바뀌므로,
         # 여기서 미리 기억해둠(_on_export에서 사용).
         self._export_basename = os.path.splitext(os.path.basename(path))[0]
+        # 2026-10-05 화이트 레이어: 새 파일이면 이전 화이트는 버리고, .ai면 원본 경로를 기억(안 그림의 투명도)
+        self._wl_clear()
+        self._ai_source_path = path if path.lower().endswith(".ai") else None
         # AI 이미지가 AI 대지 어디에 어떤 크기로 놓였는지(SVG를 원본 대지에 맞춰 저장할 때 씀,
         # 2026-09-29 "svg 파일 원본 이미지 크기에 맞게")
         self._source_raster_dpi = None
@@ -2444,6 +2452,14 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
 
                 grid_result = load_real_grid_cells(ai_path, raster_path)
                 grid_cells = grid_result.cells_px
+                # 2026-10-05: 같은 그림이 여러 번 놓인 격자 파일은 작업 이미지가 페이지 전체 렌더링으로
+                # 바뀐다 -- 그러면 SVG 저장 위치도 "대지 전체 = 이미지"로 맞춘다(첫 자리 기준이면 어긋남).
+                pl = self._ai_placement or {}
+                if pl.get("placements", 1) > 1 and pl.get("page_w_pt"):
+                    self._ai_placement = {
+                        "page_w_pt": pl["page_w_pt"], "page_h_pt": pl["page_h_pt"], "x0_pt": 0.0, "y0_pt": 0.0,
+                        "pt_per_px": 72.0 / float(grid_result.dpi), "placements": 1,
+                    }
             except Exception:  # noqa: BLE001
                 grid_cells = None
             if grid_cells:
@@ -5045,6 +5061,8 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
 
         self.input_path.set("")
         self._export_basename = ""
+        self._wl_clear()
+        self._ai_source_path = None
         self.is_vector.set(False)
         self._real_grid_cells_px = None
 
@@ -6282,8 +6300,13 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
             if out_path.lower().endswith(".svg"):
                 # 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장(2026-09-29)
                 export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
-                           placement=placement)
+                           placement=placement, white_geom=self._white_geom)
                 lines = [out_path]
+                if self._white_geom is not None:
+                    lines.append("화이트 레이어도 같은 파일 안 '화이트레이어' 그룹(흰색 면, 칼선 아래)에 넣었습니다.")
+                tiles = (placement or {}).get("tiles") or []
+                if len(tiles) > 1:
+                    lines.append(f"AI 대지에 같은 그림이 {len(tiles)}번 놓여 있어, 놓인 자리마다 칼선을 똑같이 넣었습니다.")
             else:
                 if not out_path.lower().endswith(".png"):
                     out_path += ".png"
@@ -6298,6 +6321,10 @@ class CutLineApp(PathEditorMixin, ctk.CTk):
                     f"원본 이미지와 같은 크기({self._last_result.width_px}x{self._last_result.height_px}px)의 "
                     "투명 배경 PNG입니다 -- 원본 이미지 위에 왼쪽 위 모서리를 맞춰 겹치면 칼선 위치가 그대로 맞습니다.",
                 ]
+                white_png = self._wl_export_png(out_path, img_dpi)
+                if white_png:
+                    lines += [white_png, "화이트 레이어(흰색 면, 같은 크기)입니다 -- 흰 바탕에선 안 보이니 일러스트레이터에서 "
+                              "'화이트레이어' 레이어에 같은 방법으로 겹쳐 넣으세요."]
             self.status.set(f"저장됨: {out_path}")
             self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")
         except Exception as e:  # noqa: BLE001

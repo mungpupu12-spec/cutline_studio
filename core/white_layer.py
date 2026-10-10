@@ -1,0 +1,253 @@
+"""화이트 레이어(흰색 잉크 판) 만들기와 화이트 기준 칼선 보완(2026-10-05).
+
+멍푸: "칼선을 보완하고 화이트 레이어를 만들어주는 기능을 추가할거야. 좋은 예는 키스컷 마테 좋은 예의
+화이트 레이어를 기준으로 인쇄소 가이드, 화이트 레이어 튜토리얼 등 자료 찾아서 만들어."
+
+좋은 예(키스컷 마스킹테이프 롤, 실제 인쇄 납품 파일)를 실측한 결과(일지 2026-10-05 참고):
+  - 레이어 4개(참고 / 칼선 / 도안 / 화이트레이어). 화이트는 "화이트레이어"라는 별도 레이어에 흰색(C0 M0 Y0 K0)
+    면으로 채운 벡터. 칼선은 마젠타 100%(C0 M100 Y0 K0) 0.5pt 선.
+  - 화이트 범위 = 그림 실루엣과 거의 같음(줄이거나 늘리지 않음) -- 그림 알파 약 25% 경계로 잡으면 좋은 예
+    화이트와 겹침 비율(IoU) 0.967로 가장 잘 맞았다(50% 경계는 0.938). 아주 작은 점까지 모두 덮고, 그림 안의 작은 구멍(안에 들어가는 가장 큰 원 지름
+    약 2.1mm 이하)은 메웠고 그보다 큰 구멍(2.5mm 이상)은 비워 뒀다.
+  - 칼선 = 화이트 외곽에서 바깥으로 약 1.3mm(1.1~1.5mm)를 고르게 띄운 닫힌 선. 칼선끼리 1.5mm보다 가까워지는
+    조각은 하나로 합쳐져 있다(남은 가장 가까운 간격 약 1.57mm). 이 규칙으로 만든 칼선은 좋은 예의 칼선 66개와
+    66개 모두 일치(겹침 비율 중앙값 0.985, 경계 차이 중앙값 0.07mm).
+인쇄소 자료: 화이트는 별도 레이어(또는 별색)로 따로 지정, 화이트는 그림보다 같거나 살짝 작게(색이 화이트 경계를
+덮도록), 반투명·그러데이션 부분은 화이트를 얼마나 깔지 따로 정해야 한다 -- 그래서 "안쪽으로 줄이기(mm)"를
+설정으로 둔다(기본 0 = 좋은 예와 같음).
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.ops import unary_union
+
+# 좋은 예에서 잰 기본값
+DEFAULT_FILL_HOLES_MM = 2.3     # 이보다 좁은 구멍(안에 들어가는 원 지름)은 화이트로 메움
+DEFAULT_CHOKE_MM = 0.0          # 화이트를 그림보다 안쪽으로 줄이는 양
+DEFAULT_CUT_OFFSET_MM = 1.3     # 화이트 기준 칼선: 화이트 외곽에서 띄우는 거리
+DEFAULT_MERGE_GAP_MM = 2.0      # 칼선끼리 이보다 가까우면 하나로 합침(저장 전 점검 기준과 같음)
+ALPHA_THRESHOLD = 64            # 그림 알파 약 25%(좋은 예 화이트와 가장 잘 맞음)
+
+
+def _mm_to_px(mm: float, dpi: float) -> float:
+    return float(mm) * float(dpi) / 25.4
+
+
+def _disk(r_px: float):
+    r = max(0, int(round(r_px)))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+def has_transparent_background(rgba: np.ndarray, min_frac: float = 0.02) -> bool:
+    """알파가 있고 투명한 곳이 어느 정도(기본 2%) 있으면 '투명 배경 그림'."""
+    return rgba.ndim == 3 and rgba.shape[2] == 4 and float((rgba[..., 3] < 128).mean()) >= min_frac
+
+
+def rasterize_geom(geom, width: int, height: int) -> np.ndarray:
+    """shapely (Multi)Polygon(이미지 픽셀 좌표) -> bool 마스크(구멍 반영)."""
+    m = np.zeros((int(height), int(width)), np.uint8)
+    if geom is None or geom.is_empty:
+        return m.astype(bool)
+    polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    for p in polys:
+        if p.is_empty or p.geom_type != "Polygon":
+            continue
+        ext = np.round(np.asarray(p.exterior.coords) * 8).astype(np.int32)
+        cv2.fillPoly(m, [ext], 1, lineType=cv2.LINE_8, shift=3)
+        for r in p.interiors:
+            cv2.fillPoly(m, [np.round(np.asarray(r.coords) * 8).astype(np.int32)], 0, lineType=cv2.LINE_8, shift=3)
+    return m.astype(bool)
+
+
+def fill_small_holes(mask: np.ndarray, max_diameter_px: float) -> np.ndarray:
+    """마스크 안의 구멍 중 '안에 들어가는 가장 큰 원의 지름'이 max_diameter_px 이하인 것만 메운다."""
+    if max_diameter_px <= 0:
+        return mask
+    inv = (~mask).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    if n <= 1:
+        return mask
+    border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    dt = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+    maxd = np.zeros(n, np.float32)
+    np.maximum.at(maxd, lab.ravel(), dt.ravel())
+    fill = (2.0 * maxd) <= float(max_diameter_px)
+    fill[0] = False
+    fill[border] = False
+    out = mask.copy()
+    out[fill[lab]] = True
+    return out
+
+
+def build_white_mask(art_mask: np.ndarray, dpi: float, fill_holes_mm: float = DEFAULT_FILL_HOLES_MM,
+                     choke_mm: float = DEFAULT_CHOKE_MM) -> np.ndarray:
+    """그림 마스크 -> 화이트 마스크(작은 구멍 메움, 필요하면 안쪽으로 줄임)."""
+    m = fill_small_holes(np.asarray(art_mask, bool), _mm_to_px(fill_holes_mm, dpi))
+    if choke_mm and choke_mm > 0:
+        m = cv2.erode(m.astype(np.uint8), _disk(_mm_to_px(choke_mm, dpi))).astype(bool)
+    return m
+
+
+def mask_to_geom(mask: np.ndarray, simplify_px: float = 0.4, min_area_px: float = 1.0):
+    """bool 마스크 -> MultiPolygon(구멍 포함, 이미지 픽셀 좌표 -- 프로그램의 다른 칼선과 같은 픽셀 중심
+    기준). 계단은 simplify_px 이내로 단순화."""
+    m = np.asarray(mask, np.uint8)
+    if not m.any():
+        return MultiPolygon()
+    contours, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hier is None:
+        return MultiPolygon()
+    hier = hier[0]
+    polys = []
+    for i, c in enumerate(contours):
+        if hier[i][3] != -1 or len(c) < 3:
+            continue
+        ext = c[:, 0, :].astype(float)
+        holes = []
+        j = hier[i][2]
+        while j != -1:
+            h = contours[j][:, 0, :].astype(float)
+            if len(h) >= 3:
+                holes.append(h)
+            j = hier[j][0]
+        p = Polygon(ext, holes) if len(ext) >= 3 else None
+        if p is None:
+            continue
+        if not p.is_valid:
+            p = p.buffer(0)
+        if simplify_px:
+            p = p.simplify(simplify_px, preserve_topology=True)
+        if p.is_empty or p.area < min_area_px:
+            continue
+        polys.extend(list(p.geoms) if hasattr(p, "geoms") else [p])
+    return MultiPolygon([p for p in polys if p.geom_type == "Polygon"])
+
+
+def cut_from_white_mask(white_mask: np.ndarray, dpi: float, offset_mm: float = DEFAULT_CUT_OFFSET_MM,
+                        merge_gap_mm: float = DEFAULT_MERGE_GAP_MM, simplify_px: float = 0.5):
+    """화이트 기준 칼선(키스컷 좋은 예 방식): 화이트를 offset_mm만큼 고르게 넓힌 외곽선. 칼선끼리
+    merge_gap_mm보다 가까워지는 조각은 하나로 합친다. 구멍 없는 바깥 외곽선만."""
+    m = cv2.dilate(np.asarray(white_mask, np.uint8), _disk(_mm_to_px(offset_mm, dpi)))
+    if merge_gap_mm and merge_gap_mm > 0:
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _disk(_mm_to_px(merge_gap_mm / 2.0, dpi)))
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    polys = []
+    for c in contours:
+        if len(c) < 3:
+            continue
+        p = Polygon(c[:, 0, :].astype(float))
+        if not p.is_valid:
+            p = p.buffer(0)
+        if simplify_px:
+            p = p.simplify(simplify_px, preserve_topology=True)
+        if not p.is_empty:
+            polys.extend([g for g in (p.geoms if hasattr(p, "geoms") else [p]) if g.geom_type == "Polygon"])
+    return MultiPolygon(polys)
+
+
+def ai_image_alpha(ai_path: str, page_index: int = 0) -> Optional[np.ndarray]:
+    """.ai(PDF 호환) 안에 심긴 인쇄 이미지가 하나(같은 이미지를 여러 번 배치한 것 포함)이고 투명도 마스크
+    (SMask)가 있으면 그 알파(0~255, 이미지와 같은 크기)를 돌려준다. 프로그램은 .ai를 열 때 이 이미지의 색만
+    꺼내 쓰므로(core.ai_import) 투명했던 곳이 흰 배경이 된다 -- 화이트는 이 알파로 정확히 잡는다."""
+    import fitz
+
+    doc = fitz.open(ai_path)
+    try:
+        page = doc[page_index]
+        imgs = page.get_images(full=True)
+        if not imgs or len({e[0] for e in imgs}) != 1:
+            return None
+        xref, smask = imgs[0][0], imgs[0][1]
+        if not smask:
+            return None
+        pm = fitz.Pixmap(doc, smask)
+        if pm.n != 1:
+            pm = fitz.Pixmap(fitz.csGRAY, pm)
+        a = np.frombuffer(pm.samples, np.uint8).reshape(pm.h, pm.w).copy()
+        info = doc.extract_image(xref)
+        if (info.get("width"), info.get("height")) != (pm.w, pm.h):
+            a = cv2.resize(a, (int(info["width"]), int(info["height"])), interpolation=cv2.INTER_LINEAR)
+        return a
+    finally:
+        doc.close()
+
+
+def art_mask_for_white(image_path: str, result=None, ai_path: Optional[str] = None) -> tuple:
+    """화이트를 깔 '그림 영역' 마스크와 그 출처를 돌려준다.
+      1) .ai 안 이미지에 투명도(SMask)가 있으면 그 알파(가장 정확)
+      2) 불러온 그림(PNG 등)이 투명 배경이면 그 알파
+      3) 아니면(흰 배경 등 꽉 찬 그림) 프로그램이 인식한 그림 실루엣(각 칼선 결과의 design)을 합친 것
+    Returns (bool mask, source)  source: "ai_alpha" | "alpha" | "design"."""
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        w, h = im.size
+        rgba = np.asarray(im.convert("RGBA")) if ("A" in im.getbands() or im.mode == "P") else None
+    if ai_path:
+        try:
+            a = ai_image_alpha(ai_path)
+        except Exception:  # noqa: BLE001
+            a = None
+        if a is not None and a.shape == (h, w) and float((a < 128).mean()) >= 0.02:
+            return a >= ALPHA_THRESHOLD, "ai_alpha"
+    if rgba is not None and has_transparent_background(rgba):
+        return rgba[..., 3] >= ALPHA_THRESHOLD, "alpha"
+    geoms = []
+    for r in (result if isinstance(result, (list, tuple)) else [result]):
+        d = getattr(r, "design", None) if r is not None else None
+        if d is not None and not d.is_empty:
+            geoms.append(d)
+    if not geoms:
+        return np.zeros((h, w), bool), "design"
+    return rasterize_geom(unary_union(geoms), w, h), "design"
+
+
+def supplement_missing_cuts(existing_cut, white_mask: np.ndarray, white_geom, dpi: float,
+                            offset_mm: float = DEFAULT_CUT_OFFSET_MM, merge_gap_mm: float = DEFAULT_MERGE_GAP_MM,
+                            min_piece_mm2: float = 0.5):
+    """이미 있는 칼선은 그대로 두고, 칼선이 없는 그림 조각(화이트 기준)에만 칼선을 더한다.
+
+    화이트 조각마다 기존 칼선 안에 든 비율을 재서 절반도 안 들어 있으면 "빠진 그림"으로 보고, 빠진 그림끼리만
+    화이트 기준 칼선(키스컷 좋은 예 방식)을 만든다. 새 칼선이 기존 칼선과 merge_gap_mm보다 가까우면 억지로
+    붙이거나 기존 칼선을 고치지 않고 위치만 알려 준다(사람이 확인할 곳).
+    Returns (added MultiPolygon, too_close [(x_mm, y_mm)], n_places) -- n_places = 빠진 그림 자리 수."""
+    wm = np.asarray(white_mask, np.uint8)
+    h, w = wm.shape
+    mm = 25.4 / float(dpi)
+    covered = np.zeros((h, w), bool)
+    ex_polys = []
+    if existing_cut is not None and not existing_cut.is_empty:
+        ex_polys = [Polygon(p.exterior) for p in (existing_cut.geoms if hasattr(existing_cut, "geoms") else [existing_cut])
+                    if p.geom_type == "Polygon" and not p.is_empty]
+        covered = rasterize_geom(MultiPolygon(ex_polys), w, h)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(wm, connectivity=8)
+    if n <= 1:
+        return MultiPolygon(), [], 0
+    cov = np.bincount(lab[covered & (wm > 0)], minlength=n) / np.maximum(st[:, cv2.CC_STAT_AREA], 1)
+    min_px = min_piece_mm2 / (mm * mm)
+    missing_ids = [i for i in range(1, n) if cov[i] < 0.5 and st[i, cv2.CC_STAT_AREA] >= min_px]
+    if not missing_ids:
+        return MultiPolygon(), [], 0
+    keep = np.zeros(n, bool)
+    keep[missing_ids] = True
+    miss_mask = keep[lab]
+    cands = cut_from_white_mask(miss_mask, dpi, offset_mm=offset_mm, merge_gap_mm=merge_gap_mm)
+    ex_union = unary_union(ex_polys) if ex_polys else None
+    gap_px = _mm_to_px(merge_gap_mm, dpi)
+    added, too_close = [], []
+    for c in cands.geoms:
+        if ex_union is not None and c.distance(ex_union) < gap_px:
+            q = c.representative_point()
+            too_close.append((q.x * mm, q.y * mm))
+            continue
+        added.append(c)
+    return MultiPolygon(added), too_close, len(cands.geoms)

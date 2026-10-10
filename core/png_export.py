@@ -48,3 +48,29 @@ def export_cut_png(result, out_path: str, dpi: Optional[float] = None,
         draw.line(pts, fill=rgba, width=width_px, joint="curve")
     img.save(out_path, format="PNG", dpi=(use_dpi, use_dpi))
     return out_path
+
+
+# 2026-10-05 화이트 레이어: 좋은 예(실제 납품 파일)처럼 흰색(C0 M0 Y0 K0) 면. 흰 바탕에서는 안 보이므로
+# 일러스트레이터에서 "화이트레이어" 레이어에 넣어 쓰면 된다.
+WHITE_RGB = (255, 255, 255)
+
+
+def export_white_png(white_geom, width_px: int, height_px: int, out_path: str, dpi: float = 300.0,
+                     color=WHITE_RGB) -> str:
+    """화이트 레이어(이미지 픽셀 좌표의 면)를 원본 이미지와 같은 크기의 투명 PNG에 채운다(구멍은 비움)."""
+    img = Image.new("RGBA", (int(width_px), int(height_px)), (0, 0, 0, 0))
+    mask = Image.new("L", img.size, 0)
+    md = ImageDraw.Draw(mask)
+    if white_geom is not None and not white_geom.is_empty:
+        polys = list(white_geom.geoms) if hasattr(white_geom, "geoms") else [white_geom]
+        for p in polys:
+            if p.is_empty or p.geom_type != "Polygon" or len(p.exterior.coords) < 3:
+                continue
+            md.polygon([(float(x), float(y)) for x, y in p.exterior.coords], fill=255)
+            for r in p.interiors:
+                if len(r.coords) >= 3:
+                    md.polygon([(float(x), float(y)) for x, y in r.coords], fill=0)
+    img.paste(tuple(color) + (255,), (0, 0), mask)
+    use_dpi = float(dpi) if dpi and dpi > 0 else 300.0
+    img.save(out_path, format="PNG", dpi=(use_dpi, use_dpi))
+    return out_path

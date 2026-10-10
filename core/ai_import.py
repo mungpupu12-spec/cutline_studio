@@ -123,6 +123,14 @@ def ai_raster_placement(ai_path: str, dpi: float = 300.0, page_index: int = 0) -
                     "x0_pt": r.x0 - pr.x0, "y0_pt": r.y0 - pr.y0,
                     "pt_per_px": r.width / float(info["width"]), "placements": len(rects),
                 })
+                # 2026-10-05: 같은 이미지가 대지에 여러 번 놓인 경우(마스킹테이프 롤처럼 같은 그림을
+                # 이어 붙인 구성) 놓인 자리마다 칼선·화이트를 넣을 수 있게 모든 자리를 기억한다. 크기가
+                # 첫 자리와 같은(돌리거나 키우지 않은) 자리만 -- 다르면 그 자리는 넣지 않는다.
+                same = [q for q in rects
+                        if abs(q.width - r.width) <= 0.01 * r.width and abs(q.height - r.height) <= 0.01 * r.height]
+                if len(same) > 1:
+                    out["tiles"] = [(q.x0 - pr.x0, q.y0 - pr.y0) for q in same]
+                    out["tiles_skipped"] = len(rects) - len(same)
         return out
     finally:
         doc.close()

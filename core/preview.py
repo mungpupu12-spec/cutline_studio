@@ -14,6 +14,32 @@ COLORS_RGB = {
     "safety": (0, 190, 60),
 }
 
+# 2026-10-05 화이트 레이어: 화면에서 화이트 자리를 하늘색 반투명으로 겹쳐 보여 준다(실제 저장 색은 흰색).
+WHITE_PREVIEW_RGB = (0, 170, 255)
+WHITE_PREVIEW_ALPHA = 0.38
+_WHITE_OVERLAY = {"geom": None}
+
+
+def set_white_overlay(geom):
+    """미리보기에 겹쳐 그릴 화이트 레이어(이미지 픽셀 좌표). None이면 안 그림."""
+    _WHITE_OVERLAY["geom"] = geom if (geom is not None and not geom.is_empty) else None
+
+
+def _draw_white_overlay(canvas, geom, offset_xy):
+    ox, oy = offset_xy
+    mask = Image.new("L", canvas.size, 0)
+    md = ImageDraw.Draw(mask)
+    polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    a = int(round(255 * WHITE_PREVIEW_ALPHA))
+    for poly in polys:
+        if poly.is_empty or poly.geom_type != "Polygon" or len(poly.exterior.coords) < 3:
+            continue
+        md.polygon([(x + ox, y + oy) for x, y in poly.exterior.coords], fill=a)
+        for r in poly.interiors:
+            if len(r.coords) >= 3:
+                md.polygon([(x + ox, y + oy) for x, y in r.coords], fill=0)
+    canvas.paste(WHITE_PREVIEW_RGB, (0, 0), mask)
+
 
 def _draw_multipolygon_outline(draw: ImageDraw.ImageDraw, mp, offset_xy, color, width):
     if isinstance(mp, Polygon):
@@ -49,6 +75,9 @@ def render_preview(
 
         art = image_cache.pil_open(original_image_path, "RGBA")
         canvas.paste(art, (margin_px, margin_px), art)
+
+    if _WHITE_OVERLAY["geom"] is not None:
+        _draw_white_overlay(canvas, _WHITE_OVERLAY["geom"], (margin_px, margin_px))
 
     draw = ImageDraw.Draw(canvas)
 

@@ -320,6 +320,14 @@ def load_real_grid_cells(
         if not images:
             raise ValueError(f"{ai_path}: no embedded raster image found on page {page_index}.")
 
+        # 2026-10-05(화이트 레이어 작업 중 실제 파일로 발견): 격자 레이어가 없는 파일(마스킹테이프 롤 등)도
+        # 아래에서 작업 이미지를 먼저 덮어쓴 뒤에야 "격자 없음"으로 끝났다 -- 같은 그림을 여러 번 배치한
+        # 파일이면 작업 이미지가 페이지 전체 렌더링(기존 칼선·화이트·참고 레이어까지 그려진 그림)으로 바뀌어,
+        # 자동 인식이 기존 칼선까지 그림으로 보고 SVG 저장 위치도 어긋났다. 격자 레이어부터 확인한다.
+        drawings = [d for d in page.get_drawings() if d.get("layer") == layer_name]
+        if not drawings:
+            raise ValueError(f"{ai_path}: no shapes found on layer '{layer_name}'.")
+
         from PIL import Image as PILImage
 
         if len(images) == 1:
@@ -356,10 +364,6 @@ def load_real_grid_cells(
                 iw, ih = im.size
             sx = sy = zoom
             rx0, ry0, rx1, ry1 = page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1
-
-        drawings = [d for d in page.get_drawings() if d.get("layer") == layer_name]
-        if not drawings:
-            raise ValueError(f"{ai_path}: no shapes found on layer '{layer_name}'.")
 
         # 2026-09-08(9차): 칸을 "시트 전체를 가로지르는 선"이 아니라 칸마다
         # 이미 닫힌 사각형 하나로 그려 놓은 형태(_extract_closed_rect_cells
