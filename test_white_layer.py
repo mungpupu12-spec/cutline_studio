@@ -201,3 +201,91 @@ def test_kisscut_auto_uses_shape_based_cut_for_transparent_art():
         assert not app._wl_kisscut_auto(flat)
     finally:
         app.destroy()
+
+
+def test_white_checkbox_toggles_save_and_preview():
+    """2026-10-11: "화이트 없음" 글자 대신 체크칸 -- 끄면 화면·저장에서 빠지고 켜면 다시 들어간다."""
+    from core import preview
+    from gui.app import CutLineApp
+
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app._show_note_dialog = lambda *a, **k: None
+        src = os.path.join(SAMPLES, "sheet_char_1.png")
+        app.input_path.set(src)
+        assert not app.white_on.get() and app._wl_active_geom() is None
+        mask, geom, source = app._wl_compute(src)
+        app._wl_made(src, mask, geom, source)
+        assert app.white_on.get() and app._wl_active_geom() is geom and preview._WHITE_OVERLAY["geom"] is geom
+        app.white_on.set(False)
+        app._on_white_check()
+        assert app._wl_active_geom() is None and preview._WHITE_OVERLAY["geom"] is None
+        app.white_on.set(True)
+        app._on_white_check()
+        assert app._wl_active_geom() is geom and preview._WHITE_OVERLAY["geom"] is geom
+        app._wl_clear()
+        assert not app.white_on.get()
+    finally:
+        app.destroy()
+
+
+def test_white_only_view_hides_art():
+    """2026-10-11: '화이트만' 보기는 그림을 빼고 화이트(파란색)만, '적용된 모습'은 그림을 얹어서."""
+    from core import preview
+    from core.cutline_core import CutlineResult, OffsetSpec
+    from PIL import Image
+
+    src = os.path.join(SAMPLES, "sheet_char_1.png")
+    a = np.asarray(Image.open(src).convert("RGBA"))
+    m = a[..., 3] >= 64
+    g = wl.mask_to_geom(m)
+    res = CutlineResult(dpi=300.0, width_px=a.shape[1], height_px=a.shape[0], design=g, offsets={},
+                        offset_mm=OffsetSpec(0, 0, 0))
+    d = tempfile.mkdtemp()
+    try:
+        preview.set_white_overlay(g)
+        ys, xs = np.nonzero(a[..., 3] == 255)
+        y, x = int(ys[len(ys) // 2]), int(xs[len(xs) // 2])
+        preview.set_white_only(False)
+        on = np.asarray(Image.open(preview.render_preview(res, os.path.join(d, "a.png"), original_image_path=src)))
+        preview.set_white_only(True)
+        only = np.asarray(Image.open(preview.render_preview(res, os.path.join(d, "b.png"), original_image_path=src)))
+        mg = 40
+        assert tuple(only[y + mg, x + mg]) == preview.WHITE_PREVIEW_RGB          # 화이트만: 파란색
+        assert tuple(on[y + mg, x + mg]) == tuple(a[y, x, :3])                  # 적용된 모습: 그림 색
+    finally:
+        preview.set_white_only(False)
+        preview.set_white_overlay(None)
+
+
+def test_help_guide_opens_with_every_section():
+    from gui.app import CutLineApp
+    from gui.help_guide import HELP_SECTIONS
+
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        win = app._show_help_guide()
+        app.update()
+        texts = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    texts.append(c.cget("text"))
+                except Exception:  # noqa: BLE001
+                    pass
+                walk(c)
+        walk(win)
+        for title, _what, _hows in HELP_SECTIONS:
+            assert title in texts, title
+        assert any("화이트만" in t for t in texts if isinstance(t, str))
+        assert app._show_help_guide() is None  # 이미 열려 있으면 그 창을 앞으로
+        win.destroy()
+    finally:
+        app.destroy()

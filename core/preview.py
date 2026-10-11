@@ -20,12 +20,18 @@ COLORS_RGB = {
 # 화이트 외곽선을 파란 선으로 한 번 더 그린다(꽉 찬 그림에서도 화이트 범위가 보이게).
 WHITE_PREVIEW_RGB = (40, 110, 255)
 WHITE_PREVIEW_EDGE_RGB = (0, 70, 230)
-_WHITE_OVERLAY = {"geom": None}
+_WHITE_OVERLAY = {"geom": None, "only": False}
 
 
 def set_white_overlay(geom):
     """미리보기에 겹쳐 그릴 화이트 레이어(이미지 픽셀 좌표). None이면 안 그림."""
     _WHITE_OVERLAY["geom"] = geom if (geom is not None and not geom.is_empty) else None
+
+
+def set_white_only(only: bool):
+    """2026-10-11(멍푸: "화이트 레이어가 적용 된 모습과, 화이트 레이어만 볼 수 있게 해"): True면 그림을
+    빼고 화이트(파란색)와 칼선만 그린다. False면 그림이 화이트 위에 얹힌 모습."""
+    _WHITE_OVERLAY["only"] = bool(only)
 
 
 def _white_polys(geom):
@@ -90,7 +96,7 @@ def render_preview(
     if white is not None:
         _draw_white_fill(canvas, white, (margin_px, margin_px))
 
-    if original_image_path:
+    if original_image_path and not (white is not None and _WHITE_OVERLAY["only"]):
         from . import image_cache
 
         art = image_cache.pil_open(original_image_path, "RGBA")

@@ -103,6 +103,7 @@ from core import license_client as lic
 from core import glass_theme
 from gui.path_editor import PathEditorMixin
 from gui.white_layer_ui import WhiteLayerMixin
+from gui.help_guide import HelpGuideMixin
 
 try:
     from PIL import Image, ImageTk
@@ -482,7 +483,7 @@ ctk.set_default_color_theme("blue")
 
 
 
-class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
+class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
     def __init__(self):
         super().__init__()
         # 2026-08-31 피드백("검정 화면이 또 뜨고 없애면 모든 창이 꺼져"):
@@ -1879,6 +1880,10 @@ class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 내부 상태만 처음 상태로(디스크의 파일은 건드리지 않음).
         self._btn_secondary(header_bar, "화면 초기화", self._on_reset_all).pack(
             side="right", padx=(12, 4),
+        )
+        # 2026-10-11(멍푸: "각 기능에 대한 개념, 사용방법을 화면 초기화 옆에 클릭하면 해설이 나오게 해")
+        self._btn_secondary(header_bar, "❔ 도움말", self._show_help_guide).pack(
+            side="right", padx=(12, 0),
         )
         # 진행 상태 한 줄: 경로/오류 원문처럼 긴 문구는 짧게 줄여서(_on_status_changed).
         status_pill = ctk.CTkFrame(header_bar, fg_color=BG_CARD, corner_radius=17, height=36,
@@ -6303,9 +6308,9 @@ class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             if out_path.lower().endswith(".svg"):
                 # 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장(2026-09-29)
                 export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
-                           placement=placement, white_geom=self._white_geom)
+                           placement=placement, white_geom=self._wl_active_geom())
                 lines = [out_path]
-                if self._white_geom is not None:
+                if self._wl_active_geom() is not None:
                     lines.append("화이트 레이어도 같은 파일 안 '화이트레이어'에 흰색으로 넣었어요.")
                 tiles = (placement or {}).get("tiles") or []
                 if len(tiles) > 1:

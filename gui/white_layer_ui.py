@@ -34,7 +34,11 @@ class WhiteLayerMixin:
         self._ai_source_path = None    # .ai로 열었으면 그 원본 경로(안 이미지의 투명도를 읽음)
         self.white_choke_mm = tk.DoubleVar(value=wl.DEFAULT_CHOKE_MM)
         self.white_cut_offset_mm = tk.DoubleVar(value=wl.DEFAULT_CUT_OFFSET_MM)
-        self.white_status = tk.StringVar(value="화이트 없음")
+        self.white_status = tk.StringVar(value="화이트 넣기")
+        # 2026-10-11(멍푸: "표시한 문구 체크 표기 할 수 있게 해"): "화이트 없음" 글자 대신 체크칸 --
+        # 켜면 화이트를 만들고(이미 있으면 다시 보이게) 저장에 넣고, 끄면 화면·저장에서 뺀다.
+        self.white_on = tk.BooleanVar(value=False)
+        self.white_view = tk.StringVar(value="적용된 모습")
         self._wl_busy = False
 
     # ---- 화면 --------------------------------------------------------------
@@ -43,10 +47,19 @@ class WhiteLayerMixin:
             parent, "화이트 레이어",
             "투명 스티커 밑에 까는 흰색 바탕",
         )
-        ctk.CTkLabel(
-            sec, textvariable=self.white_status, font=self.font_body, text_color="#111111",
-            anchor="w", justify="left", wraplength=300,
-        ).pack(fill="x", pady=(4, 4))
+        from gui.app import ACCENT, ACCENT_HOVER, TEXT_PRIMARY
+
+        self._white_check = self._wrap_checkbox(ctk.CTkCheckBox(
+            sec, textvariable=self.white_status, variable=self.white_on, command=self._on_white_check,
+            font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+        ))
+        self._white_check.pack(anchor="w", pady=(4, 4))
+        # 보기: 그림이 화이트 위에 얹힌 모습 / 화이트만(2026-10-11)
+        self._white_view_btn = ctk.CTkSegmentedButton(
+            sec, values=["적용된 모습", "화이트만"], variable=self.white_view, command=self._on_white_view,
+            font=self.font_body, selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+        )
+        self._white_view_btn.pack(fill="x", pady=(2, 6))
         self._make_number_field(sec, "화이트 크기 조정", self.white_choke_mm, from_=0.0, to=1.0, increment=0.05)
         self._white_make_btn = self._btn_secondary(sec, "⬜ 화이트 레이어 만들기", self._on_make_white)
         self._white_make_btn.pack(fill="x", pady=(4, 6))
@@ -64,8 +77,50 @@ class WhiteLayerMixin:
         self._white_mask = None
         self._white_source = ""
         set_white_overlay(None)
+        from core.preview import set_white_only
+
+        set_white_only(False)
+        if hasattr(self, "white_view"):
+            self.white_view.set("적용된 모습")
         if hasattr(self, "white_status"):
-            self.white_status.set("화이트 없음")
+            self.white_status.set("화이트 넣기")
+        if hasattr(self, "white_on"):
+            self.white_on.set(False)
+
+    def _on_white_view(self, _value=None):
+        from core.preview import set_white_only
+
+        only = self.white_view.get() == "화이트만"
+        set_white_only(only)
+        if self._wl_active_geom() is None:
+            if only:
+                self.status.set("화이트를 먼저 만들어 주세요(체크칸 또는 '화이트 레이어 만들기').")
+            return
+        self.status.set("화이트만 보고 있어요(그림 숨김)." if only else "그림이 화이트 위에 얹힌 모습이에요.")
+        path = self.input_path.get()
+        if path and os.path.exists(path):
+            self._wl_rerender(path)
+
+    def _wl_active_geom(self):
+        """저장·화면에 쓸 화이트(체크를 끄면 None)."""
+        return self._white_geom if (self._white_geom is not None and self.white_on.get()) else None
+
+    def _on_white_check(self):
+        from core.preview import set_white_overlay
+
+        if self.white_on.get():
+            if self._white_geom is None:
+                self.white_on.set(False)   # 다 만들어지면 켜짐(_wl_made)
+                self._on_make_white()
+                return
+            set_white_overlay(self._white_geom)
+            self.status.set("화이트를 다시 넣었어요. 칼선을 저장하면 같이 저장돼요.")
+        else:
+            set_white_overlay(None)
+            self.status.set("화이트를 뺐어요. 저장할 때 화이트는 안 들어가요.")
+        path = self.input_path.get()
+        if path and os.path.exists(path) and getattr(self, "_preview_full_image", None) is not None:
+            self._wl_rerender(path)
 
     def _wl_image_dpi(self):
         """작업 이미지 1px의 실제 해상도(dpi) -- mm 값을 픽셀로 바꿀 때."""
@@ -147,7 +202,8 @@ class WhiteLayerMixin:
         self._white_mask, self._white_geom, self._white_source = mask, geom, source
         set_white_overlay(geom)
         n = len(geom.geoms) if hasattr(geom, "geoms") else 1
-        self.white_status.set(f"화이트 완성 ({n}조각) · 화면에선 파란색, 저장은 흰색")
+        self.white_on.set(True)
+        self.white_status.set(f"화이트 넣기 ({n}조각) · 화면은 파란색, 저장은 흰색")
         self._wl_rerender(path)
         self.status.set("화이트 레이어를 만들었어요. 칼선을 저장하면 같이 저장돼요.")
         if then:
@@ -269,7 +325,7 @@ class WhiteLayerMixin:
     # ---- 내보내기 ------------------------------------------------------------
     def _wl_export_png(self, cut_png_path, dpi):
         """칼선 PNG 옆에 화이트 PNG(같은 크기, 흰색 면)를 저장. 저장한 경로(없으면 None)."""
-        if self._white_geom is None or self._last_result is None:
+        if self._wl_active_geom() is None or self._last_result is None:
             return None
         from core.png_export import export_white_png
 
