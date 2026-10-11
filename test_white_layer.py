@@ -292,13 +292,15 @@ def test_help_guide_opens_with_every_section():
 
 
 def test_tooltips_short_and_cover_every_control():
-    """2026-10-11: 마우스를 2초 올려 두면 10자 이내 설명이 뜬다. 모든 버튼·체크박스·숫자 칸에 설명이 있어야 한다."""
+    """2026-10-11: 마우스를 2초 올려 두면 15자 이내 설명이 뜬다. 모든 버튼·체크박스·숫자 칸에 설명이 있어야 한다."""
     import customtkinter as ctk
     from gui.app import CutLineApp
     from gui import tooltips as tt
 
     for t in list(tt.TIPS.values()) + list(tt.FIELD_TIPS.values()) + list(tt.SECTION_TIPS.values()):
         assert 0 < len(t) <= tt.MAX_TIP_LEN, t
+        assert t.endswith("니다"), t   # 짧은 문장(~합니다/~입니다)
+    assert tt.MAX_TIP_LEN == 15
     assert tt.TIP_DELAY_MS == 2000
 
     app = CutLineApp()
@@ -360,7 +362,7 @@ def test_tooltips_short_and_cover_every_control():
         deadline = __import__("time").time() + 2
         while mgr.visible_text is None and __import__("time").time() < deadline:
             app.update()
-        assert mgr.visible_text == "기능 설명 보기"
+        assert mgr.visible_text == "기능 설명을 봅니다"
         mgr._on_press(Ev)                    # 누르면 사라짐
         assert mgr.visible_text is None
     finally:

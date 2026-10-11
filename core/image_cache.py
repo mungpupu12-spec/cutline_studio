@@ -47,16 +47,34 @@ def _put(key, sig, value):
             _cache.popitem(last=False)
 
 
+def _cv2_read(path, flags):
+    """cv2.imread. 단, 윈도우에서 cv2.imread는 경로에 한글이 있으면 파일이 있어도 None을 준다
+    (2026-10-12 멍푸: "PNG 파일이 불러오기가 안돼" -- 멍푸 PC에서 바탕화면 한글 폴더의 PNG로 확인:
+    cv2.imread None, 같은 파일을 영문 경로로 복사하면 정상). 그때는 파일 바이트를 직접 읽어
+    cv2.imdecode로 푼다. 영문 경로는 예전과 똑같이 cv2.imread를 쓴다."""
+    img = cv2.imread(path, flags)
+    if img is None and os.path.isfile(path):
+        try:
+            import numpy as np
+
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size:
+                img = cv2.imdecode(data, flags)
+        except Exception:  # noqa: BLE001
+            img = None
+    return img
+
+
 def imread(path, flags=cv2.IMREAD_COLOR):
-    """cv2.imread와 같지만 캐시된 읽기 전용 배열을 돌려준다(읽기 실패 시 None)."""
+    """cv2.imread와 같지만 캐시된 읽기 전용 배열을 돌려준다(읽기 실패 시 None). 한글 경로도 읽는다."""
     sig = _signature(path)
     if sig is None:
-        return cv2.imread(path, flags)
+        return _cv2_read(path, flags)
     key = ("cv2", os.path.abspath(path), int(flags))
     hit = _get(key, sig)
     if hit is not None:
         return hit
-    img = cv2.imread(path, flags)
+    img = _cv2_read(path, flags)
     if img is None:
         return None
     img.setflags(write=False)
