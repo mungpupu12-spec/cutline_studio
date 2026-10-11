@@ -5571,8 +5571,9 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # ("반복되는 스티커는 한개의 칼선을 먼저 완성하고 나머지에 그대로
         # 적용해") 그대로 유지, 격자 없는 파일용 대체 경로(else)는 그대로.
         suspicious_regions_px: list = []
-        # 2026-10-11: 키스컷 + 투명 배경 그림은 그림 모양 기준 칼선으로(gui.white_layer_ui._wl_kisscut_auto)
-        if self.job_type.get() == "MASKING_TAPE" and not self._real_grid_cells_px and self._wl_kisscut_auto(path):
+        # 2026-10-11/12: 투명 배경 그림(키스컷·유테)과 진한 배경 위 흰 테두리 스티커는 그림 모양 기준 칼선으로
+        # (gui.white_layer_ui._shape_cut_auto). 격자가 있는 파일은 예전 방식.
+        if not self._real_grid_cells_px and self._shape_cut_auto(path):
             return
         try:
             if self._real_grid_cells_px and self.job_type.get() == "DOMUSONG":

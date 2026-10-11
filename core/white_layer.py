@@ -211,6 +211,72 @@ def art_mask_for_white(image_path: str, result=None, ai_path: Optional[str] = No
     return rasterize_geom(unary_union(geoms), w, h), "design"
 
 
+def sticker_border_mask(rgb: np.ndarray, dpi: float, min_sticker_mm2: float = 15.0) -> Optional[np.ndarray]:
+    """흰 테두리가 둘린 스티커가 진하고 화려한 배경(그러데이션, 격자, 반짝이) 위에 놓인 시트에서 스티커 모양
+    (흰 테두리 바깥선까지)을 찾는다(2026-10-12 멍푸: "배경색이 진하고 화려해도 정확한 칼선을 따야해").
+
+    실제 시트(파란 그러데이션 + 연한 격자 + 흰 반짝이, 스티커마다 흰 테두리 약 1.8mm)에서 확인한 방법:
+      1) 흰색(밝고 무채색)만 고른다 -- 격자는 연한 파랑이라 빠진다.
+      2) 0.3mm보다 가는 흰 선(반짝이 빛줄기 등)은 깎아 낸다.
+      3) 흰 테두리가 감싼 안쪽을 채운다(그림이 들어 있는 닫힌 테두리).
+      4) 안에 그림(흰색 아닌 곳)이 15% 이상 있고 충분히 큰 덩어리만 스티커로 본다 -- 흰 반짝이·점은 빠진다.
+    결과: 그림을 100% 덮고, 테두리 바깥선을 따라감(그림에서 최대 약 2mm).
+    배경이 흰색이거나(가장자리가 대부분 흰색) 스티커가 없으면 None -- 이때는 예전 방식 그대로."""
+    if cv2 is None:
+        return None
+    a = np.asarray(rgb)
+    if a.ndim != 3 or a.shape[2] < 3:
+        return None
+    a = a[..., :3].astype(np.int16)
+    h, w = a.shape[:2]
+    mn = a.min(axis=2)
+    mx = a.max(axis=2)
+    white = ((mn >= 225) & ((mx - mn) <= 30)).astype(np.uint8)
+    edge = np.concatenate([white[0], white[-1], white[:, 0], white[:, -1]])
+    if float(edge.mean()) > 0.3:          # 흰 배경 시트 -- 흰 테두리를 배경과 구분할 수 없음
+        return None
+    r = max(1, int(round(_mm_to_px(0.3, dpi))))
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, _disk(r))
+    inv = (1 - white).astype(np.uint8)
+    n, lab, _, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    outside = np.isin(lab, np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    filled = (~outside).astype(np.uint8)
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(filled, connectivity=8)
+    if n2 <= 1:
+        return None
+    min_area = _mm_to_px(1.0, dpi) ** 2 * float(min_sticker_mm2)
+    nonwhite = np.bincount(lab2[white == 0].ravel(), minlength=n2)
+    keep = np.zeros(n2, bool)
+    for i in range(1, n2):
+        area = st2[i, cv2.CC_STAT_AREA]
+        if area >= min_area and nonwhite[i] >= 0.15 * area:
+            keep[i] = True
+    if not keep.any():
+        return None
+    m = keep[lab2]
+    if float(m.mean()) > 0.85:            # 거의 전체가 스티커 -- 배경을 못 찾은 것
+        return None
+    return m
+
+
+def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None) -> tuple:
+    """그림 모양 기준 칼선을 만들 수 있는 마스크와 종류.
+      ("ai_alpha" | "alpha", 그림 마스크): 투명 배경 그림 -- 칼선은 그림에서 띄운다.
+      ("sticker", 스티커 마스크): 진한 배경 위 흰 테두리 스티커 -- 칼선은 흰 테두리 바깥선.
+      (None, None): 둘 다 아님(예전 방식)."""
+    art, src = art_mask_for_white(image_path, None, ai_path=ai_path)
+    if src in ("ai_alpha", "alpha") and art.any():
+        return src, art
+    from PIL import Image
+
+    with Image.open(image_path) as im:
+        rgb = np.asarray(im.convert("RGB"))
+    m = sticker_border_mask(rgb, dpi)
+    if m is not None:
+        return "sticker", m
+    return None, None
+
+
 def supplement_missing_cuts(existing_cut, white_mask: np.ndarray, white_geom, dpi: float,
                             offset_mm: float = DEFAULT_CUT_OFFSET_MM, merge_gap_mm: float = DEFAULT_MERGE_GAP_MM,
                             min_piece_mm2: float = 0.5):

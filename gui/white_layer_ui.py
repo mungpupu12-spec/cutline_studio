@@ -342,41 +342,78 @@ class WhiteLayerMixin:
 
     # ---- 키스컷 자동 인식(2026-10-11) -------------------------------------------
     def _wl_kisscut_auto(self, path) -> bool:
-        """멍푸: "칼선 종류에 키스컷 포함해서 칼선이 왜 제대로 인식 안 되는지 파악해" -- 키스컷 롤을 요소마다
-        상자로 나눠 실루엣을 따로 따던 예전 방식은, 흩어진 반짝이·작은 별 묶음을 사각형으로 잡거나(실루엣 실패)
-        칼선이 그림 안을 가로지르고, 좋은 예처럼 가까운 조각을 한 칼선으로 묶지 못했다(좋은 예 대조 67개 중 34~40개
-        일치). 그림이 투명 배경(.ai 안 투명도 또는 PNG 알파)이면 좋은 예와 같은 방식 -- 그림 모양에서 고르게 띄운
-        칼선, 가까운 조각은 합침 -- 으로 만든다(좋은 예와 60개 모두 일치). 꽉 찬 그림이면 False(예전 방식 그대로).
-        작업 스레드에서 불린다."""
+        """키스컷 자동(예전 이름 그대로 -- _shape_cut_auto 참고)."""
+        return self._shape_cut_auto(path)
+
+    # 그림 모양 기준 칼선을 쓰는 작업 종류. 투명 배경 그림은 키스컷·유테만(무테·자동 생성은 예전 방식),
+    # 흰 테두리 스티커 시트는 넷 다(흰 테두리 바깥선이 곧 자를 선).
+    SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART")
+    SHAPE_CUT_STICKER_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS", "AUTO_STYLE")
+
+    def _shape_cut_auto(self, path) -> bool:
+        """그림 모양 기준으로 칼선을 한 번에 만든다. 못 쓰는 그림이면 False(예전 방식으로). 작업 스레드에서 불린다.
+
+        2026-10-11(멍푸: "칼선 종류에 키스컷 포함해서 칼선이 왜 제대로 인식 안 되는지 파악해"): 키스컷 롤을 요소마다
+        상자로 나눠 실루엣을 따로 따던 예전 방식은, 흩어진 반짝이·작은 별 묶음을 사각형으로 잡거나 칼선이 그림 안을
+        가로지르고 가까운 조각을 한 칼선으로 묶지 못했다. 투명 배경 그림이면 좋은 예 방식 -- 그림 모양에서 고르게
+        띄운 칼선, 가까운 조각은 합침 -- 으로 만든다(좋은 예와 60개 모두 일치).
+        2026-10-12(멍푸: "png 칼선 오류 고쳐", "칼선이 체크 된건 다 만들어져야해 배경색이 진하고 화려해도 정확한
+        칼선을 따야해"): 실제 PNG 두 장으로 확인 --
+          - 투명 배경 PNG + 유테: 연한 하늘색 털 같은 밝은 부분을 배경으로 보고 칼선이 그림 안을 가로질렀다.
+            -> 유테도 투명도로 그림 모양을 잡고 유테 간격만큼 띄운다.
+          - 파란 그러데이션·격자·반짝이 배경 위 흰 테두리 스티커: 배경을 한 가지 색으로 보지 못해 칼선 3개만
+            나왔다(스티커 6개 이상). -> 흰 테두리 스티커를 찾아 테두리 바깥선을 칼선으로(core.white_layer.
+            sticker_border_mask). 가까운 칼선(2mm 미만)은 합친다."""
         from core.accumulate import combine_results
         from core.cutline_core import CutlineResult, OffsetSpec
         from core.preview import render_preview
         from gui.app import _work_file_dir
 
         try:
-            ai_path = self._ai_source_path
-            art, source = wl.art_mask_for_white(path, None, ai_path=ai_path)
-            if source == "design" or not art.any():
+            job = self.job_type.get()
+            if job not in self.SHAPE_CUT_STICKER_JOBS:
                 return False
             dpi = self._wl_image_dpi()
-            off = max(0.1, float(self.white_cut_offset_mm.get()))
-            mask = wl.build_white_mask(art, dpi)
-            cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
+            kind, mask = wl.shape_cut_source(path, dpi, ai_path=self._ai_source_path)
+            if kind is None or (kind != "sticker" and job not in self.SHAPE_CUT_ALPHA_JOBS):
+                return False
+            if kind == "sticker":
+                off = 0.0
+                cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0)
+                msg = f"흰 테두리 스티커 {{n}}개에 칼선을 만들었습니다(흰 테두리 바깥선)."
+            else:
+                if job == "MASKING_TAPE":
+                    off = max(0.1, float(self.white_cut_offset_mm.get()))
+                    msg = (f"키스컷 칼선 {{n}}개를 만들었습니다(그림에서 {off:.1f}mm). "
+                           "간격은 아래 '화이트 레이어'의 '칼선 간격'에서 바꿀 수 있습니다.")
+                else:
+                    off = max(0.1, float(self.style_margin_mm.get()))
+                    msg = (f"유테 칼선 {{n}}개를 만들었습니다(그림에서 {off:.1f}mm). "
+                           "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
+                mask = wl.build_white_mask(mask, dpi)
+                cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
             if cuts.is_empty:
                 return False
             h, w = mask.shape
             item = CutlineResult(
                 dpi=float(self.dpi.get()), width_px=w, height_px=h, design=wl.mask_to_geom(mask),
                 offsets={"cut": cuts}, offset_mm=OffsetSpec(off, off, off),
-                adjustments=[f"키스컷 칼선 {len(cuts.geoms)}개를 만들었어요(그림에서 {off:.1f}mm). "
-                             "간격은 아래 '화이트 레이어'의 '칼선 간격'에서 바꿀 수 있어요."],
             )
+            # 안내 문구는 adjustments(자동 조정)가 아니라 상태 줄에 -- adjustments에 넣으면 _show_preview가
+            # "자동 조정 안내" 창을 띄우고 이 칼선의 간격(스티커는 0)을 유테/무테 간격 칸에 덮어써서, 다음
+            # 그림의 유테 간격이 0이 됐다(2026-10-12 멍푸 PC에서 확인: 스티커판 다음 투명판 유테가 0.1mm).
+            done_msg = "자동 인식 완료: " + msg.format(n=len(cuts.geoms))
             self._accumulated.append(item)
             combined = combine_results(self._accumulated)
             png = os.path.join(_work_file_dir(), "_last_preview.png")
             render_preview(combined, png, original_image_path=path, async_save=True)
             self._last_result = combined
-            self.after(0, self._show_preview, png, item)
+
+            def _show():
+                self._show_preview(png, item)
+                self.status.set(done_msg)
+
+            self.after(0, _show)
             return True
         except Exception:  # noqa: BLE001 -- 실패하면 예전 방식으로
             traceback.print_exc()

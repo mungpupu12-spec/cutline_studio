@@ -359,9 +359,10 @@ def test_tooltips_short_and_cover_every_control():
         mgr._on_enter(Ev)
         assert mgr._job is not None and mgr.visible_text is None
         mgr._on_enter(Ev)                    # 같은 버튼 안 -> 예약을 새로 만들지 않음
-        deadline = __import__("time").time() + 2
-        while mgr.visible_text is None and __import__("time").time() < deadline:
-            app.update()
+        # 예약된 표시를 바로 실행(전체 시험 중에는 다른 창의 실제 Enter/Leave가 끼어들어 기다리면 흔들림 --
+        # 실제 마우스로 2초에 뜨는 것은 Xvfb에서 따로 확인함)
+        app.after_cancel(mgr._job)
+        mgr._show()
         assert mgr.visible_text == "기능 설명을 봅니다"
         mgr._on_press(Ev)                    # 누르면 사라짐
         assert mgr.visible_text is None
