@@ -147,3 +147,57 @@ def test_gui_make_white_and_cut_from_white():
         assert app._white_geom is None
     finally:
         app.destroy()
+
+
+def test_page_render_hides_cut_white_guide_layers():
+    """2026-10-11: 페이지를 통째로 그릴 때(서로 다른 그림 여러 장) 칼선·화이트·참고 레이어는 빼고 그림 레이어만.
+    레이어 이름 규칙을 보는 시험이라 PDF를 직접 만든다."""
+    import fitz
+    from PIL import Image
+    from core.ai_import import load_ai_as_raster
+
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "t.ai")
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=100)
+    art = doc.add_ocg("图案도안")
+    cut = doc.add_ocg("刀线칼선")
+    ref = doc.add_ocg("参考삭제x")
+    for i, (x, oc) in enumerate(((20, art), (120, art))):   # 서로 다른 그림 두 장 -> 페이지 통째로 그리는 경로
+        pm = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 20 + i, 20), False)
+        pm.set_rect(pm.irect, (200, 30 * i, 40))
+        page.insert_image(fitz.Rect(x, 30, x + 40, 70), pixmap=pm, oc=oc)
+    page.draw_rect(fitz.Rect(5, 5, 195, 95), color=(1, 0, 1), width=2, oc=cut)
+    page.draw_line(fitz.Point(0, 50), fitz.Point(200, 50), color=(0, 1, 0), width=2, oc=ref)
+    doc.save(src)
+    out = os.path.join(d, "r.png")
+    load_ai_as_raster(src, out, dpi=72)
+    a = np.asarray(Image.open(out).convert("RGBA"))
+    assert a[50, 40, 3] == 255                     # 그림
+    assert a[6, 100, 3] == 0 and a[50, 100, 3] == 0  # 칼선 레이어 선, 참고 레이어 선은 안 그림
+
+
+def test_kisscut_auto_uses_shape_based_cut_for_transparent_art():
+    from gui.app import CutLineApp
+
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app._show_note_dialog = lambda *a, **k: None
+        shown = []
+        app.after = lambda ms, f, *a: shown.append(f)
+        src = os.path.join(SAMPLES, "scene.png")
+        app.input_path.set(src)
+        app.job_type.set("MASKING_TAPE")
+        assert app._wl_kisscut_auto(src)
+        cut = app._last_result.offsets["cut"]
+        assert len(cut.geoms) >= 1 and shown
+        # 꽉 찬(투명하지 않은) 그림이면 예전 방식으로 넘긴다
+        from PIL import Image
+        flat = os.path.join(tempfile.mkdtemp(), "flat.png")
+        Image.open(src).convert("RGB").save(flat)
+        assert not app._wl_kisscut_auto(flat)
+    finally:
+        app.destroy()

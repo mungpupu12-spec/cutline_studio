@@ -283,3 +283,46 @@ class WhiteLayerMixin:
         export_white_png(self._white_geom, self._last_result.width_px, self._last_result.height_px, out,
                          dpi=dpi or self._wl_image_dpi())
         return out
+
+    # ---- 키스컷 자동 인식(2026-10-11) -------------------------------------------
+    def _wl_kisscut_auto(self, path) -> bool:
+        """멍푸: "칼선 종류에 키스컷 포함해서 칼선이 왜 제대로 인식 안 되는지 파악해" -- 키스컷 롤을 요소마다
+        상자로 나눠 실루엣을 따로 따던 예전 방식은, 흩어진 반짝이·작은 별 묶음을 사각형으로 잡거나(실루엣 실패)
+        칼선이 그림 안을 가로지르고, 좋은 예처럼 가까운 조각을 한 칼선으로 묶지 못했다(좋은 예 대조 67개 중 34~40개
+        일치). 그림이 투명 배경(.ai 안 투명도 또는 PNG 알파)이면 좋은 예와 같은 방식 -- 그림 모양에서 고르게 띄운
+        칼선, 가까운 조각은 합침 -- 으로 만든다(좋은 예와 60개 모두 일치). 꽉 찬 그림이면 False(예전 방식 그대로).
+        작업 스레드에서 불린다."""
+        from core.accumulate import combine_results
+        from core.cutline_core import CutlineResult, OffsetSpec
+        from core.preview import render_preview
+        from gui.app import _work_file_dir
+
+        try:
+            ai_path = self._ai_source_path
+            art, source = wl.art_mask_for_white(path, None, ai_path=ai_path)
+            if source == "design" or not art.any():
+                return False
+            dpi = self._wl_image_dpi()
+            off = max(0.1, float(self.white_cut_offset_mm.get()))
+            mask = wl.build_white_mask(art, dpi)
+            cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
+            if cuts.is_empty:
+                return False
+            h, w = mask.shape
+            item = CutlineResult(
+                dpi=float(self.dpi.get()), width_px=w, height_px=h, design=wl.mask_to_geom(mask),
+                offsets={"cut": cuts}, offset_mm=OffsetSpec(off, off, off),
+                adjustments=[f"투명 배경 그림이라 그림 모양에서 {off:.1f}mm 띄운 키스컷 칼선 {len(cuts.geoms)}개를 "
+                             "만들었습니다(가까운 조각은 하나로 합침 -- 키스컷 좋은 예 방식). 간격은 '화이트 레이어' "
+                             "카드의 '칼선 간격'에서 바꿀 수 있습니다."],
+            )
+            self._accumulated.append(item)
+            combined = combine_results(self._accumulated)
+            png = os.path.join(_work_file_dir(), "_last_preview.png")
+            render_preview(combined, png, original_image_path=path, async_save=True)
+            self._last_result = combined
+            self.after(0, self._show_preview, png, item)
+            return True
+        except Exception:  # noqa: BLE001 -- 실패하면 예전 방식으로
+            traceback.print_exc()
+            return False

@@ -85,11 +85,44 @@ def load_ai_as_raster(ai_path: str, out_path: str, dpi: float = 300.0, page_inde
         #      잃어버리므로, 모든 모티프가 실제 배치대로 합성된 페이지
         #      전체를 쓰는 것만이 올바르다.
         zoom = max(dpi, 1.0) / 72.0
+        _hide_non_art_layers(doc)
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=True)
         pix.save(out_path)
         return out_path
     finally:
         doc.close()
+
+
+# 2026-10-11(멍푸: "칼선 종류에 키스컷 포함해서 칼선이 왜 제대로 인식 안 되는지 파악해"): 페이지를 통째로
+# 그리면 그림이 아닌 레이어(이미 그려 둔 칼선, 화이트, 참고·가이드 선, "제출시 삭제")까지 작업 이미지에
+# 들어가, 자동 인식이 롤 전체를 가로지르는 가이드 선과 옛 칼선을 그림으로 봤다(실제 키스컷 롤 파일로 확인).
+# 이름으로 이런 레이어를 알아보고 끈 채 그린다. 그림 레이어가 하나도 안 남으면 아무것도 끄지 않는다.
+_NON_ART_LAYER_WORDS = ("칼선", "刀线", "화이트", "白墨", "参考", "참고", "삭제", "가이드", "guide", "재단",
+                        "cut", "white")
+
+
+def _is_non_art_layer(name: str) -> bool:
+    n = (name or "").lower()
+    return any(w in n for w in _NON_ART_LAYER_WORDS)
+
+
+def _hide_non_art_layers(doc) -> list:
+    """그림이 아닌 레이어를 끈다(이 열린 문서 안에서만, 파일은 그대로). 끈 레이어 이름 목록."""
+    try:
+        cfgs = doc.layer_ui_configs()
+    except Exception:  # noqa: BLE001
+        return []
+    if not cfgs:
+        return []
+    hide = [c for c in cfgs if _is_non_art_layer(c.get("text", ""))]
+    if not hide or len(hide) == len(cfgs):
+        return []
+    for c in cfgs:
+        try:
+            doc.set_layer_ui_config(c["number"], action=2 if c in hide else 0)
+        except Exception:  # noqa: BLE001
+            pass
+    return [c.get("text", "") for c in hide]
 
 
 def ai_raster_placement(ai_path: str, dpi: float = 300.0, page_index: int = 0) -> dict:
