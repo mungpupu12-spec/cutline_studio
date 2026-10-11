@@ -1882,7 +1882,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             side="right", padx=(12, 4),
         )
         # 2026-10-11(멍푸: "각 기능에 대한 개념, 사용방법을 화면 초기화 옆에 클릭하면 해설이 나오게 해")
-        self._btn_secondary(header_bar, "❔ 도움말", self._show_help_guide).pack(
+        self._btn_secondary(header_bar, "도움말", self._show_help_guide).pack(
             side="right", padx=(12, 0),
         )
         # 진행 상태 한 줄: 경로/오류 원문처럼 긴 문구는 짧게 줄여서(_on_status_changed).
