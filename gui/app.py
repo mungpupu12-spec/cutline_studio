@@ -6306,7 +6306,7 @@ class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                            placement=placement, white_geom=self._white_geom)
                 lines = [out_path]
                 if self._white_geom is not None:
-                    lines.append("화이트 레이어도 같은 파일 안 '화이트레이어' 그룹(흰색 면, 칼선 아래)에 넣었습니다.")
+                    lines.append("화이트 레이어도 같은 파일 안 '화이트레이어'에 흰색으로 넣었어요.")
                 tiles = (placement or {}).get("tiles") or []
                 if len(tiles) > 1:
                     lines.append(f"AI 대지에 같은 그림이 {len(tiles)}번 놓여 있어, 놓인 자리마다 칼선을 똑같이 넣었습니다.")
@@ -6326,8 +6326,8 @@ class CutLineApp(WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 ]
                 white_png = self._wl_export_png(out_path, img_dpi)
                 if white_png:
-                    lines += [white_png, "화이트 레이어(흰색 면, 같은 크기)입니다 -- 흰 바탕에선 안 보이니 일러스트레이터에서 "
-                              "'화이트레이어' 레이어에 같은 방법으로 겹쳐 넣으세요."]
+                    lines += [white_png, "화이트 레이어예요(흰색이라 흰 바탕에선 안 보여요). 일러스트레이터에서 "
+                              "'화이트레이어' 레이어에 똑같이 겹쳐 넣으세요."]
             self.status.set(f"저장됨: {out_path}")
             self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")
         except Exception as e:  # noqa: BLE001

@@ -14,9 +14,12 @@ COLORS_RGB = {
     "safety": (0, 190, 60),
 }
 
-# 2026-10-05 화이트 레이어: 화면에서 화이트 자리를 하늘색 반투명으로 겹쳐 보여 준다(실제 저장 색은 흰색).
-WHITE_PREVIEW_RGB = (0, 170, 255)
-WHITE_PREVIEW_ALPHA = 0.38
+# 2026-10-05 화이트 레이어: 화면에서 화이트 자리를 파란색으로 보여 준다(실제 저장 색은 흰색).
+# 2026-10-11(멍푸: "저장본은 흰색이지만 컷라인 스튜디오에는 푸른색으로 보이게 해서 차이를 확인하게 해"):
+# 그림 아래에 진한 파란 바탕으로 깔고(그림이 없는 곳까지 화이트가 나온 자리가 파랗게 드러남), 그 위에
+# 화이트 외곽선을 파란 선으로 한 번 더 그린다(꽉 찬 그림에서도 화이트 범위가 보이게).
+WHITE_PREVIEW_RGB = (40, 110, 255)
+WHITE_PREVIEW_EDGE_RGB = (0, 70, 230)
 _WHITE_OVERLAY = {"geom": None}
 
 
@@ -25,20 +28,33 @@ def set_white_overlay(geom):
     _WHITE_OVERLAY["geom"] = geom if (geom is not None and not geom.is_empty) else None
 
 
-def _draw_white_overlay(canvas, geom, offset_xy):
+def _white_polys(geom):
+    polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    return [p for p in polys if not p.is_empty and p.geom_type == "Polygon" and len(p.exterior.coords) >= 3]
+
+
+def _draw_white_fill(canvas, geom, offset_xy):
+    """화이트 자리를 파랗게 채운다(그림을 붙이기 전에 -- 그림 아래 바탕)."""
     ox, oy = offset_xy
     mask = Image.new("L", canvas.size, 0)
     md = ImageDraw.Draw(mask)
-    polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
-    a = int(round(255 * WHITE_PREVIEW_ALPHA))
-    for poly in polys:
-        if poly.is_empty or poly.geom_type != "Polygon" or len(poly.exterior.coords) < 3:
-            continue
-        md.polygon([(x + ox, y + oy) for x, y in poly.exterior.coords], fill=a)
+    for poly in _white_polys(geom):
+        md.polygon([(x + ox, y + oy) for x, y in poly.exterior.coords], fill=255)
         for r in poly.interiors:
             if len(r.coords) >= 3:
                 md.polygon([(x + ox, y + oy) for x, y in r.coords], fill=0)
     canvas.paste(WHITE_PREVIEW_RGB, (0, 0), mask)
+
+
+def _draw_white_edge(canvas, geom, offset_xy, width=2):
+    """화이트 외곽선(그림 위에)."""
+    ox, oy = offset_xy
+    d = ImageDraw.Draw(canvas)
+    for poly in _white_polys(geom):
+        for ring in [poly.exterior] + list(poly.interiors):
+            pts = [(x + ox, y + oy) for x, y in ring.coords]
+            if len(pts) >= 2:
+                d.line(pts, fill=WHITE_PREVIEW_EDGE_RGB, width=width, joint="curve")
 
 
 def _draw_multipolygon_outline(draw: ImageDraw.ImageDraw, mp, offset_xy, color, width):
@@ -70,14 +86,18 @@ def render_preview(
     # 원본의 투명한 부분은 예전처럼 흰 바탕 위에 보이도록 알파를 마스크로 쓴다.
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
 
+    white = _WHITE_OVERLAY["geom"]
+    if white is not None:
+        _draw_white_fill(canvas, white, (margin_px, margin_px))
+
     if original_image_path:
         from . import image_cache
 
         art = image_cache.pil_open(original_image_path, "RGBA")
         canvas.paste(art, (margin_px, margin_px), art)
 
-    if _WHITE_OVERLAY["geom"] is not None:
-        _draw_white_overlay(canvas, _WHITE_OVERLAY["geom"], (margin_px, margin_px))
+    if white is not None:
+        _draw_white_edge(canvas, white, (margin_px, margin_px), width=max(1, line_width - 1))
 
     draw = ImageDraw.Draw(canvas)
 
