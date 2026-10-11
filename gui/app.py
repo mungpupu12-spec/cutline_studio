@@ -104,7 +104,7 @@ from core import glass_theme
 from gui.path_editor import PathEditorMixin
 from gui.white_layer_ui import WhiteLayerMixin
 from gui.help_guide import HelpGuideMixin
-from gui.tooltips import FIELD_TIPS, install_tooltips, set_tip
+from gui.tooltips import FIELD_TIPS, SECTION_TIPS, install_tooltips, set_tip
 
 try:
     from PIL import Image, ImageTk
@@ -1162,10 +1162,13 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         card.pack(fill="x", pady=(0, 10), padx=(2, 6))
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=12)
-        ctk.CTkLabel(
+        title_label = ctk.CTkLabel(
             inner, text=title, font=self.font_section, text_color=TEXT_PRIMARY,
             anchor="w", justify="left",
-        ).pack(fill="x")
+        )
+        title_label.pack(fill="x")
+        if title in SECTION_TIPS:   # 2026-10-11 제목에도 마우스를 올리면 짧은 설명
+            set_tip(title_label, SECTION_TIPS[title])
         if subtitle:
             ctk.CTkLabel(
                 inner, text=subtitle, font=self.font_caption, text_color=TEXT_SECONDARY,
@@ -1935,6 +1938,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         preview_title = ctk.CTkLabel(
             preview_header_row, text="미리보기", font=self.font_section, text_color=TEXT_PRIMARY, anchor="w",
         )
+        set_tip(preview_title, SECTION_TIPS["미리보기"])
         # 2026-09-07(7차) 피드백("키스컷 이미지 축소 되어 전체 화면이 보이지
         # 않음. 칼선이 잘 됐는지 확대해서 볼 수 있는 기능 필요"): 미리보기
         # 섹션 제목 오른쪽에 확대/축소/원본크기 버튼 + 현재 배율(%) 표시.
@@ -2077,9 +2081,9 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                                 tip=FIELD_TIPS["dpi"])
         precision_row = ctk.CTkFrame(sec2, fg_color="transparent")
         precision_row.pack(fill="x", pady=(6, 0))
-        ctk.CTkLabel(
+        set_tip(ctk.CTkLabel(
             precision_row, text="정밀도(업샘플)", font=self.font_body, text_color=TEXT_PRIMARY,
-        ).pack(side="left")
+        ), FIELD_TIPS["precision"]).pack(side="left")
         # 2026-09-29(멍푸: "칸에 맞게 스크롤방식으로 선택형 모두 변경"): 예전 콤보박스는
         # 누르면 칸 밖으로 따로 뜨는 목록이었음 -> 칸 안에서 바로 고르는 1·2·3·4 버튼 묶음
         # (참고 이미지의 Segmented Control 모양).

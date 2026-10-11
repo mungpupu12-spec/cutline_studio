@@ -297,7 +297,7 @@ def test_tooltips_short_and_cover_every_control():
     from gui.app import CutLineApp
     from gui import tooltips as tt
 
-    for t in list(tt.TIPS.values()) + list(tt.FIELD_TIPS.values()):
+    for t in list(tt.TIPS.values()) + list(tt.FIELD_TIPS.values()) + list(tt.SECTION_TIPS.values()):
         assert 0 < len(t) <= tt.MAX_TIP_LEN, t
     assert tt.TIP_DELAY_MS == 2000
 
@@ -331,6 +331,20 @@ def test_tooltips_short_and_cover_every_control():
                 walk(c)
         walk(app)
         assert not missing, missing
+
+        # 카드 제목(굵은 글씨)에도 모두 설명이 있다
+        titles = []
+
+        def walk_titles(w):
+            for c in w.winfo_children():
+                if isinstance(c, ctk.CTkToplevel) or c is getattr(app, "_license_gate_frame", None):
+                    continue
+                if isinstance(c, ctk.CTkLabel) and c.cget("font") is app.font_section:
+                    titles.append(c)
+                walk_titles(c)
+        walk_titles(app)
+        assert len(titles) >= len(tt.SECTION_TIPS)
+        assert not [c.cget("text") for c in titles if not mgr.tip_for(c)]
 
         # 버튼 안쪽(캔버스)에 마우스가 들어가면 2초 뒤 설명이 뜨고, 안쪽끼리 옮겨 다녀도 유지된다.
         btn = next(c for c in app.winfo_children() for c in c.winfo_children()
@@ -388,8 +402,9 @@ def test_main_window_wording_uses_plain_sentences():
         help_text = "\n".join(w + "\n" + "\n".join(h) for _t, w, h in HELP_SECTIONS)
         for old in ("(완칼)", "세밀함", "섞인 시트", "안에 든 인쇄용 그림"):
             assert old not in help_text, old
-        for _t, what, hows in HELP_SECTIONS:     # 문장은 ~다./~요.로 끝난다
+        for _t, what, hows in HELP_SECTIONS:     # 문장은 ~다.로 끝나고, 도움말 창에서 두 줄 이내(한 줄 약 29자)
             for line in [what] + hows:
                 assert line.endswith("다."), line
+                assert len(line) <= 48, line
     finally:
         app.destroy()
