@@ -289,3 +289,107 @@ def test_help_guide_opens_with_every_section():
         win.destroy()
     finally:
         app.destroy()
+
+
+def test_tooltips_short_and_cover_every_control():
+    """2026-10-11: 마우스를 2초 올려 두면 10자 이내 설명이 뜬다. 모든 버튼·체크박스·숫자 칸에 설명이 있어야 한다."""
+    import customtkinter as ctk
+    from gui.app import CutLineApp
+    from gui import tooltips as tt
+
+    for t in list(tt.TIPS.values()) + list(tt.FIELD_TIPS.values()):
+        assert 0 < len(t) <= tt.MAX_TIP_LEN, t
+    assert tt.TIP_DELAY_MS == 2000
+
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app.update()
+        mgr = app._tooltips
+        missing = []
+
+        def has_tip(w):
+            while w is not None:
+                if mgr.tip_for(w):
+                    return True
+                w = getattr(w, "master", None)
+            return False
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, ctk.CTkToplevel) or c is getattr(app, "_license_gate_frame", None):
+                    continue   # 튜토리얼 창·라이선스 입력 화면은 제외
+                # 묶음 버튼(CTkSegmentedButton)은 안쪽 버튼 하나하나를 확인한다
+                if isinstance(c, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkEntry)):
+                    if not has_tip(c):
+                        try:
+                            missing.append(c.cget("text"))
+                        except Exception:  # noqa: BLE001
+                            missing.append(str(c))
+                walk(c)
+        walk(app)
+        assert not missing, missing
+
+        # 버튼 안쪽(캔버스)에 마우스가 들어가면 2초 뒤 설명이 뜨고, 안쪽끼리 옮겨 다녀도 유지된다.
+        btn = next(c for c in app.winfo_children() for c in c.winfo_children()
+                   if isinstance(c, ctk.CTkButton) and c.cget("text") == "도움말")
+        inner = btn.winfo_children()[0]
+
+        class Ev:
+            widget = inner
+        mgr.delay_ms = 50
+        mgr._on_enter(Ev)
+        assert mgr._job is not None and mgr.visible_text is None
+        mgr._on_enter(Ev)                    # 같은 버튼 안 -> 예약을 새로 만들지 않음
+        deadline = __import__("time").time() + 2
+        while mgr.visible_text is None and __import__("time").time() < deadline:
+            app.update()
+        assert mgr.visible_text == "기능 설명 보기"
+        mgr._on_press(Ev)                    # 누르면 사라짐
+        assert mgr.visible_text is None
+    finally:
+        app.destroy()
+
+
+def test_main_window_wording_uses_plain_sentences():
+    """2026-10-11: 화면 문구 정리(빨간 표시). 옛 문구가 남아 있지 않은지 확인."""
+    from gui.app import CutLineApp, JOB_TYPE_LABELS
+    from gui.help_guide import HELP_SECTIONS
+
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app.update()
+        texts = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    t = c.cget("text")
+                    if isinstance(t, str):
+                        texts.append(t)
+                except Exception:  # noqa: BLE001
+                    pass
+                walk(c)
+        walk(app)
+        joined = "\n".join(texts)
+        for old in ("먼저 골라주세요", "예, 있음", "아니오, 없음", "(GrabCut)", "동시 적용)", "무테/유테 선택 시에만",
+                    "여러 번 추가해도", "이 영역 추가 + 미리보기", "(모두 지우기)", "칼선 내보내기 (PNG)",
+                    "고르세요."):
+            assert old not in joined, old
+        for new in ("있음", "없음", "선택 영역 추가", "누적 초기화", "칼선 내보내기", "무테 칼선도 함께 추가"):
+            assert new in texts, new
+        assert app.accum_status.get().endswith("니다.")
+        assert JOB_TYPE_LABELS["MASKING_TAPE"] == "키스컷 (마스킹테이프)"
+        help_text = "\n".join(w + "\n" + "\n".join(h) for _t, w, h in HELP_SECTIONS)
+        for old in ("(완칼)", "세밀함", "섞인 시트", "안에 든 인쇄용 그림"):
+            assert old not in help_text, old
+        for _t, what, hows in HELP_SECTIONS:     # 문장은 ~다./~요.로 끝난다
+            for line in [what] + hows:
+                assert line.endswith("다."), line
+    finally:
+        app.destroy()

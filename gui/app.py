@@ -104,6 +104,7 @@ from core import glass_theme
 from gui.path_editor import PathEditorMixin
 from gui.white_layer_ui import WhiteLayerMixin
 from gui.help_guide import HelpGuideMixin
+from gui.tooltips import FIELD_TIPS, install_tooltips, set_tip
 
 try:
     from PIL import Image, ImageTk
@@ -428,7 +429,7 @@ JOB_TYPE_LABELS = {
     # 전체 테두리를 한 번만 추가하는 별도 버튼을 새로 만든다
     # (_on_add_roll_border 참고) -- 이게 "연속된 롤(시트) 전체를 고려해야
     # 함"이라고 하신 부분의 실제 구현이다.
-    "MASKING_TAPE": "키스컷",
+    "MASKING_TAPE": "키스컷 (마스킹테이프)",
 }
 JOB_TYPE_PLACEHOLDER = "작업 종류를 선택하세요"
 # 2026-09-01 피드백("도무송은 선택 취소인 상태에서 자율선택으로 변경"):
@@ -635,7 +636,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # accumulate.combine_results) 결과 -- "여러 번 드래그 + 옵션 선택 →
         # 전부 한 파일에 누적"이라는 실제 작업 원리를 그대로 구현한 것.
         self._accumulated = []
-        self.accum_status = tk.StringVar(value="누적된 영역 없음")
+        self.accum_status = tk.StringVar(value="아직 만든 칼선이 없습니다.")
 
         self._last_result = None
         self._preview_photo = None  # keep a reference so Tk doesn't GC it
@@ -1428,11 +1429,13 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         return cb
 
     def _make_number_field(self, parent, label, var, unit="mm", from_=0.0, to=1000.0,
-                            increment=0.5, color=None):
+                            increment=0.5, color=None, tip=None):
         """숫자 입력 한 줄: (선택) 색상 스와치 + 라벨 + [-][입력칸][+] + 단위.
         기존 ttk.Spinbox/Entry들을 이걸로 통일해서 대체한다."""
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=4)
+        if tip:
+            set_tip(row, tip)   # 2026-10-11 마우스를 올려 두면 뜨는 짧은 설명(gui/tooltips.py)
         if color:
             swatch = ctk.CTkFrame(row, width=12, height=12, corner_radius=3, fg_color=color)
             swatch.pack(side="left", padx=(0, 8))
@@ -2045,17 +2048,17 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 못함. 순서를 바꿔 이 섹션을 맨 위(기본 흐름)로 올리고, 아래
         # "가이드 + 여러 도안" 섹션은 여러 개의 서로 다른 도안을 한 시트에
         # 배치할 때만 쓰는 고급/선택 기능임을 분명히 함.
-        sec1 = self._section(left_col, "도안 파일", "주 형식: AI(.ai) · PNG/JPG도 가능")
+        sec1 = self._section(left_col, "도안 파일", "AI 파일을 권장합니다. PNG, JPG도 열 수 있습니다.")
         file_row = ctk.CTkFrame(sec1, fg_color="transparent")
         file_row.pack(fill="x", pady=(8, 4))
-        ctk.CTkEntry(
+        set_tip(ctk.CTkEntry(
             file_row, textvariable=self.input_path, font=self.font_body, corner_radius=17,
             border_width=1, border_color=BORDER, fg_color=CONTROL_FILL, height=34,
-        ).pack(side="left", fill="x", expand=True)
+        ), FIELD_TIPS["file"]).pack(side="left", fill="x", expand=True)
         self._btn_secondary(file_row, "찾아보기", self._choose_file).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
             sec1,
-            text="AI는 원본 그대로 추출 · PNG/JPG도 가능",
+            text="AI 파일을 열어도 원본 파일은 바뀌지 않습니다.",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
             wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x")
@@ -2070,7 +2073,8 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 따라 통째로 삭제(관련 메서드/변수도 함께 제거 -- 아래 _choose_file
         # 참고).
         sec2 = self._section(left_col, "작업 해상도")
-        self._make_number_field(sec2, "DPI", self.dpi, unit="", from_=72, to=1200, increment=1)
+        self._make_number_field(sec2, "DPI", self.dpi, unit="", from_=72, to=1200, increment=1,
+                                tip=FIELD_TIPS["dpi"])
         precision_row = ctk.CTkFrame(sec2, fg_color="transparent")
         precision_row.pack(fill="x", pady=(6, 0))
         ctk.CTkLabel(
@@ -2088,6 +2092,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             text_color=TEXT_PRIMARY,
         )
         self.precision_segment.set(str(self.precision.get()))
+        set_tip(self.precision_segment, FIELD_TIPS["precision"])
         self.precision_segment.pack(side="left", padx=(8, 0))
 
         def _sync_precision(*_):
@@ -2105,13 +2110,13 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 커지면서(+5pt) 패널 폭을 넘어가 오른쪽이 잘려 보이는 원인이었음.
         # 같은 줄에 우겨넣지 않고 아래 줄로 내려서 자연스럽게 줄바꿈되게 함.
         ctk.CTkLabel(
-            sec2, text="클수록 정밀하지만 느려집니다 (기본 4)",
+            sec2, text="정밀도가 높을수록 칼선이 매끄럽지만 느려집니다. 기본은 4입니다.",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
             wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(3, 0))
         ctk.CTkLabel(
             sec2,
-            text="너무 크면 속도 보호로 자동 조정될 수 있음",
+            text="영역이 크면 속도를 위해 정밀도를 자동으로 낮춥니다.",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
             wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(4, 0))
@@ -2127,7 +2132,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 아래 "작업 종류"에 자동으로 선택된다. 시작점만 잡아주는 것이라,
         # 고른 뒤에도 "작업 종류"에서 언제든 다른 값으로 바꿀 수 있다.
         sec0 = self._section(
-            left_col, "0. 도무송 여부", "이 시트에 도무송이 있나요? 먼저 골라주세요"
+            left_col, "0. 도무송 여부", "시트에 도무송 칸이 있는지 먼저 고릅니다."
         )
         domusong_yn_row = ctk.CTkFrame(sec0, fg_color="transparent")
         domusong_yn_row.pack(fill="x", pady=(4, 0))
@@ -2136,11 +2141,11 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 없었다. 이제 현재 작업 종류에 맞춰 고른 쪽만 강조한다. 좁은 화면에서
         # 글자가 잘리던("니오 (도무송 없") 것도 짧은 문구로 줄임.
         self._yn_yes_btn = self._btn_secondary(
-            domusong_yn_row, "예, 있음", lambda: self.job_type.set("MIXED_AUTO")
+            domusong_yn_row, "있음", lambda: self.job_type.set("MIXED_AUTO")
         )
         self._yn_yes_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self._yn_no_btn = self._btn_secondary(
-            domusong_yn_row, "아니오, 없음", lambda: self.job_type.set("BORDERLESS")
+            domusong_yn_row, "없음", lambda: self.job_type.set("BORDERLESS")
         )
         self._yn_no_btn.pack(side="left", fill="x", expand=True)
         self.job_type.trace_add("write", lambda *_: self._refresh_domusong_yn_buttons())
@@ -2151,7 +2156,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 아웃라인으로 선택 작업합니다로 수정" 지시): 문구를 그대로 교체.
         ctk.CTkLabel(
             sec0,
-            text="도무송 선택 후, 도안에 맞는 칼선 무테/유테/아웃라인으로 선택 작업합니다",
+            text="고른 값에 맞는 작업 종류가 아래에 자동으로 선택됩니다. 작업 종류는 다시 바꿀 수 있습니다.",
             font=self.font_caption, text_color=TEXT_SECONDARY, anchor="w", justify="left",
             wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", pady=(6, 0))
@@ -2160,11 +2165,11 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 2026-08-27 피드백: "도무송은 무조건 선택이 아니라 ... 아예 카테고리
         # 형태로 선택하고 작은창 안에 여러가지 선택지가 있게 수정해" -- 지금
         # 고른 값만 보여주는 버튼 하나 + 팝업으로 고르게 함.
-        sec3 = self._section(left_col, "작업 종류", "칼선을 만들 기준을 고르세요.")
+        sec3 = self._section(left_col, "작업 종류", "칼선을 만드는 방식을 고릅니다.")
         self.job_type_label_var = tk.StringVar(
             value=JOB_TYPE_LABELS.get(self.job_type.get()) or JOB_TYPE_PLACEHOLDER
         )
-        self._make_category_picker(
+        set_tip(self._make_category_picker(
             sec3, self.job_type_label_var,
             [
                 ("BORDERLESS", "무테"),
@@ -2173,14 +2178,14 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 ("MIXED_AUTO", "무테/유테+도무송"),
                 ("DOMUSONG", "도무송"),
                 ("FULL_CUT", "조각"),
-                ("MASKING_TAPE", "키스컷"),
+                ("MASKING_TAPE", JOB_TYPE_LABELS["MASKING_TAPE"]),
             ],
             self.job_type, "작업 종류 선택",
             on_change=lambda: self.job_type_label_var.set(
                 JOB_TYPE_LABELS.get(self.job_type.get()) or JOB_TYPE_PLACEHOLDER
             ),
             allow_clear=True,
-        ).pack(fill="x", pady=(6, 0))
+        ), FIELD_TIPS["job_type"]).pack(fill="x", pady=(6, 0))
         # 드래그 영역 지우기/원본 다시 보기는 무테/유테/도무송/조각 스티커 어떤
         # 작업 종류에서든 쓰이는 공통 동작이라 여기(항상 눌리는 위치)에 둠.
         sel_btn_row = ctk.CTkFrame(sec3, fg_color="transparent")
@@ -2226,7 +2231,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 눌러도 매번 새로 하나씩 누적되니, 잘못 눌렀으면 "선택 영역
         # 지우기" 옆의 누적 초기화로 지우고 다시 하면 된다).
         self._roll_border_btn = self._btn_secondary(
-            sec3, "롤 전체 테두리 추가 (마스킹테이프)", self._on_add_roll_border
+            sec3, "롤 전체 테두리 추가", self._on_add_roll_border
         )
         roll_border_btn_pack = {"fill": "x", "pady": (8, 0)}
         self._roll_border_btn.pack(**roll_border_btn_pack)
@@ -2251,12 +2256,12 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 되돌림(이번 세션 초반엔 이 섹션을 화면 맨 위로 옮겼었는데, 그것도
         # 이번에 되돌리는 대상).
         sec6 = self._section(
-            left_col, "도무송 세부 옵션", "도무송 선택 시에만 적용"
+            left_col, "도무송 세부 옵션", "작업 종류가 도무송일 때만 적용합니다."
         )
         self.cutline_type_label_var = tk.StringVar(
             value=CUTLINE_TYPE_LABELS.get(self.cutline_type.get()) or CUTLINE_TYPE_PLACEHOLDER
         )
-        self._make_category_picker(
+        set_tip(self._make_category_picker(
             sec6, self.cutline_type_label_var,
             [
                 (CutlineType.FULL_CUT.name, "조각 스티커"),
@@ -2270,36 +2275,36 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 CUTLINE_TYPE_LABELS.get(self.cutline_type.get()) or CUTLINE_TYPE_PLACEHOLDER
             ),
             allow_clear=True,
-        ).pack(fill="x", pady=(2, 0))
+        ), FIELD_TIPS["cutline_type"]).pack(fill="x", pady=(2, 0))
         # 2026-09-29: 체크박스 글이 길어 카드 오른쪽 밖으로 잘려 보였음 -> 줄바꿈(_wrap_checkbox)
         self._wrap_checkbox(ctk.CTkCheckBox(
-            sec6, text="유색/복잡한 배경에서도 자동 분리 (GrabCut)", variable=self.use_grabcut,
+            sec6, text="배경이 복잡해도 그림만 분리", variable=self.use_grabcut,
             font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
         )).pack(anchor="w", pady=(6, 0))
         # 2026-09-07 피드백("도무송과 무테를 동시에 선택할 수 있게 다중선택
         # 기능을 만들고"): 도무송 도형 칼선과, 같은 영역의 무테(사각형)
         # 칼선을 한 번에 함께 추가하는 다중선택 체크박스.
         self._wrap_checkbox(ctk.CTkCheckBox(
-            sec6, text="같은 영역에 무테 칼선도 함께 추가 (도무송+무테 동시 적용)",
+            sec6, text="무테 칼선도 함께 추가",
             variable=self.domusong_also_borderless,
             font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
         )).pack(anchor="w", pady=(6, 0))
 
         # ---- 오프셋 간격 (조각 스티커/도무송) ---------------------------------------
         sec4 = self._section(
-            left_col, "오프셋 간격", "조각 스티커/도무송용 · mm, 바깥쪽 기준"
+            left_col, "오프셋 간격", "조각, 도무송, 롤 테두리에 적용합니다. 자세한 기준은 도움말에 있습니다."
         )
         self._make_number_field(
             sec4, "세이프티 (safety)", self.safety_mm, color=COLOR_SAFETY,
-            from_=0.0, to=100.0, increment=0.5,
+            from_=0.0, to=100.0, increment=0.5, tip=FIELD_TIPS["safety"],
         )
         self._make_number_field(
             sec4, "칼선 (cutting line)", self.cut_mm, color=COLOR_CUT,
-            from_=0.0, to=100.0, increment=0.5,
+            from_=0.0, to=100.0, increment=0.5, tip=FIELD_TIPS["cut"],
         )
         self._make_number_field(
             sec4, "블리딩 (bleeding)", self.bleed_mm, color=COLOR_BLEED,
-            from_=0.0, to=100.0, increment=0.5,
+            from_=0.0, to=100.0, increment=0.5, tip=FIELD_TIPS["bleed"],
         )
 
         # ---- 유테/무테 세부 옵션 ----------------------------------------------------
@@ -2307,12 +2312,12 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 고르므로(위 sec3), 여기 있던 별도의 유테/무테 하위 선택 콤보박스는
         # 없앰 -- 간격(mm) 값 하나만 남김.
         sec5 = self._section(
-            left_col, "유테/무테 간격", "무테/유테 선택 시에만 · 기본 1.2mm"
+            left_col, "유테/무테 간격", "무테, 유테, 키스컷에 적용합니다. 기본은 1.2mm입니다."
         )
         # 2026-09-29: 단위 칸의 "(기본 1.2)"가 카드 밖으로 잘려 보였음 -> 설명 줄로 옮김
         self._make_number_field(
-            sec5, "간격", self.style_margin_mm, unit="mm",
-            from_=0.1, to=20.0, increment=0.1,
+            sec5, "칼선 간격", self.style_margin_mm, unit="mm",
+            from_=0.1, to=20.0, increment=0.1, tip=FIELD_TIPS["style_margin"],
         )
 
         # 2026-08-27 피드백: "도무송은 무조건 선택이 아니라 선택할 수 있는
@@ -2330,7 +2335,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
 
         # ---- 7. 누적 ---------------------------------------------------------------
         sec7 = self._section(
-            left_col, "누적", "여러 번 추가해도 한 파일에 쌓입니다"
+            left_col, "누적", "만든 칼선은 모두 한 파일에 쌓입니다."
         )
         # 2026-08-27 피드백("프로그램 글자색 블랙으로 통일"): 여기만 브랜드
         # 컬러(파란색)로 튀던 걸 다른 본문 텍스트와 같은 검정으로 맞춤.
@@ -2338,13 +2343,13 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             sec7, textvariable=self.accum_status, font=self.font_body, text_color=TEXT_PRIMARY,
             anchor="w",
         ).pack(fill="x", pady=(4, 8))
-        self.generate_btn = self._btn_primary(sec7, "이 영역 추가 + 미리보기", self._on_generate)
+        self.generate_btn = self._btn_primary(sec7, "선택 영역 추가", self._on_generate)
         self.generate_btn.pack(fill="x", pady=(0, 6))
-        self._btn_secondary(sec7, "누적 초기화 (모두 지우기)", self._on_reset_accumulation_clicked).pack(
+        self._btn_secondary(sec7, "누적 초기화", self._on_reset_accumulation_clicked).pack(
             fill="x", pady=(0, 8)
         )
         # 2026-09-30(멍푸: "칼선 파일 svg 말고 png로"): 기본은 투명 배경 PNG(원본 이미지와 같은 크기)
-        self.export_btn = self._btn_primary(sec7, "칼선 내보내기 (PNG)", self._on_export)
+        self.export_btn = self._btn_primary(sec7, "칼선 내보내기", self._on_export)
         self.export_btn.configure(state="disabled")
         self.export_btn.pack(fill="x")
 
@@ -2360,6 +2365,9 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             status_card, textvariable=self.status_detail, font=self.font_caption,
             text_color=TEXT_SECONDARY, anchor="w", justify="left", wraplength=LEFT_TEXT_WRAP,
         ).pack(fill="x", padx=16, pady=12)
+
+        # 2026-10-11(멍푸: "각각의 기능에 2초 이상 커서를 두면 10자 이내의 설명이 나오게 해")
+        self._tooltips = install_tooltips(self, mgr=getattr(self, "_tooltips", None))
 
     # ------------------------------------------------------------------
     def _choose_file(self):
@@ -3415,7 +3423,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         w_mm, h_mm = self._selection_size_mm(cx0, cy0, cx1, cy1)
         self.status.set(
             f"선택 완료 ({w_mm:.1f} × {h_mm:.1f}mm) -- 왼쪽에서 칼선 종류를 고르고 "
-            "'이 영역 추가 + 미리보기'를 누르세요."
+            "'선택 영역 추가'를 누르세요."
         )
 
     # ---- 2026-09-26 피드백("칸 인식... 가져다 대면 예비 모양이 뜨는
@@ -4287,7 +4295,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 f"아직 칸 {n_remaining}개 남음 -- "
                 "'② 표시한 도무송 칼선 생성'을 눌러 이어서 진행하세요.",
             )
-            self.after(0, self.accum_status.set, f"누적 {len(self._accumulated)}개 영역")
+            self.after(0, self.accum_status.set, f"{len(self._accumulated)}개 영역이 쌓였습니다.")
             self.after(0, lambda: self.generate_btn.configure(state="normal"))
             if errors:
                 self.after(
@@ -4493,7 +4501,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                    if any(gi not in self._mixed_marked for gi in range(len(groups)) if gi not in self._mixed_processed)
                    else "'② 표시한 도무송 칼선 생성'을 눌러 이어서 진행하세요."),
             )
-            self.after(0, self.accum_status.set, f"누적 {len(self._accumulated)}개 영역")
+            self.after(0, self.accum_status.set, f"{len(self._accumulated)}개 영역이 쌓였습니다.")
             self.after(0, lambda: self.generate_btn.configure(state="normal"))
             if errors:
                 self.after(
@@ -4781,7 +4789,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         if self.job_type.get() != "MASKING_TAPE":
             self._show_note_dialog(
                 "마스킹테이프에서만 사용할 수 있습니다",
-                ["이 버튼은 작업 종류가 '키스컷 마스킹테이프'일 때만 사용할 수 있습니다."],
+                ["이 버튼은 작업 종류가 '키스컷 (마스킹테이프)'일 때만 쓸 수 있습니다."],
                 kind="error",
             )
             return
@@ -5007,7 +5015,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
 
         n_items = len(self._accumulated)
         n_shapes = len(self._last_result.design.geoms)
-        self.accum_status.set(f"누적 {n_items}개 영역 (파트 {n_shapes}개)")
+        self.accum_status.set(f"{n_items}개 영역이 쌓였습니다. (칼선 {n_shapes}개)")
         status_text = (
             f"완료. 누적 {n_items}개 영역, 도안 {n_shapes}개 파트. 내보내기 준비됨.\n"
             f"계속 드래그해서 영역을 추가하려면 '원본 다시 보기'를 누르세요."
@@ -5049,7 +5057,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         self._accumulated = []
         self._grabcut_hint_meta = {}
         self._last_result = None
-        self.accum_status.set("누적된 영역 없음")
+        self.accum_status.set("아직 만든 칼선이 없습니다.")
         self.export_btn.configure(state="disabled")
         self.status.set("누적된 영역을 모두 지웠습니다. 다시 드래그해서 시작하세요.")
 

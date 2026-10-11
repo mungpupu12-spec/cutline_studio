@@ -45,14 +45,16 @@ class WhiteLayerMixin:
     def _wl_build_section(self, parent):
         sec = self._section(
             parent, "화이트 레이어",
-            "투명 스티커 밑에 까는 흰색 바탕",
+            "투명 스티커 그림 밑에 까는 흰색 바탕입니다.",
         )
         from gui.app import ACCENT, ACCENT_HOVER, TEXT_PRIMARY
+        from gui.tooltips import FIELD_TIPS
 
         self._white_check = self._wrap_checkbox(ctk.CTkCheckBox(
             sec, textvariable=self.white_status, variable=self.white_on, command=self._on_white_check,
             font=self.font_body, text_color=TEXT_PRIMARY, fg_color=ACCENT, hover_color=ACCENT_HOVER,
         ))
+        self._white_check._cl_tip_text = FIELD_TIPS["white_on"]
         self._white_check.pack(anchor="w", pady=(4, 4))
         # 보기: 그림이 화이트 위에 얹힌 모습 / 화이트만(2026-10-11)
         self._white_view_btn = ctk.CTkSegmentedButton(
@@ -60,11 +62,12 @@ class WhiteLayerMixin:
             font=self.font_body, selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
         )
         self._white_view_btn.pack(fill="x", pady=(2, 6))
-        self._make_number_field(sec, "화이트 크기 조정", self.white_choke_mm, from_=0.0, to=1.0, increment=0.05)
+        self._make_number_field(sec, "화이트 크기 조정", self.white_choke_mm, from_=0.0, to=1.0, increment=0.05,
+                                tip=FIELD_TIPS["white_choke"])
         self._white_make_btn = self._btn_secondary(sec, "⬜ 화이트 레이어 만들기", self._on_make_white)
         self._white_make_btn.pack(fill="x", pady=(4, 6))
         self._make_number_field(sec, "칼선 간격", self.white_cut_offset_mm, from_=0.3, to=10.0,
-                                increment=0.1)
+                                increment=0.1, tip=FIELD_TIPS["white_cut"])
         self._white_cut_btn = self._btn_secondary(sec, "✂ 칼선 재설정", self._on_white_cut)
         self._white_cut_btn.pack(fill="x", pady=(4, 2))
         return sec
@@ -306,7 +309,7 @@ class WhiteLayerMixin:
         self._last_result = combined
         self._wl_rerender(path)
         n_items = len(self._accumulated)
-        self.accum_status.set(f"누적 {n_items}개 영역")
+        self.accum_status.set(f"{n_items}개 영역이 쌓였습니다.")
         self.export_btn.configure(state="normal")
         n = len(cuts.geoms) if hasattr(cuts, "geoms") else 0
         if replace:
