@@ -1,6 +1,7 @@
 """2026-10-12: 그림 모양 기준 칼선(알고리즘 확인용 합성 이미지 -- 칼선 품질 판단은 실제 파일로 함).
   - 진한 그러데이션·연한 격자·흰 반짝이 배경 위 흰 테두리 스티커: 테두리 바깥선을 칼선으로, 반짝이는 뺀다.
-  - 투명 배경 그림 + 유테: 그림에서 유테 간격만큼 띄운 칼선. 무테는 예전 방식(False)."""
+  - 투명 배경 그림 + 유테: 그림에서 유테 간격만큼 띄운 칼선. 무테는 그림 안쪽으로 같은 간격.
+  - 칼선이 2mm보다 가까우면 합칠지 따로 자를지 묻는다."""
 import os
 import tempfile
 
@@ -89,8 +90,13 @@ def test_gui_shape_cut_line_art_transparent_and_sticker():
     try:
         app._show_note_dialog = lambda *a, **k: None
         app.input_path.set(p)
-        app.job_type.set("BORDERLESS")
-        assert not app._shape_cut_auto(p)                 # 무테 + 투명 배경은 예전 방식
+        app.job_type.set("BORDERLESS")                    # 무테 + 투명 배경: 그림 안쪽으로 유테/무테 간격만큼
+        assert app._shape_cut_auto(p)
+        cut = app._accumulated[-1].offsets["cut"]
+        assert len(cut.geoms) == 1
+        inset_mm = (101 - (cut.area / np.pi) ** 0.5) / DPI * 25.4
+        assert abs(inset_mm - float(app.style_margin_mm.get())) < 0.2, inset_mm
+        app._accumulated.clear()
         app.job_type.set("LINE_ART")
         assert app._shape_cut_auto(p)
         item = app._accumulated[-1]
@@ -111,5 +117,42 @@ def test_gui_shape_cut_line_art_transparent_and_sticker():
         # 스티커 칼선(간격 0)이 유테/무테 간격 칸을 덮어쓰지 않고, 안내 창도 띄우지 않는다(실제 PC에서 생긴 문제)
         assert abs(float(app.style_margin_mm.get()) - 1.2) < 1e-9 and not dialogs
         assert "흰 테두리 스티커 2개" in app.status.get()
+    finally:
+        app.destroy()
+
+
+def test_close_stickers_ask_merge_or_separate():
+    """흰 테두리 사이가 2mm보다 가까운 스티커 두 개 -> 고르는 창. 따로 자르기면 2개, 합치기면 1개."""
+    from gui.app import CutLineApp
+
+    h, w = 400, 600
+    img = np.zeros((h, w, 3), np.uint8)
+    img[...] = (90, 140, 220)
+    art = np.zeros((h, w), np.uint8)
+    cv2.rectangle(art, (100, 100), (260, 300), 1, -1)
+    cv2.rectangle(art, (100 + 160 + 2 * 20 + 12, 100), (520, 300), 1, -1)   # 테두리 사이 12px(약 1mm)
+    ring = cv2.dilate(art, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+    img[ring > 0] = (255, 255, 255)
+    img[art > 0] = (40, 90, 60)
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "close.png")
+    Image.fromarray(img).save(p)
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app._show_note_dialog = lambda *a, **k: None
+        app.input_path.set(p)
+        app.job_type.set("LINE_ART")
+        for answer, n_expected in ((False, 2), (True, 1)):
+            asked = []
+            app._show_confirm_dialog = lambda h_, lines, **k: (asked.append(k), answer)[1]
+            app._accumulated.clear()
+            assert app._shape_cut_auto(p)
+            for _ in range(5):
+                app.update()
+            assert asked and asked[0]["yes_text"] == "하나로 합치기" and asked[0]["no_text"] == "따로 자르기"
+            assert len(app._accumulated[-1].offsets["cut"].geoms) == n_expected
     finally:
         app.destroy()

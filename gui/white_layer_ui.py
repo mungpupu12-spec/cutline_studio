@@ -345,9 +345,9 @@ class WhiteLayerMixin:
         """키스컷 자동(예전 이름 그대로 -- _shape_cut_auto 참고)."""
         return self._shape_cut_auto(path)
 
-    # 그림 모양 기준 칼선을 쓰는 작업 종류. 투명 배경 그림은 키스컷·유테만(무테·자동 생성은 예전 방식),
+    # 그림 모양 기준 칼선을 쓰는 작업 종류. 투명 배경 그림은 키스컷·유테·무테(2026-10-20 무테 추가, 자동 생성은 예전 방식),
     # 흰 테두리 스티커 시트는 넷 다(흰 테두리 바깥선이 곧 자를 선).
-    SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART")
+    SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS")
     SHAPE_CUT_STICKER_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS", "AUTO_STYLE")
 
     def _shape_cut_auto(self, path) -> bool:
@@ -377,11 +377,23 @@ class WhiteLayerMixin:
             kind, mask = wl.shape_cut_source(path, dpi, ai_path=self._ai_source_path)
             if kind is None or (kind != "sticker" and job not in self.SHAPE_CUT_ALPHA_JOBS):
                 return False
+            separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)
+            n_close = 0
             if kind == "sticker":
                 off = 0.0
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0)
-                msg = f"흰 테두리 스티커 {{n}}개에 칼선을 만들었습니다(흰 테두리 바깥선)."
+                separate = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0, merge_gap_mm=0.0)
+                msg = "흰 테두리 스티커 {n}개에 칼선을 만들었습니다(흰 테두리 바깥선)."
+            elif job == "BORDERLESS":
+                off = max(0.5, float(self.style_margin_mm.get()))
+                mask = wl.build_white_mask(mask, dpi)
+                cuts, n_thin = wl.borderless_cut_from_mask(mask, dpi, inset_mm=off)
+                msg = (f"무테 칼선 {{n}}개를 만들었습니다(그림 안쪽 {off:.1f}mm). "
+                       "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
+                if n_thin:
+                    msg += f" 너무 가는 그림 {n_thin}개는 안쪽으로 자를 수 없어 칼선을 만들지 않았습니다."
             else:
+                mask = wl.build_white_mask(mask, dpi)
                 if job == "MASKING_TAPE":
                     off = max(0.1, float(self.white_cut_offset_mm.get()))
                     msg = (f"키스컷 칼선 {{n}}개를 만들었습니다(그림에서 {off:.1f}mm). "
@@ -390,24 +402,52 @@ class WhiteLayerMixin:
                     off = max(0.1, float(self.style_margin_mm.get()))
                     msg = (f"유테 칼선 {{n}}개를 만들었습니다(그림에서 {off:.1f}mm). "
                            "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
-                mask = wl.build_white_mask(mask, dpi)
+                    separate = wl.cut_from_white_mask(mask, dpi, offset_mm=off, merge_gap_mm=0.0)
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
             if cuts.is_empty:
                 return False
+            if separate is not None and len(separate.geoms) > len(cuts.geoms):
+                n_close = wl.count_close_pairs(separate, dpi, gap_mm=wl.DEFAULT_MERGE_GAP_MM)
             h, w = mask.shape
-            item = CutlineResult(
-                dpi=float(self.dpi.get()), width_px=w, height_px=h, design=wl.mask_to_geom(mask),
-                offsets={"cut": cuts}, offset_mm=OffsetSpec(off, off, off),
-            )
-            # 안내 문구는 adjustments(자동 조정)가 아니라 상태 줄에 -- adjustments에 넣으면 _show_preview가
-            # "자동 조정 안내" 창을 띄우고 이 칼선의 간격(스티커는 0)을 유테/무테 간격 칸에 덮어써서, 다음
-            # 그림의 유테 간격이 0이 됐다(2026-10-12 멍푸 PC에서 확인: 스티커판 다음 투명판 유테가 0.1mm).
-            done_msg = "자동 인식 완료: " + msg.format(n=len(cuts.geoms))
-            self._accumulated.append(item)
-            combined = combine_results(self._accumulated)
-            png = os.path.join(_work_file_dir(), "_last_preview.png")
-            render_preview(combined, png, original_image_path=path, async_save=True)
-            self._last_result = combined
+            design = wl.mask_to_geom(mask)
+
+            def _finish(chosen, note=""):
+                item = CutlineResult(
+                    dpi=float(self.dpi.get()), width_px=w, height_px=h, design=design,
+                    offsets={"cut": chosen}, offset_mm=OffsetSpec(off, off, off),
+                )
+                # 안내 문구는 adjustments(자동 조정)가 아니라 상태 줄에 -- adjustments에 넣으면 _show_preview가
+                # "자동 조정 안내" 창을 띄우고 이 칼선의 간격(스티커는 0)을 유테/무테 간격 칸에 덮어써서, 다음
+                # 그림의 유테 간격이 0이 됐다(2026-10-12 멍푸 PC에서 확인: 스티커판 다음 투명판 유테가 0.1mm).
+                done_msg = "자동 인식 완료: " + msg.format(n=len(chosen.geoms)) + note
+                self._accumulated.append(item)
+                combined = combine_results(self._accumulated)
+                png = os.path.join(_work_file_dir(), "_last_preview.png")
+                render_preview(combined, png, original_image_path=path, async_save=True)
+                self._last_result = combined
+                return png, item, done_msg
+
+            if n_close:
+                # 2026-10-20(멍푸: "테두리 사이가 2mm보다 가까운 스티커를 ... 합칠지, 따로 자를지 선택 사항으로
+                # 팝업 뜨기"): 고르는 창은 화면 스레드에서 띄우고, 고른 뒤 칼선을 넣는다.
+                def _ask():
+                    merge = self._show_confirm_dialog(
+                        "가까운 칼선이 있습니다",
+                        [f"칼선 사이가 {wl.DEFAULT_MERGE_GAP_MM:g}mm보다 가까운 곳이 {n_close}군데 있습니다.",
+                         "하나로 합치기: 가까운 그림을 칼선 하나로 묶습니다. 사이의 좁은 틈도 함께 잘립니다.",
+                         "따로 자르기: 그림마다 칼선을 따로 둡니다. 칼선이 가까워 재단이 밀리면 겹칠 수 있습니다."],
+                        yes_text="하나로 합치기", no_text="따로 자르기",
+                    )
+                    chosen = cuts if merge else separate
+                    note = "" if merge else f" 가까운 칼선 {n_close}군데는 따로 두었습니다."
+                    png, item, done_msg = _finish(chosen, note)
+                    self._show_preview(png, item)
+                    self.status.set(done_msg)
+
+                self.after(0, _ask)
+                return True
+
+            png, item, done_msg = _finish(cuts)
 
             def _show():
                 self._show_preview(png, item)

@@ -468,7 +468,7 @@ TUTORIAL_SLIDES = [
     ("step2.png", "작업 종류를 고르세요"),
     ("step3.png", "도안을 자동으로 인식해요"),
     ("step5.png", "영역 추가로 칼선 생성"),
-    ("step6.png", "칼선 내보내기(PNG)로 저장"),
+    ("step6.png", "칼선 내보내기로 저장"),
 ]
 # 튜토리얼 내용을 바꿀 때마다 이 번호를 올리면, "다시 보지 않기"를 이미
 # 체크한 사용자에게도 새로워진 튜토리얼이 한 번은 다시 뜬다(아래
@@ -5307,7 +5307,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         except Exception:  # noqa: BLE001 -- 위치 계산 실패해도 대화상자 자체는 뜸(장식일 뿐)
             pass
 
-    def _show_confirm_dialog(self, heading, lines):
+    def _show_confirm_dialog(self, heading, lines, yes_text="예", no_text="아니오"):
         """예/아니오 확인이 필요할 때 쓰는 자체 대화상자 (_show_note_dialog의
         확인/취소 버전).
 
@@ -5362,10 +5362,10 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 pass
             dialog.destroy()
 
-        self._btn_secondary(btn_row, "아니오", lambda: _choose(False)).grid(
+        self._btn_secondary(btn_row, no_text, lambda: _choose(False)).grid(
             row=0, column=0, padx=(0, 6), sticky="ew"
         )
-        self._btn_primary(btn_row, "예", lambda: _choose(True)).grid(
+        self._btn_primary(btn_row, yes_text, lambda: _choose(True)).grid(
             row=0, column=1, padx=(6, 0), sticky="ew"
         )
         dialog.protocol("WM_DELETE_WINDOW", lambda: _choose(False))
@@ -6282,6 +6282,67 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             kind="error",
         )
 
+    def _export_layered_copy(self, out_path, src_path, ai_src, placement, white=None, img=None, img_dpi=None):
+        """원본 사본 + 칼선(+화이트) 레이어 저장. 안내 문구 목록을 돌려준다. 작업 스레드에서 불릴 수 있어 Tk 값은
+        부르는 쪽이 미리 읽어 넘긴다(white, img, img_dpi).
+
+        2026-10-20 멍푸 PC 일러스트레이터 2026에서 확인한 순서:
+          - AI: 일러스트레이터가 직접 '칼선'·'화이트레이어' 레이어를 더해 저장(원래 레이어 그대로, core.illustrator_bridge).
+            일러스트레이터가 없거나 실패하면 같은 이름의 PDF(대지 그대로 + 칼선 레이어)로 대신 저장.
+          - PNG/JPG: 일러스트레이터로 '도안'·'칼선'(·'화이트레이어') 레이어 PDF. 없으면 PyMuPDF로 같은 구조의 PDF."""
+        from core import layered_export as lx
+
+        res = self._last_result
+        if out_path.lower().endswith(".ai"):
+            if not ai_src or not placement:
+                raise ValueError("AI 사본은 AI 파일을 불러왔을 때만 만들 수 있습니다. PDF로 저장하세요.")
+            if os.path.abspath(out_path) == os.path.abspath(ai_src):
+                raise ValueError("원본 AI 파일에는 덮어쓰지 않습니다. 다른 이름으로 저장하세요.")
+            r = lx.save_ai_copy_via_illustrator(ai_src, out_path, res, placement, white_geom=white)
+            if r.startswith("OK"):
+                lines = [out_path, "원본 AI 사본에 '칼선' 레이어(마젠타 0.5pt)를 맨 위에 더했습니다. "
+                                   "원래 레이어와 원본 파일은 그대로입니다."]
+                n_tiles = len(placement.get("tiles") or []) or 1
+                if n_tiles > 1:
+                    lines.append(f"같은 그림이 {n_tiles}번 놓여 있어, 놓인 자리마다 칼선을 넣었습니다.")
+                if white is not None:
+                    lines.append("화이트는 '화이트레이어' 레이어(맨 아래)에 넣었습니다.")
+                return lines
+            try:
+                os.remove(out_path)        # 레이어를 못 넣은 단순 복사본은 남기지 않는다
+            except OSError:
+                pass
+            pdf = os.path.splitext(out_path)[0] + ".pdf"
+            lx.export_ai_copy_with_cut(ai_src, pdf, res, placement, white_geom=white, strip_private=True)
+            why = "일러스트레이터를 찾지 못해" if r.startswith("NOAPP") else f"일러스트레이터에서 오류가 나서({r[4:80]})"
+            return [pdf, f"{why} AI 대신 PDF로 저장했습니다. 대지 그대로에 '칼선' 레이어가 들어 있습니다.",
+                    "일러스트레이터에서 열면 레이어가 하나로 합쳐져 보일 수 있습니다."]
+        r = lx.save_layered_pdf_via_illustrator(img, out_path, res, img_dpi, white_geom=white)
+        if not r.startswith("OK"):
+            lx.export_layered_pdf(img, res, out_path, img_dpi, white_geom=white)
+        from PIL import Image as _Img
+
+        with _Img.open(img) as im:
+            w_mm, h_mm = (round(v / img_dpi * 25.4, 1) for v in im.size)
+        lines = [out_path, f"원본 이미지({w_mm:g} x {h_mm:g}mm)와 칼선을 레이어로 나눈 PDF입니다. "
+                           "레이어: 도안 / 칼선(마젠타 0.5pt)."]
+        if white is not None:
+            lines.append("화이트는 '화이트레이어' 레이어(맨 아래)에 넣었습니다.")
+        return lines
+
+    def _run_export_layered(self, *args, **kw):
+        try:
+            lines = self._export_layered_copy(*args, **kw)
+            self.after(0, lambda: (self.status.set(f"저장됨: {lines[0]}"),
+                                   self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")))
+        except Exception as e:  # noqa: BLE001
+            self._report_exception_to_server("칼선 사본 저장 중")
+            msg = str(e)
+            self.after(0, lambda: (self.status.set("저장하지 못했습니다."),
+                                   self._show_note_dialog("저장 중 오류가 발생했습니다", [msg], kind="error")))
+        finally:
+            self.after(0, lambda: self.export_btn.configure(state="normal"))
+
     def _on_export(self):
         if self._pe_active:
             self._pe_commit_working(push_undo=True)  # 고치던 칼선까지 저장에 넣는다
@@ -6307,17 +6368,38 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 2026-09-30(멍푸: "칼선 파일 svg 말고 png로 개체 그룹화 해서 그대로 원본 이미지에 적용할
         # 수 있게"): 기본은 PNG -- 원본 이미지와 같은 크기·해상도의 투명 배경에 마젠타 칼선만.
         # 필요하면 저장 창에서 형식을 SVG로 바꿀 수도 있다(파일 확장자로 구분).
-        default_name = base + "_cutlines.png"
+        # 2026-10-20(멍푸: "불러온 png,jpg,ai파일 사본 생성 해서 png,jpg는 이미지/칼선 레이어를 분리한 pdf로 ...
+        # ai 파일도 사본 생성해 이미지 파일 위에 칼선 레이어 생성해서 적용하기"): 기본은 원본 사본에 칼선 레이어를
+        # 넣은 파일(AI면 AI 사본, PNG/JPG면 PDF). 칼선만 따로 필요하면 PNG/SVG도 고를 수 있다.
+        ai_src = getattr(self, "_ai_source_path", None)
+        src_path = ai_src or self.input_path.get().strip()
+        copy_types = ([("AI 사본 - 원본 그대로 + 칼선 레이어", "*.ai")] if ai_src
+                      else [("PDF - 도안·칼선 레이어 분리", "*.pdf")])
+        default_name = base + ("_칼선.ai" if ai_src else "_칼선.pdf")
         out_path = filedialog.asksaveasfilename(
             title="칼선 내보내기",
-            defaultextension=".png",
+            defaultextension=".ai" if ai_src else ".pdf",
             initialfile=default_name,
-            filetypes=[("PNG - 칼선만, 투명 배경(원본 이미지와 같은 크기)", "*.png"), ("SVG", "*.svg")],
+            filetypes=copy_types + [("PNG - 칼선만, 투명 배경(원본 이미지와 같은 크기)", "*.png"), ("SVG", "*.svg")],
         )
         if not out_path:
             return
         try:
             placement = getattr(self, "_ai_placement", None)
+            low = out_path.lower()
+            if low.endswith(".ai") or low.endswith(".pdf"):
+                # 일러스트레이터가 켜지는 동안 화면이 멈추지 않게 작업 스레드에서. Tk 값은 여기서 미리 읽는다.
+                if placement and placement.get("pt_per_px"):
+                    img_dpi = 72.0 / float(placement["pt_per_px"])
+                else:
+                    img_dpi = getattr(self, "_source_raster_dpi", None) or _image_dpi_of(
+                        self.input_path.get().strip(), self.dpi.get())
+                kw = {"white": self._wl_active_geom(), "img": self.input_path.get().strip(), "img_dpi": img_dpi}
+                self.export_btn.configure(state="disabled")
+                self.status.set("칼선 레이어를 넣어 저장하는 중... 일러스트레이터가 처음 켜질 때는 시간이 조금 걸립니다.")
+                threading.Thread(target=self._run_export_layered,
+                                 args=(out_path, src_path, ai_src, placement), kwargs=kw, daemon=True).start()
+                return
             if out_path.lower().endswith(".svg"):
                 # 원본 이미지(AI면 그 대지)와 같은 실제 크기(mm)로 저장(2026-09-29)
                 export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
@@ -6351,6 +6433,20 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("칼선 내보내기 저장 중")
             self._show_note_dialog("저장 중 오류가 발생했습니다", [str(e)], kind="error")
+
+
+def _image_dpi_of(path, fallback):
+    """PNG/JPG 안에 적힌 해상도(dpi). 없으면 fallback."""
+    try:
+        from PIL import Image as _Img
+
+        with _Img.open(path) as im:
+            d = im.info.get("dpi")
+        if d and float(d[0]) > 1:
+            return float(d[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return float(fallback)
 
 
 def _crash_log_path():

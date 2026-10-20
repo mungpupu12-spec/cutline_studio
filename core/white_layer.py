@@ -259,6 +259,46 @@ def sticker_border_mask(rgb: np.ndarray, dpi: float, min_sticker_mm2: float = 15
     return m
 
 
+def borderless_cut_from_mask(art_mask: np.ndarray, dpi: float, inset_mm: float = 1.2) -> tuple:
+    """투명 배경 그림의 무테 칼선(2026-10-20, 멍푸: "무테 + 투명 배경 PNG도 고쳐"): 그림 조각마다 바깥 외곽을
+    그림 안쪽으로 inset_mm만큼 줄인 선. 기존 무테 규칙(core.image_style._inset_inside_art -- 실제 손 칼선 대조로
+    정한 "항상 그림 안쪽, 뾰족한 끝만 둥글게")을 그대로 쓴다. 안쪽으로 줄이면 사라지는 가는 조각은 배경을
+    자르지 않도록 칼선을 만들지 않는다. Returns (MultiPolygon, 건너뛴 조각 수)."""
+    from core.image_style import _inset_inside_art
+
+    geom = mask_to_geom(art_mask)
+    inset_px = _mm_to_px(inset_mm, dpi)
+    lines, skipped = [], 0
+    for p in geom.geoms:
+        outer = Polygon(p.exterior.coords)
+        if outer.is_empty:
+            continue
+        ln = _inset_inside_art(outer, inset_px)
+        parts = [g for g in (getattr(ln, "geoms", None) or [ln]) if g is not None and not g.is_empty
+                 and g.geom_type == "Polygon"]
+        if not parts:
+            skipped += 1
+            continue
+        lines.extend(parts)
+    return MultiPolygon(lines), skipped
+
+
+def count_close_pairs(cuts, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) -> int:
+    """칼선끼리 gap_mm보다 가까운 쌍의 수."""
+    gs = list(getattr(cuts, "geoms", []) or [])
+    lim = _mm_to_px(gap_mm, dpi)
+    n = 0
+    for i in range(len(gs)):
+        bi = gs[i].bounds
+        for j in range(i + 1, len(gs)):
+            bj = gs[j].bounds
+            if bi[0] - lim > bj[2] or bj[0] - lim > bi[2] or bi[1] - lim > bj[3] or bj[1] - lim > bi[3]:
+                continue
+            if gs[i].distance(gs[j]) < lim:
+                n += 1
+    return n
+
+
 def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None) -> tuple:
     """그림 모양 기준 칼선을 만들 수 있는 마스크와 종류.
       ("ai_alpha" | "alpha", 그림 마스크): 투명 배경 그림 -- 칼선은 그림에서 띄운다.
