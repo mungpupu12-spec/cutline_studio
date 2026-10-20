@@ -398,7 +398,7 @@ def test_main_window_wording_uses_plain_sentences():
                     "여러 번 추가해도", "이 영역 추가 + 미리보기", "(모두 지우기)", "칼선 내보내기 (PNG)",
                     "고르세요."):
             assert old not in joined, old
-        for new in ("있음", "없음", "선택 영역 추가", "누적 초기화", "칼선 내보내기", "무테 칼선도 함께 추가"):
+        for new in ("있음", "없음", "선택 영역 추가", "누적 초기화", "완성 파일 내보내기", "무테 칼선도 함께 추가"):
             assert new in texts, new
         assert app.accum_status.get().endswith("니다.")
         assert JOB_TYPE_LABELS["MASKING_TAPE"] == "키스컷 (마스킹테이프)"

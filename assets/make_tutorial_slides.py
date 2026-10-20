@@ -20,13 +20,13 @@ OUT_DIR = os.path.join(HERE, "tutorial")
 
 W, H = 560, 260
 
-BG = (245, 245, 246, 255)       # BG_APP
+BG = (243, 245, 244, 255)       # BG_APP
 CARD = (255, 255, 255, 255)     # BG_CARD
 BORDER = (226, 226, 229, 255)   # BORDER
 INK = (0, 0, 0, 255)            # TEXT_PRIMARY
 GRAY = (69, 69, 74, 255)        # TEXT_SECONDARY
-COBALT = (0, 71, 171, 255)      # ACCENT
-COBALT_SOFT = (232, 240, 251, 255)  # ACCENT_SOFT
+COBALT = (30, 135, 112, 255)    # ACCENT(2026-10-20: 앱 포인트 색 진한 민트에 맞춤)
+COBALT_SOFT = (227, 245, 239, 255)  # ACCENT_SOFT
 WHITE = (255, 255, 255, 255)
 SAFETY = (22, 164, 74, 255)
 CUT = (220, 38, 38, 255)
@@ -124,8 +124,8 @@ def _arrow(d, x0, y0, x1, y1, color, width=4, head=10):
     d.line([x0, y0, x1, y1], fill=color, width=width)
     import math
     ang = math.atan2(y1 - y0, x1 - x0)
-    for side in (-1, 1):
-        a = ang + side * 2.5
+    for side in (-1, 1):   # 2026-10-20: 화살촉이 거꾸로(꼬리 쪽으로) 그려지던 것 바로잡음
+        a = ang + side * 0.6
         d.line([x1, y1, x1 - head * math.cos(a), y1 - head * math.sin(a)], fill=color, width=width)
 
 
@@ -152,14 +152,11 @@ def step1():
 
 
 def step2():
-    """작업 종류: 조각 스티커/스티커/도무송 카테고리 선택."""
+    """도무송 여부와 작업 종류 고르기(2026-10-20: 지금 화면의 작업 종류 이름으로)."""
     im, d = _canvas()
-    # 2026-08-31 피드백("완칼이라는 용어를 변경하자. 조각 스티커로"): 앱
-    # 화면(JOB_TYPE_LABELS)과 똑같은 용어를 써야 튜토리얼과 실제 화면이
-    # 어긋나 보이지 않음.
-    labels = ["조각 스티커", "스티커", "도무송"]
-    selected = 2
-    pw, ph, gap = 150, 62, 20
+    labels = ["무테", "유테", "키스컷"]
+    selected = 1
+    pw, ph, gap = 140, 58, 22
     total = pw * 3 + gap * 2
     x0 = (W - total) / 2
     y0 = H / 2 - ph / 2 - 14
@@ -167,57 +164,55 @@ def step2():
         bx0 = x0 + i * (pw + gap)
         box = (bx0, y0, bx0 + pw, y0 + ph)
         if i == selected:
-            d.rounded_rectangle(box, radius=18, fill=COBALT)
+            d.rounded_rectangle(box, radius=29, fill=COBALT)
             fill = WHITE
         else:
-            d.rounded_rectangle(box, radius=18, outline=BORDER, width=2, fill=CARD)
+            d.rounded_rectangle(box, radius=29, outline=BORDER, width=2, fill=CARD)
             fill = GRAY
-        # 2026-08-31 피드백("버튼 안의 글자가 안 보여"): 실제 원인은 이 라벨이
-        # 아예 안 그려진 게 아니라 _font()가 한글 글리프 없는 폰트로 조용히
-        # 넘어가서 생긴 문제였음(_font() 주석 참고) -- 폰트 탐색 로직을
-        # 고쳤고, 여기서는 "조각 스티커"처럼 길어진 라벨이 버튼 폭(150px)을
-        # 벗어나 잘리지 않도록 _label_fit으로 폭에 맞춰 크기를 자동으로
-        # 줄인다.
-        _label_fit(
-            d, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2, text,
-            fill=fill, size=19, max_width=pw - 16,
-        )
+        _label_fit(d, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2, text, fill=fill, size=20, max_width=pw - 16)
     cx, cy = x0 + selected * (pw + gap) + pw / 2, y0 + ph + 34
     d.polygon([(cx - 10, cy - 10), (cx + 10, cy - 10), (cx, cy + 6)], fill=COBALT)
     return im
 
 
+def _blob(d, cx, cy, rx, ry, fill):
+    d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=fill)
+
+
 def step3():
-    """드래그로 칼선 영역 선택."""
+    """자동으로 여러 개 인식 + 추가: 그림마다 칼선(빨강)이 생김."""
     im, d = _canvas()
     outer = (60, 30, 500, 230)
     d.rounded_rectangle(outer, radius=14, fill=CARD, outline=BORDER, width=2)
-    sel = (170, 80, 400, 190)
-    _dashed_rect(d, sel, COBALT, width=3)
-    cx, cy = sel[0] + 14, sel[1] + 14
-    d.ellipse([cx - 9, cy - 9, cx + 9, cy + 9], fill=COBALT)
-    _arrow(d, cx, cy, sel[2] - 14, sel[3] - 14, COBALT, width=4, head=12)
+    for cx, cy, rx, ry, col in [(150, 130, 46, 58, (247, 196, 120, 255)), (280, 120, 40, 40, (150, 200, 235, 255)),
+                                (410, 135, 50, 42, (240, 160, 180, 255))]:
+        m = 12
+        d.ellipse([cx - rx - m, cy - ry - m, cx + rx + m, cy + ry + m], outline=CUT, width=3)
+        _blob(d, cx, cy, rx, ry, col)
     return im
 
 
 def step4():
-    """세부 옵션(유테/무테, 재단 도형 등) 선택."""
+    """미리보기에서 칼선 확인·수정."""
     im, d = _canvas()
-    box_a = (130, 60, 250, 180)
-    box_b = (310, 60, 430, 180)
-    d.rounded_rectangle(box_a, radius=14, outline=COBALT, width=5, fill=CARD)
-    d.rounded_rectangle(box_b, radius=14, fill=GRAY)
-    check_r = 16
-    ccx, ccy = box_a[2] - 6, box_a[1] - 6
-    d.ellipse([ccx - check_r, ccy - check_r, ccx + check_r, ccy + check_r], fill=COBALT)
-    d.line([ccx - 7, ccy, ccx - 2, ccy + 6, ccx + 8, ccy - 8], fill=WHITE, width=3, joint="curve")
-    _label(d, (box_a[0] + box_a[2]) / 2, box_a[3] + 22, "유테", fill=INK, size=15)
-    _label(d, (box_b[0] + box_b[2]) / 2, box_b[3] + 22, "무테", fill=GRAY, size=15)
+    outer = (60, 30, 500, 230)
+    d.rounded_rectangle(outer, radius=14, fill=CARD, outline=BORDER, width=2)
+    cx, cy = 230, 130
+    d.ellipse([cx - 80, cy - 66, cx + 80, cy + 66], outline=CUT, width=3)
+    _blob(d, cx, cy, 66, 52, (150, 200, 235, 255))
+    for a in (0, 90, 180, 270):
+        import math
+        x = cx + 80 * math.cos(math.radians(a))
+        y = cy + 66 * math.sin(math.radians(a))
+        d.rectangle([x - 6, y - 6, x + 6, y + 6], fill=WHITE, outline=COBALT, width=2)
+    px, py = 390, 110
+    d.rounded_rectangle([px - 10, py - 40, px + 10, py + 40], radius=6, fill=COBALT)
+    d.polygon([(px - 10, py + 40), (px + 10, py + 40), (px, py + 62)], fill=COBALT)
     return im
 
 
 def step5():
-    """이 영역 추가 + 미리보기로 계속 쌓기(누적)."""
+    """이 영역 추가 + 미리보기로 계속 쌓기(누적) -- 예전 슬라이드(지금은 쓰지 않음)."""
     im, d = _canvas()
     base_x, base_y, w, h = 170, 150, 170, 60
     colors = [BORDER, (200, 200, 205, 255), COBALT_SOFT]
@@ -232,26 +227,29 @@ def step5():
     return im
 
 
+def _file(d, x0, y0, x1, y1, fold=20):
+    d.polygon([(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)], fill=CARD, outline=BORDER, width=2)
+    d.polygon([(x1 - fold, y0), (x1, y0 + fold), (x1 - fold, y0 + fold)], fill=BORDER)
+
+
 def step6():
-    """완성되면 SVG로 내보내기."""
+    """원본은 그대로 두고, 사본 파일에 칼선 레이어를 만들어 저장(2026-10-20)."""
     im, d = _canvas()
-    ix0, iy0 = 70, 80
-    isz = 100
-    d.rounded_rectangle([ix0, iy0, ix0 + isz, iy0 + isz], radius=int(isz * 0.22), fill=COBALT)
-    margin = isz * 0.20
-    d.line(
-        [ix0 + margin, iy0 + margin, ix0 + isz - margin, iy0 + isz - margin],
-        fill=WHITE, width=5,
-    )
-    _arrow(d, ix0 + isz + 30, iy0 + isz / 2, ix0 + isz + 150, iy0 + isz / 2, GRAY, width=5, head=14)
-    dx0, dy0, dx1, dy1 = ix0 + isz + 170, iy0 - 10, ix0 + isz + 170 + 130, iy0 + isz + 10
-    fold = 22
-    d.polygon(
-        [(dx0, dy0), (dx1 - fold, dy0), (dx1, dy0 + fold), (dx1, dy1), (dx0, dy1)],
-        fill=CARD, outline=BORDER, width=2,
-    )
-    d.polygon([(dx1 - fold, dy0), (dx1, dy0 + fold), (dx1 - fold, dy0 + fold)], fill=BORDER)
-    _label(d, (dx0 + dx1) / 2, (dy0 + dy1) / 2 + 8, "SVG", fill=COBALT, size=22)
+    _file(d, 50, 60, 160, 200)
+    _label(d, 105, 112, "원본", fill=GRAY, size=18)
+    _blob(d, 105, 155, 30, 22, (150, 200, 235, 255))
+    _arrow(d, 180, 130, 250, 130, GRAY, width=5, head=14)
+    _file(d, 270, 40, 510, 220)
+    _label(d, 330, 64, "사본", fill=GRAY, size=16)
+    rows = [("칼선", CUT, True), ("도안", (150, 200, 235, 255), False), ("화이트레이어", (200, 200, 205, 255), False)]
+    for k, (name, col, line) in enumerate(rows):
+        y = 92 + k * 40
+        d.rounded_rectangle([290, y, 490, y + 32], radius=8, fill=CARD, outline=BORDER, width=2)
+        if line:
+            d.ellipse([302, y + 6, 322, y + 26], outline=col, width=3)
+        else:
+            d.rounded_rectangle([302, y + 6, 322, y + 26], radius=4, fill=col)
+        _label_fit(d, 400, y + 16, name, fill=CUT if line else GRAY, size=16, max_width=150)
     return im
 
 

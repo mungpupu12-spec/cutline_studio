@@ -12,7 +12,7 @@
         있으면 바꿀지 먼저 묻는다).
       * 그 밖의 작업 종류: 지금 칼선은 그대로 두고, 칼선이 없는 그림 조각에만 칼선을 더한다. 옆 칼선과
         너무 가까워 자동으로 더하기 어려운 곳은 위치만 알려 준다.
-  - 칼선 내보내기를 하면 화이트도 함께 저장된다(PNG는 "_화이트.png" 따로, SVG는 "화이트레이어" 그룹).
+  - 완성 파일 내보내기(예전 이름 칼선 내보내기)를 하면 화이트도 함께 저장된다(PNG는 "_화이트.png" 따로, SVG는 "화이트레이어" 그룹).
 """
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ class WhiteLayerMixin:
                 self._on_make_white()
                 return
             set_white_overlay(self._white_geom)
-            self.status.set("화이트를 다시 넣었어요. 칼선을 저장하면 같이 저장돼요.")
+            self.status.set("화이트를 다시 넣었습니다. 완성 파일을 내보내면 함께 저장됩니다.")
         else:
             set_white_overlay(None)
             self.status.set("화이트를 뺐어요. 저장할 때 화이트는 안 들어가요.")
@@ -208,7 +208,7 @@ class WhiteLayerMixin:
         self.white_on.set(True)
         self.white_status.set(f"화이트 넣기 ({n}조각) · 화면은 파란색, 저장은 흰색")
         self._wl_rerender(path)
-        self.status.set("화이트 레이어를 만들었어요. 칼선을 저장하면 같이 저장돼요.")
+        self.status.set("화이트 레이어를 만들었습니다. 완성 파일을 내보내면 함께 저장됩니다.")
         if then:
             then()
 

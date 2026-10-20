@@ -463,12 +463,15 @@ CUTLINE_TYPE_LABELS = {
 # 다른 만큼의 빈 공간을 남기고 있었다 -- 모든 캡션을 15자 안팎의 짧은 한
 # 줄로 통일하면 "가장 긴 캡션"과 "가장 짧은 캡션"의 차이가 거의 없어져
 # 빈 공간 자체가 크게 줄어든다(자세한 원인은 아래 max_req_h 주석 참고).
+# 2026-10-20(멍푸: "튜토리얼 내용 업데이트해. 5.사본 파일에 칼선 레이어 생성 및 저장"): 지금 작업 순서와
+# (번호는 대화상자가 앞에 붙인다)
+# 화면 이름에 맞춰 다시 그림(작업 종류 무테/유테/키스컷, 자동 인식, 미리보기에서 수정, 사본+칼선 레이어 저장).
 TUTORIAL_SLIDES = [
-    ("step1.png", "도안 파일을 선택하세요"),
-    ("step2.png", "작업 종류를 고르세요"),
-    ("step3.png", "도안을 자동으로 인식해요"),
-    ("step5.png", "영역 추가로 칼선 생성"),
-    ("step6.png", "칼선 내보내기로 저장"),
+    ("step1.png", "도안 파일을 엽니다"),
+    ("step2.png", "작업 종류를 고릅니다"),
+    ("step3.png", "자동으로 칼선을 만듭니다"),
+    ("step4.png", "미리보기에서 칼선을 고칩니다"),
+    ("step6.png", "사본 파일에 칼선 레이어 생성 및 저장"),
 ]
 # 튜토리얼 내용을 바꿀 때마다 이 번호를 올리면, "다시 보지 않기"를 이미
 # 체크한 사용자에게도 새로워진 튜토리얼이 한 번은 다시 뜬다(아래
@@ -476,7 +479,7 @@ TUTORIAL_SLIDES = [
 # -- 2026-08-31 피드백("슬라이드 튜토리얼 어디갔어?")의 원인이, 예전 버전을
 # 테스트하며 이미 "다시 보지 않기"가 저장되어 있어서 새 슬라이드 튜토리얼
 # 자체가 아예 뜨지 않았을 가능성이 높아 추가한 안전장치.
-TUTORIAL_VERSION = 5
+TUTORIAL_VERSION = 6
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -2353,7 +2356,8 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             fill="x", pady=(0, 8)
         )
         # 2026-09-30(멍푸: "칼선 파일 svg 말고 png로"): 기본은 투명 배경 PNG(원본 이미지와 같은 크기)
-        self.export_btn = self._btn_primary(sec7, "칼선 내보내기", self._on_export)
+        # 2026-10-20(멍푸: "완성 파일 내보내기로 변경"): 원본 사본에 칼선 레이어를 넣어 저장하므로 이름을 바꿈
+        self.export_btn = self._btn_primary(sec7, "완성 파일 내보내기", self._on_export)
         self.export_btn.configure(state="disabled")
         self.export_btn.pack(fill="x")
 
@@ -6377,7 +6381,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                       else [("PDF - 도안·칼선 레이어 분리", "*.pdf")])
         default_name = base + ("_칼선.ai" if ai_src else "_칼선.pdf")
         out_path = filedialog.asksaveasfilename(
-            title="칼선 내보내기",
+            title="완성 파일 내보내기",
             defaultextension=".ai" if ai_src else ".pdf",
             initialfile=default_name,
             filetypes=copy_types + [("PNG - 칼선만, 투명 배경(원본 이미지와 같은 크기)", "*.png"), ("SVG", "*.svg")],
@@ -6431,7 +6435,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             self.status.set(f"저장됨: {out_path}")
             self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")
         except Exception as e:  # noqa: BLE001
-            self._report_exception_to_server("칼선 내보내기 저장 중")
+            self._report_exception_to_server("완성 파일 내보내기 저장 중")
             self._show_note_dialog("저장 중 오류가 발생했습니다", [str(e)], kind="error")
 
 
