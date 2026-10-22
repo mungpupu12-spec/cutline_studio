@@ -156,3 +156,67 @@ def test_close_stickers_ask_merge_or_separate():
             assert len(app._accumulated[-1].offsets["cut"].geoms) == n_expected
     finally:
         app.destroy()
+
+
+def _scene_image():
+    """여러 색 배경(위 연한 벽 / 가운데 격자 무늬 띠 / 아래 연회색 바닥) 앞에 그림 셋: 띠와 바닥에 걸친 큰 덩어리,
+    바닥 위 흰 사각형(바닥과 밝기 차이 작음), 바닥 위 여러 색 줄무늬 기둥. 알고리즘 확인용 합성 이미지."""
+    h, w = 600, 800
+    img = np.zeros((h, w, 3), np.uint8)
+    img[:] = (252, 246, 232)
+    img[120:380] = (35, 175, 204)
+    img[120:380, ::40] = (122, 195, 217)
+    img[120:380:40, :] = (122, 195, 217)
+    img[380:] = (240, 240, 244)
+    big = np.zeros((h, w), np.uint8)
+    cv2.ellipse(big, (400, 300), (150, 200), 0, 0, 360, 1, -1)
+    img[big > 0] = (238, 178, 82)
+    cv2.circle(img, (400, 300), 30, (0, 168, 179), -1)               # 배경 띠와 비슷한 색이 그림 안에
+    paper = np.zeros((h, w), np.uint8)
+    cv2.rectangle(paper, (60, 420), (200, 560), 1, -1)
+    img[paper > 0] = (255, 255, 255)
+    cv2.line(img, (80, 450), (180, 450), (20, 20, 20), 4)
+    pill = np.zeros((h, w), np.uint8)
+    cv2.rectangle(pill, (640, 430), (720, 570), 1, -1)
+    img[pill > 0] = (255, 255, 255)
+    img[430:460, 640:721] = (138, 204, 227)
+    img[500:520, 640:721] = (0, 131, 76)
+    return cv2.GaussianBlur(img, (3, 3), 0), big.astype(bool), paper.astype(bool), pill.astype(bool)
+
+
+def test_scene_objects_mask_separates_objects_from_multicolor_background():
+    img, big, paper, pill = _scene_image()
+    m = wl.scene_objects_mask(img, DPI)
+    assert m is not None
+    n, lab = cv2.connectedComponents(m.astype(np.uint8))
+    assert n - 1 == 3
+    for obj in (big, paper, pill):
+        assert (m & obj).sum() >= 0.97 * obj.sum()                 # 그림은 거의 다(흰 사각형·줄무늬 기둥 포함)
+    assert (m & ~(big | paper | pill)).sum() <= 0.02 * m.sum()       # 배경은 거의 안 들어감
+    cuts, _ = wl.borderless_cut_from_mask(wl.build_white_mask(m, DPI), DPI, inset_mm=1.2)
+    assert len(cuts.geoms) == 3
+
+
+import pytest
+
+
+@pytest.mark.parametrize("line", [(30, 30, 30), (215, 190, 160)])   # 검정 선, 옅은 갈색 선
+def test_scene_objects_mask_white_face_on_white_background(line):
+    """흰 바탕 위, 선으로 그린 흰 얼굴(선에 0.2mm 틈) -- 얼굴 전체가 그림(유테 칼선이 선 바깥으로).
+    2026-10-22 멍푸: "유테는 이미지 외곽에 선이 있는거야, 옅은 갈색 같은 색도 있으니 선을 기준으로 만들어"."""
+    img = np.full((500, 500, 3), 255, np.uint8)
+    cv2.circle(img, (250, 250), 150, line, 4)                         # 흰 얼굴 테두리 선
+    img[96:106, 248:250] = 255                                        # 선의 좁은 틈(2px, 약 0.17mm)
+    cv2.circle(img, (200, 230), 10, (30, 30, 30), -1)                 # 눈
+    cv2.circle(img, (300, 230), 10, (30, 30, 30), -1)
+    cv2.ellipse(img, (250, 300), (40, 20), 0, 0, 180, (230, 170, 170), -1)
+    face = np.zeros((500, 500), np.uint8)
+    cv2.circle(face, (250, 250), 150, 1, -1)
+    m = wl.scene_objects_mask(img, DPI)
+    assert m is not None
+    assert (m & face.astype(bool)).sum() >= 0.98 * face.sum()         # 흰 얼굴 안쪽도 그림
+    assert (m & ~cv2.dilate(face, np.ones((7, 7), np.uint8)).astype(bool)).sum() == 0
+    cuts = wl.cut_from_white_mask(wl.build_white_mask(m, DPI), DPI, offset_mm=1.2)
+    assert len(cuts.geoms) == 1
+    r = (cuts.geoms[0].area / np.pi) ** 0.5
+    assert r > 152                                                    # 칼선이 선 바깥

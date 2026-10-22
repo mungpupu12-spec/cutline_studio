@@ -374,7 +374,9 @@ class WhiteLayerMixin:
             if job not in self.SHAPE_CUT_STICKER_JOBS:
                 return False
             dpi = self._wl_image_dpi()
-            kind, mask = wl.shape_cut_source(path, dpi, ai_path=self._ai_source_path)
+            kind, mask = wl.shape_cut_source(path, dpi, ai_path=self._ai_source_path,
+                                             scene=bool(self.use_grabcut.get()),
+                                             scene_single=job in ("LINE_ART", "BORDERLESS"))
             if kind is None or (kind != "sticker" and job not in self.SHAPE_CUT_ALPHA_JOBS):
                 return False
             separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)

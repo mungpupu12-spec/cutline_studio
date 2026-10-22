@@ -259,6 +259,113 @@ def sticker_border_mask(rgb: np.ndarray, dpi: float, min_sticker_mm2: float = 15
     return m
 
 
+def scene_objects_mask(rgb: np.ndarray, dpi: float, tol: float = 12.0, min_share: float = 0.004,
+                       min_obj_mm2: float = 4.0, allow_single: bool = True, _depth: int = 0) -> Optional[np.ndarray]:
+    """불투명 그림에서 배경을 빼고 그림 모양만 골라낸다. 투명 배경 그림처럼 그림 모양 기준 칼선을 만들 때 쓴다.
+
+    2026-10-21(멍푸: 여러 색 배경 앞 그림의 무테 칼선이 배경과 묶임 -- "칼선 엉망이야"): 여러 색 배경.
+    2026-10-22(멍푸: 흰 바탕 위 흰 캐릭터의 유테 칼선이 얼굴을 가로지름 -- "검정선 라인 밖으로 칼선 만들면 되는
+    기초적인 문제"): 흰 바탕(한 가지 색 배경)도 같은 방식으로. 배경을 가장자리에서부터 채워 들어가되 그림 선은
+    넘지 않으므로, 선으로 닫힌 흰 얼굴은 그림으로 남고 칼선은 선 바깥으로 간다.
+
+    방법:
+      1) 가장자리 픽셀의 색들을 배경 색으로 삼는다(가장자리의 65% 이상이 한 색이면 그 색 하나 -- 흰 바탕에 그림이
+         가장자리까지 닿아도).
+      2) 배경 색과 비슷한(차이 12 이하) 픽셀 가운데 가장자리까지 이어진 곳이 배경. 선에 난 틈이나 그림 안의 가는
+         흰 선(1mm 미만)으로는 새어 들어가지 않는다.
+      3) 나머지가 그림. 그림 안의 구멍은 채우고 4mm²보다 작은 조각은 버린다. 여러 색 배경이면 색 경계의 얇은
+         찌꺼기(0.3mm 미만)를 깎고, 거의 배경 색뿐인 조각(얇은 경계에 갇힌 배경 칸, 예: 창틀 안 유리 한 칸)도 버린다.
+    그림이 너무 작거나(2% 미만) 너무 크면(85% 초과) None -- 예전 방식 그대로."""
+    if cv2 is None:
+        return None
+    h, w = rgb.shape[:2]
+    if h < 20 or w < 20:
+        return None
+    sm = cv2.medianBlur(np.ascontiguousarray(rgb[:, :, :3]), 5)
+    border = np.concatenate([sm[0], sm[-1], sm[:, 0], sm[:, -1]]).astype(np.float32)
+    q = border.astype(np.int32) // 4
+    _keys, inv, cnt = np.unique(q[:, 0] * 4096 + q[:, 1] * 64 + q[:, 2], return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    top = border[inv == int(np.argmax(cnt))].mean(0)
+    single = (((border - top) ** 2).sum(1) <= tol * tol).mean() >= 0.65
+    if single and not allow_single:
+        return None
+    if single:
+        pal = top[None, :]
+    else:
+        pal = np.asarray([border[inv == i].mean(0) for i in np.argsort(-cnt) if cnt[i] >= min_share * len(border)],
+                         np.float32)
+    f = sm.astype(np.float32)
+    d = None
+    ones = np.ones((1, 3), np.float32)
+    for c in pal:
+        diff = cv2.subtract(f, (float(c[0]), float(c[1]), float(c[2]), 0.0))   # OpenCV로 계산(numpy보다 빠름)
+        dc = cv2.transform(cv2.multiply(diff, diff), ones)
+        d = dc if d is None else cv2.min(d, dc)
+    d = d.reshape(h, w)
+    pure = d <= tol * tol
+    bglike = pure.astype(np.uint8)
+    # 선의 좁은 틈이나 그림 안의 가는 흰 선(1mm 미만 -- 예: 모자의 흰 격자 무늬가 그림 끝까지 닿은 경우, 2026-10-22
+    # 멍푸 도안으로 확인)으로 배경이 새어 들어가지 않게: 좁은 길을 끊은 배경에서 가장자리와 이어진 곳만 찾고,
+    # 끊었던 만큼만 다시 넓힌다(원래 배경 색인 곳 안에서만).
+    # (한 색 배경일 때만 -- 여러 색 배경은 배경 칸 사이가 원래 좁아서 끊으면 안 됨)
+    rg = max(1, int(round(_mm_to_px(0.5, dpi)))) if single else 0
+    core_bg = cv2.morphologyEx(bglike, cv2.MORPH_OPEN, _disk(rg)) if rg else bglike
+    _n, lab = cv2.connectedComponents(core_bg, connectivity=4)
+    edge = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    lut = np.zeros(int(lab.max()) + 1, np.uint8)
+    lut[edge[edge > 0]] = 1
+    bg = lut[lab]
+    if rg:
+        bg = (cv2.dilate(bg, _disk(rg + 1)) > 0) & pure
+    else:
+        bg = bg > 0
+    fg = (~bg).astype(np.uint8)
+    if not single:
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _disk(max(1, int(round(_mm_to_px(0.3, dpi))))))
+    _n2, lab2 = cv2.connectedComponents((1 - fg).astype(np.uint8), connectivity=4)
+    edge2 = np.unique(np.concatenate([lab2[0], lab2[-1], lab2[:, 0], lab2[:, -1]]))
+    lut2 = np.ones(int(lab2.max()) + 1, np.uint8)                  # 가장자리와 안 닿은 빈 곳 = 그림 안 구멍
+    lut2[edge2] = 0
+    lut2[0] = 0
+    fg |= lut2[lab2]                                              # 그림 안 구멍 채우기(흰 얼굴 등)
+    n3, lab3, st, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    min_px = min_obj_mm2 / (25.4 / float(dpi)) ** 2
+    pure_frac = np.bincount(lab3.ravel(), weights=pure.ravel().astype(np.float64), minlength=n3) / np.maximum(
+        st[:, cv2.CC_STAT_AREA], 1)
+    keep = [i for i in range(1, n3) if st[i, cv2.CC_STAT_AREA] >= min_px
+            and (single or pure_frac[i] < 0.9)]
+    if not keep:
+        return None
+    lut3 = np.zeros(n3, bool)
+    lut3[keep] = True
+    out = lut3[lab3]
+    if _depth == 0:
+        # 아주 큰 덩어리(그림의 25% 이상) 안에 바탕(예: 사진 속 투명 시트, 큰 판 위에 놓인 스티커들)이 따로
+        # 있으면, 그 덩어리의 가장자리 색을 바탕으로 보고 안에서 한 번 더 그림을 찾는다(그림이 2개 이상일 때만 바꿈).
+        for i in keep:
+            if st[i, cv2.CC_STAT_AREA] < 0.25 * h * w:
+                continue
+            x, y, bw, bh = st[i, :4]
+            comp = lab3[y:y + bh, x:x + bw] == i
+            ring = comp & ~cv2.erode(comp.astype(np.uint8), _disk(2)).astype(bool)
+            if not ring.any():
+                continue
+            sub = sm[y:y + bh, x:x + bw].copy()
+            sub[~comp] = np.median(sub[ring], axis=0).astype(sub.dtype)
+            inner = scene_objects_mask(sub, dpi, tol, min_share, min_obj_mm2, True, _depth=1)
+            if inner is None:
+                continue
+            if cv2.connectedComponents(inner.astype(np.uint8), connectivity=8)[0] - 1 < 2:
+                continue
+            region = out[y:y + bh, x:x + bw]
+            region[comp] = inner[comp]
+    frac = out.mean()
+    if frac < 0.02 or frac > 0.85:
+        return None
+    return out
+
+
 def borderless_cut_from_mask(art_mask: np.ndarray, dpi: float, inset_mm: float = 1.2) -> tuple:
     """투명 배경 그림의 무테 칼선(2026-10-20, 멍푸: "무테 + 투명 배경 PNG도 고쳐"): 그림 조각마다 바깥 외곽을
     그림 안쪽으로 inset_mm만큼 줄인 선. 기존 무테 규칙(core.image_style._inset_inside_art -- 실제 손 칼선 대조로
@@ -299,11 +406,14 @@ def count_close_pairs(cuts, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) ->
     return n
 
 
-def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None) -> tuple:
+def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None, scene: bool = False,
+                     scene_single: bool = False) -> tuple:
     """그림 모양 기준 칼선을 만들 수 있는 마스크와 종류.
       ("ai_alpha" | "alpha", 그림 마스크): 투명 배경 그림 -- 칼선은 그림에서 띄운다.
       ("sticker", 스티커 마스크): 진한 배경 위 흰 테두리 스티커 -- 칼선은 흰 테두리 바깥선.
-      (None, None): 둘 다 아님(예전 방식)."""
+      ("scene", 그림 마스크): scene=True("배경이 복잡해도 그림만 분리")이고 불투명 배경(흰 바탕, 여러 색 배경) 위
+        그림 -- 투명 배경처럼 그림 모양 기준. 한 색 배경(흰 바탕)은 scene_single=True일 때만(유테·무테).
+      (None, None): 모두 아님(예전 방식)."""
     art, src = art_mask_for_white(image_path, None, ai_path=ai_path)
     if src in ("ai_alpha", "alpha") and art.any():
         return src, art
@@ -312,6 +422,13 @@ def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None)
     with Image.open(image_path) as im:
         rgb = np.asarray(im.convert("RGB"))
     m = sticker_border_mask(rgb, dpi)
+    sc = scene_objects_mask(rgb, dpi, allow_single=scene_single) if scene else None
+    # 흰 테두리를 일부 스티커에서만 찾았으면(배경을 뺀 그림 넓이의 85% 미만 -- 사진처럼 흰 테두리가 고르게 밝지
+    # 않을 때, 2026-10-22 확인) 흰 테두리 대신 그림 모양 기준으로.
+    if m is not None and (sc is None or (m & sc).sum() >= 0.85 * sc.sum()):
+        return "sticker", m
+    if sc is not None:
+        return "scene", sc
     if m is not None:
         return "sticker", m
     return None, None
