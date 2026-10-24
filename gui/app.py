@@ -4175,6 +4175,20 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         remaining_flat = [
             cell_boxes_px[idx] for gi in cell_indices for idx in cell_groups[gi]
         ]
+        # 2026-10-24(멍푸: "칼선이 조각나서 생성 되고 최소 간격을 유지 하지 않고 있어 문제 개선해", "곰돌이는
+        # 칼선이 무테지만 외곽에 칼선이 있어야해", 말풍선과 얼굴은 하나로): 흰 바탕·투명 배경처럼 배경을 뺄 수 있는
+        # 그림이면 칸마다 따로 쪼개지 않고 그림 모양 기준으로 한 번에 -- 외곽선 있는 그림은 유테(바깥), 없는 그림은
+        # 무테(안쪽), 그림 안 구멍은 채움, 2mm보다 가까운 칼선은 합칠지 묻는다. 도무송으로 표시한 칸은 뺀다.
+        if not self._real_grid_cells_px:
+            dom_boxes = [
+                self._mixed_cell_boxes_px[idx]
+                for gi in range(len(cell_groups)) if gi in self._mixed_marked
+                for idx in cell_groups[gi]
+            ]
+            done_cells = list(cell_indices)
+            if self._shape_cut_auto(path, job="AUTO_STYLE", exclude_boxes=dom_boxes,
+                                    on_done=lambda n: self._mixed_rest_shape_done(done_cells, n)):
+                return
         try:
             fine_boxes, fine_groups = detect_repeat_aware_sub_element_boxes_px(path, remaining_flat)
         except Exception as e:  # noqa: BLE001
@@ -4336,6 +4350,28 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             self.after(0, self._on_error, str(e))
             return
         self.after(0, self._show_auto_detect_result, preview_png, added_total, n_boxes_total, errors)
+
+    def _mixed_rest_shape_done(self, cell_indices, n_added):
+        """③을 그림 모양 기준으로 끝냈을 때(_shape_cut_auto의 on_done) -- 칸 처리 기록과 남은 칸 안내."""
+        for gi in cell_indices:
+            self._mixed_processed.add(gi)
+        self._mixed_added_count += n_added
+        n_groups = len(self._mixed_groups)
+        n_left = n_groups - len(self._mixed_processed)
+        if n_left <= 0:
+            self._mixed_mode = False
+            self._mixed_boxes = []
+            self._mixed_groups = []
+            self._mixed_marked = set()
+            self._mixed_rect_ids = {}
+            self._mixed_hover_gi = None
+            self._mixed_processed = set()
+            self._mixed_added_count = 0
+        else:
+            self.after(150, lambda: self.status.set(
+                self.status.get() + f" 도무송으로 표시한 칸 {n_left}개가 남았습니다 -- "
+                "'② 표시한 도무송 칼선 생성'을 눌러 이어서 진행하세요."))
+        self.after(0, lambda: self.generate_btn.configure(state="normal"))
 
     def _run_mixed_generate_subset(self, path, group_indices):
         """group_indices에 담긴 그룹들만 생성한다 -- is_domusong 여부는

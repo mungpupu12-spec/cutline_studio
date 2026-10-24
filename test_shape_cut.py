@@ -220,3 +220,95 @@ def test_scene_objects_mask_white_face_on_white_background(line):
     assert len(cuts.geoms) == 1
     r = (cuts.geoms[0].area / np.pi) ** 0.5
     assert r > 152                                                    # 칼선이 선 바깥
+
+
+def _outlined_and_painted():
+    """흰 바탕: 왼쪽은 선으로 그린 얼굴 + 위 말풍선(선), 오른쪽은 선 없이 칠한 그림(가장자리가 안쪽보다 밝음).
+    알고리즘 확인용 합성 이미지."""
+    img = np.full((600, 900, 3), 255, np.uint8)
+    cv2.circle(img, (220, 360), 120, (40, 40, 40), 4)                  # 얼굴(선)
+    cv2.ellipse(img, (220, 190), (90, 35), 0, 0, 360, (40, 40, 40), 3)  # 말풍선(선), 얼굴과 약 15px 떨어짐
+    yy, xx = np.mgrid[0:600, 0:900]
+    d = np.hypot(xx - 650, yy - 330)
+    blob = d < 160
+    shade = np.clip(110 + (d / 160.0) * 60, 0, 255)                     # 가운데 어둡고 가장자리 밝은 물감 칠
+    img[blob] = np.stack([shade, shade * 0.75, shade * 0.5], -1)[blob].astype(np.uint8)
+    return img
+
+
+def test_auto_style_cuts_outline_yute_and_painted_mute():
+    img = _outlined_and_painted()
+    m = wl.scene_objects_mask(img, DPI)
+    n, lab = cv2.connectedComponents(m.astype(np.uint8))
+    kinds = {}
+    for i in range(1, n):
+        comp = lab == i
+        ys, xs = np.nonzero(comp)
+        kinds[int(xs.mean() > 450)] = kinds.get(int(xs.mean() > 450), []) + [wl.has_outline_line(img, comp, DPI)]
+    assert all(kinds[0]) and not any(kinds[1])                          # 선 있는 그림 = 유테, 칠한 그림 = 무테
+    cuts, separate, ny, nm, _ = wl.auto_style_cuts(img, m, DPI, 2.2)
+    assert ny in (1, 2) and nm == 1                                     # 말풍선이 얼굴과 가까우면 한 덩어리
+    assert len(cuts.geoms) == 2                                         # 얼굴+말풍선 하나, 칠한 그림 하나
+    left = [g for g in cuts.geoms if g.centroid.x < 450][0]
+    right = [g for g in cuts.geoms if g.centroid.x > 450][0]
+    assert left.bounds[1] < 190 - 35 - 20 and left.bounds[3] > 360 + 120 + 20   # 유테: 말풍선·얼굴 바깥
+    assert right.bounds[0] > 650 - 160                                  # 무테: 그림 안쪽
+    assert wl.count_close_pairs(cuts, DPI) == 0                         # 최소 간격(2mm) 유지
+
+
+def test_mixed_rest_uses_shape_cut_and_excludes_domusong():
+    """'무테/유테+도무송'의 ③: 흰 바탕 그림이면 그림 모양 기준(유테/무테 자동)으로, 도무송 칸은 빼고."""
+    from gui.app import CutLineApp
+
+    img = _outlined_and_painted()
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "mixed.png")
+    Image.fromarray(img).save(p)
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        app._show_note_dialog = lambda *a, **k: None
+        app._show_confirm_dialog = lambda *a, **k: True
+        app.input_path.set(p)
+        app.job_type.set("MIXED_AUTO")
+        app.style_margin_mm.set(2.2)
+        app._mixed_boxes = [(80, 140, 360, 500), (480, 160, 820, 500)]
+        app._mixed_cell_boxes_px = list(app._mixed_boxes)
+        app._mixed_groups = [[0], [1]]
+        app._mixed_marked = {1}                                         # 오른쪽 칸은 도무송으로 표시
+        app._mixed_processed = set()
+        app._mixed_added_count = 0
+        app._run_mixed_generate_rest_fine(p, [0])
+        for _ in range(5):
+            app.update()
+        cut = app._accumulated[-1].offsets["cut"]
+        assert len(cut.geoms) == 1 and cut.geoms[0].centroid.x < 450   # 왼쪽(얼굴+말풍선) 하나만
+        assert 0 in app._mixed_processed and 1 not in app._mixed_processed
+    finally:
+        app.destroy()
+
+
+def test_label_band_gets_no_cut_and_stickers_stay_apart():
+    """시트 위 가로 가격표 띠(초록 바탕 + 흰 글자) 아래에 선 그림 스티커 둘, 하나는 띠에 거의 붙어 있음.
+    띠에는 칼선을 만들지 않고, 스티커 칼선은 띠에서 2mm 이상 떨어진다. 알고리즘 확인용 합성 이미지."""
+    from shapely.geometry import box
+
+    h, w = 900, 1400
+    img = np.full((h, w, 3), 255, np.uint8)
+    img[40:200, 40:1360] = (112, 168, 64)                              # 가격표 띠(약 13.5mm)
+    cv2.putText(img, "LABEL 2800", (120, 150), cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 255, 255), 8)
+    cv2.circle(img, (400, 420), 190, (30, 30, 30), 5)                  # 띠 바로 아래(약 30px, 2.5mm)
+    cv2.circle(img, (1000, 560), 180, (30, 30, 30), 5)
+    m = wl.scene_objects_mask(img, DPI)
+    m2, bands = wl.remove_label_bands(m, DPI)
+    assert len(bands) == 1
+    x0, y0, x1, y1 = bands[0]
+    assert y0 <= 45 and y1 >= 195 and x1 - x0 > 1200
+    cuts = wl.cut_from_white_mask(wl.build_white_mask(m2, DPI), DPI, offset_mm=1.2)
+    cuts = wl.keep_away_from_bands(cuts, bands, DPI)
+    assert len(cuts.geoms) == 2                                         # 스티커 둘, 띠는 없음
+    band = box(x0, y0, x1, y1)
+    for c in cuts.geoms:
+        assert c.distance(band) >= wl._mm_to_px(2.0, DPI) - 1           # 띠와 2mm 이상

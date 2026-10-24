@@ -295,14 +295,24 @@ def scene_objects_mask(rgb: np.ndarray, dpi: float, tol: float = 12.0, min_share
     else:
         pal = np.asarray([border[inv == i].mean(0) for i in np.argsort(-cnt) if cnt[i] >= min_share * len(border)],
                          np.float32)
-    f = sm.astype(np.float32)
-    d = None
-    ones = np.ones((1, 3), np.float32)
-    for c in pal:
-        diff = cv2.subtract(f, (float(c[0]), float(c[1]), float(c[2]), 0.0))   # OpenCV로 계산(numpy보다 빠름)
-        dc = cv2.transform(cv2.multiply(diff, diff), ones)
-        d = dc if d is None else cv2.min(d, dc)
-    d = d.reshape(h, w)
+    if len(pal) <= 2:
+        f = sm.astype(np.float32)
+        d = None
+        ones = np.ones((1, 3), np.float32)
+        for c in pal:
+            diff = cv2.subtract(f, (float(c[0]), float(c[1]), float(c[2]), 0.0))   # OpenCV로 계산(numpy보다 빠름)
+            dc = cv2.transform(cv2.multiply(diff, diff), ones)
+            d = dc if d is None else cv2.min(d, dc)
+        d = d.reshape(h, w)
+    else:
+        # 배경 색이 많으면(사진 등) 색을 64단계로 나눈 표를 한 번 만들어 찾아 쓴다(속도). 오차는 한 채널 2 이하.
+        lv = (np.arange(64, dtype=np.float32) * 4 + 1.5)
+        grid = np.stack(np.meshgrid(lv, lv, lv, indexing="ij"), -1).reshape(-1, 3)
+        table = np.full(len(grid), np.inf, np.float32)
+        for c in pal:
+            table = np.minimum(table, ((grid - c) ** 2).sum(1))
+        q6 = (sm >> 2).astype(np.int32)
+        d = table[(q6[:, :, 0] << 12) | (q6[:, :, 1] << 6) | q6[:, :, 2]]
     pure = d <= tol * tol
     bglike = pure.astype(np.uint8)
     # 선의 좁은 틈이나 그림 안의 가는 흰 선(1mm 미만 -- 예: 모자의 흰 격자 무늬가 그림 끝까지 닿은 경우, 2026-10-22
@@ -328,8 +338,22 @@ def scene_objects_mask(rgb: np.ndarray, dpi: float, tol: float = 12.0, min_share
     lut2 = np.ones(int(lab2.max()) + 1, np.uint8)                  # 가장자리와 안 닿은 빈 곳 = 그림 안 구멍
     lut2[edge2] = 0
     lut2[0] = 0
-    fg |= lut2[lab2]                                              # 그림 안 구멍 채우기(흰 얼굴 등)
+    holes = lut2[lab2]
+    fg |= holes                                                   # 그림 안 구멍 채우기(흰 얼굴 등)
     n3, lab3, st, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    # 칸 격자(도무송 칸 테두리 등)가 그려진 시트: 격자 선이 시트 대부분을 감싸 큰 구멍(칸) 여러 개를 가진 한
+    # 덩어리가 된다 -- 이걸 그림 하나로 보면 시트 전체에 칼선 하나가 생기므로 이 방식은 쓰지 않는다(예전 방식).
+    big = [i for i in range(1, n3) if st[i, cv2.CC_STAT_AREA] >= 0.4 * h * w]
+    if big:
+        enclosed = (pure & (fg > 0)).astype(np.uint8)              # 그림 안에 갇힌 바탕색 빈 곳(칸)
+        nh, hl, hst, _ = cv2.connectedComponentsWithStats(enclosed, connectivity=4)
+        if nh > 1:
+            _u, first = np.unique(hl.ravel(), return_index=True)              # 구멍마다 한 점
+            owner = lab3.ravel()[first[1:]]                                    # 그 점이 속한 덩어리
+            for i in big:
+                n_big_holes = int(((owner == i) & (hst[1:, cv2.CC_STAT_AREA] >= 0.02 * st[i, cv2.CC_STAT_AREA])).sum())
+                if n_big_holes >= 4:
+                    return None
     min_px = min_obj_mm2 / (25.4 / float(dpi)) ** 2
     pure_frac = np.bincount(lab3.ravel(), weights=pure.ravel().astype(np.float64), minlength=n3) / np.maximum(
         st[:, cv2.CC_STAT_AREA], 1)
@@ -390,6 +414,199 @@ def borderless_cut_from_mask(art_mask: np.ndarray, dpi: float, inset_mm: float =
     return MultiPolygon(lines), skipped
 
 
+def find_label_bands(mask: np.ndarray, dpi: float, min_cover: float = 0.9, min_h_mm: float = 3.0,
+                     max_h_mm: float = 30.0, max_h_frac: float = 0.5) -> list:
+    """시트 위·아래에 가로로 길게 놓인 띠(가격표·제목 띠, 예: "브랜드 이름 / 상품명 / 2800")를 찾는다
+    (2026-10-24 멍푸: "가격표가 적혀 있는건 칼선 인식 하면 안 돼, 그리고 스티커 칼선이 가격표하고 붙어 있어").
+    그림 마스크에서 한 줄의 90% 이상이 끊김 없이 채워진 줄이 이어진 곳(높이 3~30mm, 그림 높이의 절반 이하)이
+    시트 맨 위나 맨 아래에 있으면 띠로 본다 --
+    스티커는 한 줄을 그렇게 넓게 채우지 않는다. Returns [(x0, y0, x1, y1), ...] 픽셀."""
+    m = np.asarray(mask, bool)
+    h, w = m.shape
+    full = np.zeros(h, bool)
+    need = min_cover * w
+    for yy in np.nonzero(m.sum(1) >= need)[0]:
+        # 한 줄이 끊김 없이 이어져야 띠(스티커 여러 개가 나란히 있는 줄은 띠가 아님)
+        e = np.diff(np.concatenate([[0], m[yy].astype(np.int8), [0]]))
+        starts, ends = np.nonzero(e == 1)[0], np.nonzero(e == -1)[0]
+        full[yy] = bool(len(starts)) and int((ends - starts).max()) >= need
+    bands = []
+    y = 0
+    min_h = _mm_to_px(min_h_mm, dpi)
+    while y < h:
+        if not full[y]:
+            y += 1
+            continue
+        y0 = y
+        while y < h and full[y]:
+            y += 1
+        y1 = y
+        if y1 - y0 >= min_h and (y1 - y0) <= min(max_h_frac * h, _mm_to_px(max_h_mm, dpi)):
+            cols = np.nonzero(m[y0:y1].mean(0) >= 0.5)[0]
+            # 시트 맨 위나 맨 아래에 있는 띠만(그 위 또는 아래에 다른 그림이 없음) -- 가운데 놓인 가로로 긴 글자
+            # 스티커는 띠가 아니다.
+            tiny = 0.005 * (y1 - y0) * w
+            if len(cols) and (m[:y0].sum() <= tiny or m[y1:].sum() <= tiny):
+                bands.append((int(cols[0]), int(y0), int(cols[-1]) + 1, int(y1)))
+    return bands
+
+
+def remove_label_bands(mask: np.ndarray, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) -> tuple:
+    """띠와 그 둘레 gap_mm를 그림에서 뺀다(띠에 붙은 스티커는 띠와 떨어진다). 띠에서 떨어져 나온 가는 조각
+    (띠 가장자리의 부드러운 테두리 등, 4mm² 미만)은 버린다. Returns (마스크, 띠 목록)."""
+    bands = find_label_bands(mask, dpi)
+    if not bands:
+        return mask, []
+    out = np.array(mask, dtype=bool)
+    g = int(round(_mm_to_px(gap_mm, dpi)))
+    h, w = out.shape
+    for x0, y0, x1, y1 in bands:
+        out[max(0, y0 - g):min(h, y1 + g), max(0, x0 - g):min(w, x1 + g)] = False
+    n, lab, st, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), connectivity=8)
+    min_px = 4.0 / (25.4 / float(dpi)) ** 2
+    keep = np.zeros(n, bool)
+    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= min_px
+    return keep[lab], bands
+
+
+def keep_away_from_bands(cuts, bands: list, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM):
+    """칼선이 띠에 gap_mm보다 가까이 가지 않게 그 부분을 잘라 낸다."""
+    if not bands or cuts is None or cuts.is_empty:
+        return cuts
+    from shapely.geometry import box as _box
+
+    g = _mm_to_px(gap_mm, dpi)
+    zone = unary_union([_box(x0, y0, x1, y1).buffer(g) for x0, y0, x1, y1 in bands])
+    out = []
+    for p in getattr(cuts, "geoms", [cuts]):
+        q = p.difference(zone)
+        for r in getattr(q, "geoms", [q]):
+            if r.geom_type == "Polygon" and not r.is_empty and r.area > 4:
+                out.append(Polygon(r.exterior))
+    return MultiPolygon(out)
+
+
+def has_outline_line(rgb: np.ndarray, comp: np.ndarray, dpi: float, min_depth: float = 35.0,
+                     L: Optional[np.ndarray] = None) -> bool:
+    """그림 조각(comp)의 바깥 가장자리에 외곽선(선)이 둘려 있는지 -- 있으면 유테, 없으면 무테(2026-10-24 멍푸:
+    "유테는 이미지 외곽에 선이 있는거야, 옅은 갈색 같은 색도 있으니 선을 기준으로", "곰돌이는 칼선이 무테지만
+    외곽에 칼선이 있어야해").
+    가장자리에서 안쪽으로 1px씩 들어가며 깊이별 밝기(중앙값)를 잰다. 바깥 가장자리 쪽(1.5mm 안)이 어둡고, 그보다
+    안쪽(3mm 안)에서 min_depth 이상 밝아지면 선이 있다 -- 검정 선, 옅은 갈색 선, 굵은 선, 해상도가 낮은 그림 모두.
+    물감으로 칠한 그림은 가장자리가 안쪽과 비슷하거나 오히려 밝다(흰 바탕과 섞임)."""
+    c = np.asarray(comp, np.uint8)
+    if L is None:
+        L = cv2.cvtColor(np.ascontiguousarray(rgb[:, :, :3]), cv2.COLOR_RGB2LAB)[:, :, 0]
+    k3 = np.ones((3, 3), np.uint8)
+    # 1px 둘레에서 가장 어두운 값으로 본다 -- 해상도가 낮아 선이 1~2px로 흐린 그림에서도 선을 놓치지 않게
+    L = cv2.erode(np.ascontiguousarray(np.asarray(L, np.uint8)), k3)
+    d_line = max(2, int(round(_mm_to_px(1.5, dpi))))
+    d_max = min(60, max(d_line + 3, int(round(_mm_to_px(3.0, dpi)))))
+    meds = []
+    cur = c
+    for _ in range(d_max):
+        nxt = cv2.erode(cur, k3)
+        ring = (cur > 0) & (nxt == 0)
+        if ring.sum() < 12:
+            break
+        meds.append(float(np.median(L[ring])))
+        cur = nxt
+    if len(meds) < 3:
+        return False
+    meds = np.asarray(meds)
+    dark_i = int(np.argmin(meds[:d_line]))           # 가장자리 쪽에서 가장 어두운 깊이(선)
+    after = meds[dark_i + 1:]
+    return bool(len(after)) and float(after.max()) - float(meds[dark_i]) >= min_depth
+
+
+def _merge_close(polys: list, gap_px: float) -> list:
+    """gap_px보다 가까운 칼선끼리 하나로(사이를 메워 이음). 최소 간격을 지키기 위한 합치기. 서로 가까운 것끼리 묶어
+    한 번에 합친다(속도). 가까운 두 칼선의 가장 가까운 두 점을 띠로 이어 반드시 하나가 되게 하고, 그 둘레는
+    부드럽게 메운다."""
+    from shapely.ops import nearest_points
+    from shapely.geometry import LineString
+
+    polys = [p for p in polys if p is not None and not p.is_empty]
+    n = len(polys)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    bb = [p.bounds for p in polys]
+    simp = [p.simplify(1.0, preserve_topology=True) for p in polys]
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = bb[i], bb[j]
+            if a[0] - gap_px > b[2] or b[0] - gap_px > a[2] or a[1] - gap_px > b[3] or b[1] - gap_px > a[3]:
+                continue
+            if polys[i].distance(polys[j]) < gap_px:
+                parent[find(i)] = find(j)
+                edges.append((i, j))
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    out = []
+    for root, idx in groups.items():
+        if len(idx) == 1:
+            out.append(polys[idx[0]])
+            continue
+        members = set(idx)
+        bridges = []
+        for i, j in edges:
+            if i in members:
+                p1, p2 = nearest_points(polys[i], polys[j])
+                bridges.append(LineString([p1, p2]).buffer(gap_px / 4.0))
+        smooth = unary_union([simp[k].buffer(gap_px / 2.0) for k in idx]).buffer(-gap_px / 2.0)
+        u = unary_union([smooth] + [polys[k] for k in idx] + bridges)
+        if u.geom_type == "Polygon":
+            out.append(Polygon(u.exterior))
+        else:                                   # 그래도 나뉘면(드묾) 조각을 잃지 않게 각각 둔다
+            out.extend(Polygon(g.exterior) for g in u.geoms if g.geom_type == "Polygon")
+    return out
+
+
+def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: float,
+                    gap_mm: float = DEFAULT_MERGE_GAP_MM) -> tuple:
+    """그림마다 외곽선이 있으면 유테(그림 바깥으로 margin_mm), 없으면 무테(그림 안쪽으로 margin_mm) 칼선
+    (2026-10-24 멍푸: "무테/유테+도무송"에서 칼선이 조각나고 최소 간격을 지키지 않음 -- 그림 안 구멍은 채워
+    그림 바깥 외곽에만 칼선 하나). Returns (합친 칼선, 따로 둔 칼선, 유테 수, 무테 수, 건너뛴 가는 그림 수).
+    합친 칼선: gap_mm보다 가까운 칼선은 하나로 이어 최소 간격을 지킨다. 따로 둔 칼선: 이어 붙이지 않은 것."""
+    m = np.asarray(mask, np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    is_yute = np.zeros(n, bool)
+    L = cv2.cvtColor(np.ascontiguousarray(rgb[:, :, :3]), cv2.COLOR_RGB2LAB)[:, :, 0]   # 한 번만 계산(속도)
+    hh, ww = m.shape
+    pad = 2 + 5 * max(2, int(round(_mm_to_px(0.25, dpi))))
+    for i in range(1, n):
+        x, y, bw, bh = st[i, :4]
+        ya, yb, xa, xb = max(0, y - pad), min(hh, y + bh + pad), max(0, x - pad), min(ww, x + bw + pad)
+        comp = (lab[ya:yb, xa:xb] == i).astype(np.uint8)              # 그림 조각 둘레만 잘라서 본다(속도)
+        is_yute[i] = has_outline_line(None, comp, dpi, L=L[ya:yb, xa:xb])
+    ny = int(is_yute[1:].sum())
+    nm = n - 1 - ny
+    yute = is_yute[lab].astype(np.uint8)
+    mute = ((~is_yute)[lab] & (lab > 0)).astype(np.uint8)
+    polys_sep, skipped = [], 0
+    if ny:
+        polys_sep += list(cut_from_white_mask(build_white_mask(yute, dpi), dpi, offset_mm=margin_mm,
+                                              merge_gap_mm=0.0).geoms)
+    if nm:
+        mc, skipped = borderless_cut_from_mask(build_white_mask(mute, dpi), dpi, inset_mm=margin_mm)
+        polys_sep += list(mc.geoms)
+    merged = list(polys_sep)
+    for _ in range(5):                         # 합친 뒤 또 가까워진 것까지(보통 1~2번이면 끝남)
+        before = len(merged)
+        merged = _merge_close(merged, _mm_to_px(gap_mm, dpi))
+        if len(merged) == before:
+            break
+    return MultiPolygon(merged), MultiPolygon(polys_sep), ny, nm, skipped
+
+
 def count_close_pairs(cuts, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) -> int:
     """칼선끼리 gap_mm보다 가까운 쌍의 수."""
     gs = list(getattr(cuts, "geoms", []) or [])
@@ -406,6 +623,17 @@ def count_close_pairs(cuts, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) ->
     return n
 
 
+def _rgb8(im) -> np.ndarray:
+    """PIL 그림 -> 8비트 RGB. 16비트 흑백(I;16)·정수(I) 그림은 밝기를 0~255로 줄여서(2026-10-24 확인: 그냥
+    RGB로 바꾸면 전부 흰색이 되어 그림을 못 찾음)."""
+    if im.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+        a = np.asarray(im, dtype=np.float64)
+        hi = 65535.0 if im.mode.startswith("I;16") or a.max() > 255 else 255.0
+        g = np.clip(a / hi * 255.0, 0, 255).astype(np.uint8)
+        return np.repeat(g[:, :, None], 3, axis=2)
+    return np.asarray(im.convert("RGB"))
+
+
 def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None, scene: bool = False,
                      scene_single: bool = False) -> tuple:
     """그림 모양 기준 칼선을 만들 수 있는 마스크와 종류.
@@ -420,7 +648,7 @@ def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None,
     from PIL import Image
 
     with Image.open(image_path) as im:
-        rgb = np.asarray(im.convert("RGB"))
+        rgb = _rgb8(im)
     m = sticker_border_mask(rgb, dpi)
     sc = scene_objects_mask(rgb, dpi, allow_single=scene_single) if scene else None
     # 흰 테두리를 일부 스티커에서만 찾았으면(배경을 뺀 그림 넓이의 85% 미만 -- 사진처럼 흰 테두리가 고르게 밝지

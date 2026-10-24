@@ -22,6 +22,7 @@ import tkinter as tk
 import traceback
 
 import customtkinter as ctk
+import numpy as np
 
 from core import white_layer as wl
 
@@ -350,7 +351,7 @@ class WhiteLayerMixin:
     SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS")
     SHAPE_CUT_STICKER_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS", "AUTO_STYLE")
 
-    def _shape_cut_auto(self, path) -> bool:
+    def _shape_cut_auto(self, path, job=None, exclude_boxes=None, on_done=None) -> bool:
         """그림 모양 기준으로 칼선을 한 번에 만든다. 못 쓰는 그림이면 False(예전 방식으로). 작업 스레드에서 불린다.
 
         2026-10-11(멍푸: "칼선 종류에 키스컷 포함해서 칼선이 왜 제대로 인식 안 되는지 파악해"): 키스컷 롤을 요소마다
@@ -370,14 +371,29 @@ class WhiteLayerMixin:
         from gui.app import _work_file_dir
 
         try:
-            job = self.job_type.get()
+            job = job or self.job_type.get()
             if job not in self.SHAPE_CUT_STICKER_JOBS:
                 return False
             dpi = self._wl_image_dpi()
             kind, mask = wl.shape_cut_source(path, dpi, ai_path=self._ai_source_path,
                                              scene=bool(self.use_grabcut.get()),
-                                             scene_single=job in ("LINE_ART", "BORDERLESS"))
-            if kind is None or (kind != "sticker" and job not in self.SHAPE_CUT_ALPHA_JOBS):
+                                             scene_single=job in ("LINE_ART", "BORDERLESS", "AUTO_STYLE"))
+            if kind is None or (kind != "sticker" and job not in self.SHAPE_CUT_ALPHA_JOBS + ("AUTO_STYLE",)):
+                return False
+            if exclude_boxes:
+                # "무테/유테+도무송"의 ③: 도무송으로 표시한 칸(과 그 둘레 최소 간격)은 빼고 나머지 그림만
+                pad = int(round(wl._mm_to_px(wl.DEFAULT_MERGE_GAP_MM, dpi)))
+                mask = np.array(mask, dtype=bool)
+                for x0, y0, x1, y1 in exclude_boxes:
+                    mask[max(0, int(y0) - pad):int(y1) + pad, max(0, int(x0) - pad):int(x1) + pad] = False
+                if not mask.any():
+                    return False
+            # 2026-10-24(멍푸: "가격표가 적혀 있는건 칼선 인식 하면 안 돼, 그리고 스티커 칼선이 가격표하고 붙어
+            # 있어"): 시트 위·아래의 가로 띠(가격표·제목)는 빼고, 칼선이 띠에 2mm보다 가까이 가지 않게.
+            bands = []
+            if job != "MASKING_TAPE":        # 마스킹테이프는 가로로 긴 그림 자체가 띠라서 빼지 않는다
+                mask, bands = wl.remove_label_bands(mask, dpi)
+            if not np.asarray(mask).any():
                 return False
             separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)
             n_close = 0
@@ -386,6 +402,30 @@ class WhiteLayerMixin:
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0)
                 separate = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0, merge_gap_mm=0.0)
                 msg = "흰 테두리 스티커 {n}개에 칼선을 만들었습니다(흰 테두리 바깥선)."
+            elif job == "AUTO_STYLE":
+                # 2026-10-24(멍푸: "칼선이 조각나서 생성 되고 최소 간격을 유지 하지 않고 있어", "곰돌이는 칼선이
+                # 무테지만 외곽에 칼선이 있어야해", 말풍선과 얼굴은 하나로): 그림마다 외곽선이 있으면 유테(바깥),
+                # 없으면 무테(안쪽). 그림 안 구멍은 채워 바깥 외곽에만 칼선 하나.
+                from PIL import Image as _Image
+
+                off = max(0.5, float(self.style_margin_mm.get()))
+                with _Image.open(path) as _im:
+                    if _im.mode in ("RGBA", "LA", "PA") or (_im.mode == "P" and "transparency" in _im.info):
+                        # 투명 배경은 흰 바탕에 얹어서 본다 -- 반투명 가장자리의 숨은 색(검정 등)을 선으로 오인하지 않게
+                        _rgba = _im.convert("RGBA")
+                        _bg = _Image.new("RGBA", _rgba.size, (255, 255, 255, 255))
+                        _bg.alpha_composite(_rgba)
+                        rgb = np.asarray(_bg.convert("RGB"))
+                    else:
+                        rgb = wl._rgb8(_im)
+                if rgb.shape[:2] != mask.shape:
+                    return False
+                cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off)
+                mask = wl.build_white_mask(mask, dpi)
+                msg = (f"칼선 {{n}}개를 만들었습니다(외곽선 있는 그림 {ny}개는 유테 -- 바깥 {off:.1f}mm, "
+                       f"없는 그림 {nm}개는 무테 -- 안쪽 {off:.1f}mm). 간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
+                if n_thin:
+                    msg += f" 너무 가는 그림 {n_thin}개는 안쪽으로 자를 수 없어 칼선을 만들지 않았습니다."
             elif job == "BORDERLESS":
                 off = max(0.5, float(self.style_margin_mm.get()))
                 mask = wl.build_white_mask(mask, dpi)
@@ -406,6 +446,16 @@ class WhiteLayerMixin:
                            "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                     separate = wl.cut_from_white_mask(mask, dpi, offset_mm=off, merge_gap_mm=0.0)
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
+            if bands:
+                cuts = wl.keep_away_from_bands(cuts, bands, dpi)
+                if separate is not None:
+                    separate = wl.keep_away_from_bands(separate, bands, dpi)
+                msg += f" 가격표·제목 띠 {len(bands)}개는 칼선을 만들지 않았습니다."
+            if exclude_boxes:
+                # ③의 칼선이 도무송 칸에 2mm보다 가까이 들어가지 않게(유테는 바깥으로 넓어지므로)
+                cuts = wl.keep_away_from_bands(cuts, list(exclude_boxes), dpi)
+                if separate is not None:
+                    separate = wl.keep_away_from_bands(separate, list(exclude_boxes), dpi)
             if cuts.is_empty:
                 return False
             if separate is not None and len(separate.geoms) > len(cuts.geoms):
@@ -423,6 +473,8 @@ class WhiteLayerMixin:
                 # 그림의 유테 간격이 0이 됐다(2026-10-12 멍푸 PC에서 확인: 스티커판 다음 투명판 유테가 0.1mm).
                 done_msg = "자동 인식 완료: " + msg.format(n=len(chosen.geoms)) + note
                 self._accumulated.append(item)
+                if on_done is not None:
+                    on_done(len(chosen.geoms))
                 combined = combine_results(self._accumulated)
                 png = os.path.join(_work_file_dir(), "_last_preview.png")
                 render_preview(combined, png, original_image_path=path, async_save=True)
