@@ -114,6 +114,29 @@ try {
 """
 
 
+# 2026-10-25(멍푸: "칼선만 따로 저장하는 옵션"): 빈 새 문서(원본과 같은 크기)에 '칼선'(+'화이트레이어')만 넣어 AI로 저장
+_JSX_NEW_CUT_AI = _JSX_COMMON + r"""
+try {
+    app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+    var D = %(data)s;
+    var doc = app.documents.add(DocumentColorSpace.CMYK, D.w_pt, D.h_pt);
+    var ab = doc.artboards[0].artboardRect;
+    var first = doc.layers[0];
+    var nw = 0;
+    if (D.white.length) {
+        var W = layerNamed(doc, D.white_layer); nw = drawWhite(W, ab, D.white);
+    }
+    var C = layerNamed(doc, D.cut_layer); C.zOrder(ZOrderMethod.BRINGTOFRONT);
+    var nc = drawCut(C, ab, D.cut);
+    if (first.name != D.cut_layer && first.name != D.white_layer && first.pageItems.length == 0) first.remove();
+    if (D.white.length) { layerNamed(doc, D.white_layer).zOrder(ZOrderMethod.SENDTOBACK); }
+    var o = new IllustratorSaveOptions(); o.pdfCompatible = true;
+    doc.saveAs(new File(%(out)s), o); doc.close(SaveOptions.DONOTSAVECHANGES);
+    done("OK " + nc + " " + nw);
+} catch (e) { done("ERR " + e + " (line " + e.line + ")"); }
+"""
+
+
 def _js_str(s: str) -> str:
     return json.dumps(s.replace("\\", "/"), ensure_ascii=True)
 
@@ -175,4 +198,13 @@ def make_layered_pdf(image_path: str, out_pdf: str, w_pt: float, h_pt: float, cu
             "cut_layer": CUT_LAYER, "white_layer": WHITE_LAYER, "art_layer": ART_LAYER}
     jsx = (_JSX_NEW_PDF.replace("%(data)s", json.dumps(data)).replace("%(image)s", _js_str(image_path))
            .replace("%(out)s", _js_str(out_pdf)))
+    return run_jsx(jsx, timeout)
+
+
+def make_cut_only_ai(out_ai: str, w_pt: float, h_pt: float, cut_polys_pt: list,
+                     white_polys_pt: Optional[list] = None, timeout: float = 600.0) -> str:
+    """원본과 같은 크기의 새 AI에 칼선(+화이트)만. 결과 문자열("OK ..."/"ERR ..."/"NOAPP ...")."""
+    data = {"cut": cut_polys_pt, "white": white_polys_pt or [], "w_pt": w_pt, "h_pt": h_pt,
+            "cut_layer": CUT_LAYER, "white_layer": WHITE_LAYER}
+    jsx = _JSX_NEW_CUT_AI.replace("%(data)s", json.dumps(data)).replace("%(out)s", _js_str(out_ai))
     return run_jsx(jsx, timeout)

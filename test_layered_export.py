@@ -114,3 +114,114 @@ def test_gui_export_layered_copy_without_illustrator():
         assert {"칼선", "화이트레이어"} <= {c["text"] for c in fitz.open(lines[0]).layer_ui_configs()}
     finally:
         app.destroy()
+
+
+def test_cut_only_export_pdf_png_and_ai_fallback():
+    """2026-10-25 '칼선만 저장': 원본과 같은 크기의 PDF에 칼선(+화이트) 레이어만. AI는 일러스트레이터가 없으면
+    PDF로 대신 저장한다(이 검사 환경엔 일러스트레이터가 없음)."""
+    import fitz
+    from shapely.geometry import MultiPolygon, Point
+
+    from core import layered_export as lx
+    from core.cutline_core import CutlineResult, OffsetSpec
+
+    d = tempfile.mkdtemp()
+    img = os.path.join(d, "원본.png")
+    Image.fromarray(np.full((600, 900, 3), 255, np.uint8)).save(img, dpi=(300, 300))
+    cut = MultiPolygon([Point(200, 300).buffer(100), Point(650, 300).buffer(120)])
+    res = CutlineResult(dpi=300.0, width_px=900, height_px=600, design=cut, offsets={"cut": cut},
+                        offset_mm=OffsetSpec(1.2, 1.2, 1.2))
+    white = Point(200, 300).buffer(80)
+    w_pt, h_pt, cut_pts, white_pts = lx.cut_only_layout(res, None, None, img, 300.0, white_geom=white)
+    assert abs(w_pt - 900 * 72 / 300) < 0.01 and abs(h_pt - 600 * 72 / 300) < 0.01
+    out = os.path.join(d, "칼선만.pdf")
+    st = lx.export_cut_only_pdf(out, w_pt, h_pt, cut_pts, white_pts)
+    assert st["cut_rings"] == 2 and st["white_rings"] == 1
+    with fitz.open(out) as doc:
+        names = sorted(v["name"] for v in doc.get_ocgs().values())
+        assert names == ["칼선", "화이트레이어"]
+        assert doc[0].get_images() == []                               # 원본 그림은 없음
+        assert abs(doc[0].rect.width - w_pt) < 0.01
+        drawings = doc[0].get_drawings()
+        assert any(dr.get("color") for dr in drawings)                 # 칼선(선)
+    r = lx.save_cut_only_ai(os.path.join(d, "칼선만.ai"), w_pt, h_pt, cut_pts, white_pts)
+    assert r.startswith("NOAPP")                                       # 윈도우가 아니면 일러스트레이터 없음
+
+
+def test_cut_only_from_ai_keeps_artboard_size_and_position():
+    """AI 원본: 칼선만 PDF가 원본 대지와 같은 크기, 칼선이 원본 그림이 놓인 자리 그대로."""
+    from core import layered_export as lx
+
+    d = tempfile.mkdtemp()
+    p = _png(d)
+    src = fitz.open()
+    pg = src.new_page(width=500, height=400)
+    pg.insert_image(fitz.Rect(36, 72, 36 + 400 * 0.24, 72 + 300 * 0.24), filename=p)
+    ai = os.path.join(d, "fake.ai")
+    src.save(ai)
+    w_pt, h_pt, cut_pts, white_pts = lx.cut_only_layout(SimpleNamespace(offsets={"cut": SQ}, dpi=300.0),
+                                                       ai, {"pt_per_px": 0.24, "x0_pt": 36, "y0_pt": 72},
+                                                       None, None, white_geom=WH)
+    assert (round(w_pt), round(h_pt)) == (500, 400)
+    out = os.path.join(d, "칼선만.pdf")
+    lx.export_cut_only_pdf(out, w_pt, h_pt, cut_pts, white_pts)
+    doc = fitz.open(out)
+    _only(doc, "칼선")
+    x0, x1, y0, y1 = _dark_bbox(doc[0], 288)
+    assert abs(x0 / 4 - (36 + 50 * .24)) <= 0.6 and abs(x1 / 4 - (36 + 250 * .24)) <= 0.6
+    assert abs(y0 / 4 - (72 + 50 * .24)) <= 0.6 and abs(y1 / 4 - (72 + 250 * .24)) <= 0.6
+
+
+def test_gui_cut_only_button_and_save():
+    """'칼선만 저장' 버튼은 '완성 파일 내보내기'와 함께 켜지고, 누르면 고른 형식으로 칼선만 저장한다."""
+    from unittest import mock
+
+    from gui.app import CutLineApp
+
+    d = tempfile.mkdtemp()
+    p = _png(d)
+    app = CutLineApp()
+    app.withdraw()
+    if not hasattr(app, "preview_canvas"):
+        app._build_layout()
+    try:
+        notes = []
+        app._show_note_dialog = lambda *a, **k: notes.append(a)
+        app._show_confirm_dialog = lambda *a, **k: True
+        assert app.export_cut_btn.cget("state") == "disabled"
+        app.input_path.set(p)
+        app.job_type.set("LINE_ART")
+        assert app._shape_cut_auto(p)
+        for _ in range(10):
+            app.update()
+        app.export_btn.configure(state="normal")
+        assert app.export_cut_btn.cget("state") == "normal"
+        for ext in (".pdf", ".svg", ".png"):
+            out = os.path.join(d, "결과_칼선만" + ext)
+            with mock.patch("gui.app.filedialog.asksaveasfilename", return_value=out):
+                app._on_export_cut_only()
+            for _ in range(60):
+                app.update()
+                if os.path.isfile(out):
+                    break
+                import time as _t
+                _t.sleep(0.05)
+            for _ in range(10):
+                app.update()
+            assert os.path.isfile(out), ext
+        doc = fitz.open(os.path.join(d, "결과_칼선만.pdf"))
+        assert [c["text"] for c in doc.layer_ui_configs()] == ["칼선"] and doc[0].get_images() == []
+        # AI: 이 환경엔 일러스트레이터가 없어 같은 이름 PDF로 대신
+        out_ai = os.path.join(d, "결과2_칼선만.ai")
+        with mock.patch("gui.app.filedialog.asksaveasfilename", return_value=out_ai):
+            app._on_export_cut_only()
+        pdf = os.path.join(d, "결과2_칼선만.pdf")
+        for _ in range(100):
+            app.update()
+            if os.path.isfile(pdf):
+                break
+            import time as _t
+            _t.sleep(0.05)
+        assert os.path.isfile(pdf) and not os.path.exists(out_ai)
+    finally:
+        app.destroy()

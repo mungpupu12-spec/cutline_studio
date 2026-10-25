@@ -2360,6 +2360,20 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         self.export_btn = self._btn_primary(sec7, "완성 파일 내보내기", self._on_export)
         self.export_btn.configure(state="disabled")
         self.export_btn.pack(fill="x")
+        # 2026-10-25(멍푸: "추가 기능으로 칼선만 따로 저장하는 옵셥 만들어줘"): 원본 없이 칼선(+화이트)만,
+        # 원본과 같은 크기로 AI·PDF·SVG·PNG. '완성 파일 내보내기'와 함께 켜지고 꺼진다.
+        self.export_cut_btn = self._btn_secondary(sec7, "칼선만 저장", self._on_export_cut_only)
+        self.export_cut_btn.configure(state="disabled")
+        self.export_cut_btn.pack(fill="x", pady=(6, 0))
+        _export_cfg = self.export_btn.configure
+
+        def _export_cfg_both(*a, **k):
+            r = _export_cfg(*a, **k)
+            if "state" in k:
+                self.export_cut_btn.configure(state=k["state"])
+            return r
+
+        self.export_btn.configure = _export_cfg_both
 
         # ---- 8. 화이트 레이어(2026-10-05) -----------------------------------------------
         self._wl_build_section(left_col)
@@ -6377,6 +6391,111 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                                    self._show_note_dialog("칼선을 저장했습니다", lines, kind="info")))
         except Exception as e:  # noqa: BLE001
             self._report_exception_to_server("칼선 사본 저장 중")
+            msg = str(e)
+            self.after(0, lambda: (self.status.set("저장하지 못했습니다."),
+                                   self._show_note_dialog("저장 중 오류가 발생했습니다", [msg], kind="error")))
+        finally:
+            self.after(0, lambda: self.export_btn.configure(state="normal"))
+
+    def _export_check_spacing(self):
+        """저장 전 칼선 점검(교차·이중 칼선·2mm 미만). 그래도 저장하면 True."""
+        try:
+            report = check_cut_spacing(self._last_result.offsets.get("cut"), self._last_result.dpi)
+            issues = summarize_cut_spacing(report)
+        except Exception:  # noqa: BLE001 -- 점검 실패가 저장을 막지 않게
+            issues = []
+        return not issues or self._show_confirm_dialog(
+            "칼선 점검: 인쇄 전에 확인이 필요한 곳이 있습니다",
+            issues + ["그래도 이대로 저장할까요? (아니오를 누르면 돌아가서 고칠 수 있습니다)"],
+        )
+
+    def _on_export_cut_only(self):
+        """'칼선만 저장': 원본 그림 없이 칼선(+화이트) 레이어만, 원본과 같은 크기. AI(기본)·PDF·SVG·PNG."""
+        if self._pe_active:
+            self._pe_commit_working(push_undo=True)
+        if self._last_result is None:
+            return
+        if not self._export_check_spacing():
+            return
+        base = self._export_basename or os.path.splitext(os.path.basename(self.input_path.get()))[0]
+        out_path = filedialog.asksaveasfilename(
+            title="칼선만 저장",
+            defaultextension=".ai",
+            initialfile=base + "_칼선만.ai",
+            filetypes=[("AI - 칼선만(일러스트레이터)", "*.ai"), ("PDF - 칼선만", "*.pdf"),
+                       ("SVG - 칼선만", "*.svg"), ("PNG - 칼선만, 투명 배경", "*.png")],
+        )
+        if not out_path:
+            return
+        low = out_path.lower()
+        if not low.endswith((".ai", ".pdf", ".svg", ".png")):
+            out_path += ".ai"
+            low = out_path.lower()
+        src = (getattr(self, "_ai_source_path", None) or "").strip()
+        if src and os.path.abspath(out_path) == os.path.abspath(src):
+            self._show_note_dialog("원본에는 덮어쓰지 않습니다", ["다른 이름으로 저장하세요."], kind="error")
+            return
+        placement = getattr(self, "_ai_placement", None)
+        if placement and placement.get("pt_per_px"):
+            img_dpi = 72.0 / float(placement["pt_per_px"])
+        else:
+            img_dpi = getattr(self, "_source_raster_dpi", None) or _image_dpi_of(
+                self.input_path.get().strip(), self.dpi.get())
+        white = self._wl_active_geom()
+        if low.endswith((".svg", ".png")):
+            try:
+                if low.endswith(".svg"):
+                    export_svg(self._last_result, out_path, dpi=getattr(self, "_source_raster_dpi", None),
+                               placement=placement, white_geom=white)
+                    lines = [out_path, "원본과 같은 크기의 칼선만 있는 SVG입니다."]
+                    if white is not None:
+                        lines.append("화이트는 같은 파일 안 '화이트레이어'에 흰색으로 넣었습니다.")
+                else:
+                    export_cut_png(self._last_result, out_path, dpi=img_dpi)
+                    lines = [out_path, "원본 이미지와 같은 크기의 투명 배경 PNG에 칼선만 넣었습니다."]
+                    white_png = self._wl_export_png(out_path, img_dpi)
+                    if white_png:
+                        lines += [white_png, "화이트 레이어 PNG입니다(흰색이라 흰 바탕에선 안 보여요)."]
+                self.status.set(f"저장됨: {out_path}")
+                self._show_note_dialog("칼선만 저장했습니다", lines, kind="info")
+            except Exception as e:  # noqa: BLE001
+                self._report_exception_to_server("칼선만 저장 중")
+                self._show_note_dialog("저장 중 오류가 발생했습니다", [str(e)], kind="error")
+            return
+        args = (out_path, getattr(self, "_ai_source_path", None), placement, self.input_path.get().strip(),
+                img_dpi, white)
+        self.export_btn.configure(state="disabled")
+        self.status.set("칼선만 저장하는 중... 일러스트레이터가 처음 켜질 때는 시간이 조금 걸립니다."
+                        if low.endswith(".ai") else "칼선만 저장하는 중...")
+        threading.Thread(target=self._run_export_cut_only, args=args, daemon=True).start()
+
+    def _run_export_cut_only(self, out_path, ai_src, placement, img, img_dpi, white):
+        from core import layered_export as lx
+
+        try:
+            w_pt, h_pt, cut_pts, white_pts = lx.cut_only_layout(self._last_result, ai_src, placement, img,
+                                                                img_dpi, white_geom=white)
+            size = f"{w_pt / 72 * 25.4:.1f} x {h_pt / 72 * 25.4:.1f}mm"
+            if out_path.lower().endswith(".ai"):
+                r = lx.save_cut_only_ai(out_path, w_pt, h_pt, cut_pts, white_pts)
+                if r.startswith("OK"):
+                    lines = [out_path, f"원본과 같은 크기({size})의 새 AI에 '칼선' 레이어(마젠타 0.5pt)만 넣었습니다."]
+                else:
+                    pdf = os.path.splitext(out_path)[0] + ".pdf"
+                    lx.export_cut_only_pdf(pdf, w_pt, h_pt, cut_pts, white_pts)
+                    why = ("일러스트레이터를 찾지 못해" if r.startswith("NOAPP")
+                           else f"일러스트레이터에서 오류가 나서({r[4:80]})")
+                    lines = [pdf, f"{why} AI 대신 PDF로 저장했습니다(원본과 같은 크기 {size}, '칼선' 레이어)."]
+            else:
+                lx.export_cut_only_pdf(out_path, w_pt, h_pt, cut_pts, white_pts)
+                lines = [out_path, f"원본과 같은 크기({size})의 PDF에 '칼선' 레이어(마젠타 0.5pt)만 넣었습니다."]
+            if white_pts:
+                lines.append("화이트는 '화이트레이어' 레이어(맨 아래)에 따로 넣었습니다.")
+            lines.append("원본과 왼쪽 위 모서리를 맞춰 겹치면 칼선 위치가 그대로 맞습니다.")
+            self.after(0, lambda: (self.status.set(f"저장됨: {lines[0]}"),
+                                   self._show_note_dialog("칼선만 저장했습니다", lines, kind="info")))
+        except Exception as e:  # noqa: BLE001
+            self._report_exception_to_server("칼선만 저장 중")
             msg = str(e)
             self.after(0, lambda: (self.status.set("저장하지 못했습니다."),
                                    self._show_note_dialog("저장 중 오류가 발생했습니다", [msg], kind="error")))

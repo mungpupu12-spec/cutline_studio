@@ -202,3 +202,77 @@ def save_layered_pdf_via_illustrator(image_path: str, out_path: str, result, dpi
     cut = image_polys_pt(cut_geom_of(result), dpi)
     white = image_polys_pt(white_geom, dpi) if white_geom is not None and not white_geom.is_empty else []
     return make_layered_pdf(image_path, out_path, w_px * k, h_px * k, cut, white)
+
+
+# ---- 칼선만 따로 저장(2026-10-25, 멍푸: "추가 기능으로 칼선만 따로 저장하는 옵셥 만들어줘" -- AI·PDF·SVG·PNG,
+# 화이트를 만들었으면 '화이트레이어'도 따로) ---------------------------------------------------------------------
+
+def cut_only_layout(result, ai_src: Optional[str], placement: Optional[dict], img: Optional[str],
+                    img_dpi: Optional[float], white_geom=None) -> tuple:
+    """칼선만 저장할 문서 크기와 칼선·화이트 좌표(pt, 왼쪽 위 원점). 원본과 같은 크기 -- AI면 원본 대지(첫 페이지),
+    PNG/JPG면 이미지 실제 크기(img_dpi 기준). Returns (w_pt, h_pt, cut_polys_pt, white_polys_pt)."""
+    cut = cut_geom_of(result)
+    has_white = white_geom is not None and not white_geom.is_empty
+    if ai_src and placement:
+        import fitz
+
+        with fitz.open(ai_src) as doc:
+            r = doc[0].rect
+        w_pt, h_pt = float(r.width), float(r.height)
+        cut_pts = ai_polys_pt(cut, placement)
+        white_pts = ai_polys_pt(white_geom, placement) if has_white else []
+    else:
+        dpi = float(img_dpi or result.dpi or 300.0)
+        if img and os.path.isfile(img):
+            from PIL import Image
+
+            with Image.open(img) as im:
+                w_px, h_px = im.size
+        else:
+            w_px, h_px = result.width_px, result.height_px
+        k = 72.0 / dpi
+        w_pt, h_pt = w_px * k, h_px * k
+        cut_pts = image_polys_pt(cut, dpi)
+        white_pts = image_polys_pt(white_geom, dpi) if has_white else []
+    return w_pt, h_pt, cut_pts, white_pts
+
+
+def export_cut_only_pdf(out_path: str, w_pt: float, h_pt: float, cut_polys_pt: list,
+                        white_polys_pt: Optional[list] = None) -> dict:
+    """원본과 같은 크기의 빈 PDF 한 장에 '칼선'(마젠타 0.5pt) 레이어(+맨 아래 '화이트레이어')만."""
+    import fitz
+
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=w_pt, height=h_pt)
+        stats = {"cut_rings": 0, "white_rings": 0}
+
+        def _draw_pts(polys, ocg, **kw):
+            shape = page.new_shape()
+            n = 0
+            for rings in polys:
+                for ring in rings:
+                    if len(ring) >= 3:
+                        shape.draw_polyline([tuple(p) for p in ring] + [tuple(ring[0])])
+                        n += 1
+            if n:
+                shape.finish(closePath=True, even_odd=True, oc=ocg, **kw)
+                shape.commit()
+            return n
+
+        if white_polys_pt:
+            stats["white_rings"] = _draw_pts(white_polys_pt, doc.add_ocg(WHITE_LAYER, on=True),
+                                             fill=WHITE_CMYK, color=None, width=0)
+        stats["cut_rings"] = _draw_pts(cut_polys_pt, doc.add_ocg(CUT_LAYER, on=True),
+                                       color=CUT_CMYK, fill=None, width=CUT_WIDTH_PT)
+        doc.save(out_path, garbage=3, deflate=True)
+    finally:
+        doc.close()
+    return stats
+
+
+def save_cut_only_ai(out_path: str, w_pt: float, h_pt: float, cut_polys_pt: list,
+                     white_polys_pt: Optional[list] = None) -> str:
+    from core.illustrator_bridge import make_cut_only_ai
+
+    return make_cut_only_ai(out_path, w_pt, h_pt, cut_polys_pt, white_polys_pt)
