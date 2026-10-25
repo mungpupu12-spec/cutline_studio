@@ -388,6 +388,7 @@ def _split_touching_blobs(mask_u8: np.ndarray, min_area: int, peak_ratio: float 
     # 2026-09-30 속도: 블롭마다 시트 전체 크기 배열(수천x수천)을 새로 만들던 것을 블롭의
     # 바운딩 박스 안에서만 계산하도록 바꿈(결과 동일 -- peak_local_max도 라벨 영역의 바운딩
     # 박스 안에서만 봄). 키스컷 롤 한 장에서 이 함수만 약 16초 걸리던 원인.
+    seeded_blobs = []   # 씨앗이 있는 블롭 (번호, 영역) -- 워터쉐드를 블롭마다 따로(속도, 아래 참고)
     for i in range(1, n_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_area:
@@ -427,6 +428,8 @@ def _split_touching_blobs(mask_u8: np.ndarray, min_area: int, peak_ratio: float 
             for seed_i in range(1, n_seed):
                 seed_masks.append(seed_labels == seed_i)
 
+        if seed_points or seed_masks:
+            seeded_blobs.append((i, sl))
         for (py, px) in seed_points:
             markers[py, px] = next_marker
             marker_origin[next_marker] = i
@@ -495,8 +498,26 @@ def _split_touching_blobs(mask_u8: np.ndarray, min_area: int, peak_ratio: float 
     # 에서는 예전에 이미 실측으로 검증해둔 cv2.watershed + elevation
     # 트릭 경로를 그대로 쓴다(회귀 위험 없는 안전한 폴백).
     if _PEAK_LOCAL_MAX_AVAILABLE:
-        result = _ski_watershed(-dist, markers=markers, mask=mask_u8.astype(bool))
-        return result.astype(np.int32), marker_origin
+        # 2026-10-25 속도(멍푸: "도안 인식하는데 시간이 너무 많이 걸려"): 시트 전체를 한 번에 워터쉐드하던 것을
+        # 씨앗 있는 블롭마다 그 블롭 영역만 잘라서 한다. 블롭끼리는 서로 이어져 있지 않아(마스크로 막힘) 물이
+        # 넘어가지 않으므로 결과는 같다(실제 파일로 같은 결과 확인). 씨앗 없는 블롭은 예전처럼 0으로 남는다.
+        result = np.zeros(mask_u8.shape, dtype=np.int32)
+        neg = -dist
+        for i, sl in seeded_blobs:
+            blob = labels[sl] == i
+            mk = np.where(blob, markers[sl], 0)
+            ids = np.unique(mk[mk > 0])
+            if len(ids) == 1:
+                # 씨앗이 하나뿐이면 워터쉐드는 씨앗에서 상하좌우로 이어진 블롭 픽셀 전부에 그 번호를 붙일 뿐이다 --
+                # 같은 결과를 연결 요소(4방향)로 바로 구한다(훨씬 빠름).
+                n4, lab4 = cv2.connectedComponents(blob.astype(np.uint8), connectivity=4)
+                hit = np.unique(lab4[mk > 0])
+                reach = np.isin(lab4, hit[hit > 0])
+                result[sl][reach] = int(ids[0])
+                continue
+            res = _ski_watershed(neg[sl], markers=mk, mask=blob)
+            result[sl][blob] = res[blob]
+        return result, marker_origin
 
     interior_cap = 200
     norm_dist = cv2.normalize(dist, None, 0, interior_cap, cv2.NORM_MINMAX)
@@ -886,13 +907,31 @@ def _detect_boxes_from_gray(
     # 전체가 아니라 각자의(이미 분리된) 마스크만 써야 한다 -- 자세한 이유는
     # 아래 그 조각을 실제로 만드는 자리의 주석 참고.
     tight_box_masks: list = []
+    # 2026-10-25 속도(멍푸: "도안 인식하는데 시간이 너무 많이 걸려" -- 칸 격자 없는 큰 시트에서 ① 70~95초):
+    # 라벨마다 시트 전체 크기 배열(markers == lbl, np.where, 오프닝)을 새로 만들던 것을, 라벨이 차지하는 영역
+    # 둘레(오프닝 커널 반지름 + 여유)만 잘라서 계산한다. 잘린 영역 밖에는 그 라벨 픽셀이 없고 여유가 커널보다
+    # 커서 오프닝·라벨 번호·좌표 결과는 전체 시트로 계산한 것과 같다(실제 파일로 같은 결과 확인).
+    from scipy import ndimage as _ndi
+
+    _mk = np.where(markers > 0, markers, 0).astype(np.int32)
+    _label_slices = _ndi.find_objects(_mk)
+    _crop_pad = open_px + 2
+    tight_box_crops: list = []   # 각 tight box의 (y0, x0, 잘린 접촉 마스크) -- 아래 병합 판단에서 씀
     for lbl in sorted(set(np.unique(markers)) - {0, 1, -1}):
-        comp_mask_full = markers == lbl
+        _sl = _label_slices[lbl - 1] if 0 < lbl <= len(_label_slices) else None
+        if _sl is None:
+            continue
+        cy0, cx0 = max(0, _sl[0].start - _crop_pad), max(0, _sl[1].start - _crop_pad)
+        cy1, cx1 = min(h, _sl[0].stop + _crop_pad), min(w, _sl[1].stop + _crop_pad)
+        comp_mask_full = markers[cy0:cy1, cx0:cx1] == lbl          # (이름은 예전 그대로, 실제로는 잘린 영역)
+        gray_crop = gray[cy0:cy1, cx0:cx1]
         ys, xs = np.where(comp_mask_full)
         area = xs.size
         if area < min_area:
             continue
-        component_mean = float(gray[comp_mask_full].mean())
+        ys = ys + cy0
+        xs = xs + cx0
+        component_mean = float(gray_crop[comp_mask_full].mean())
         color_matches_bg = abs(component_mean - bg_mean) <= max_bg_color_diff
         # 2026-09-14(90도 회전 진단 중 실제 파일로 새로 확인): bg_mean은 칸
         # 전체 배경 픽셀의 "전역 평균 하나"라서, 배경이 여러 색 띠/그러데이션
@@ -908,7 +947,7 @@ def _detect_boxes_from_gray(
         # 눈/옷 등 내부 디테일이 있어 표준편차가 훨씬 높다(이번 캐릭터
         # 실측 38.65) -- 색만 같고 내부까지 밋밋할 때만 제외한다.
         if color_matches_bg:
-            is_flat_interior = float(gray[comp_mask_full].std()) <= 24.0
+            is_flat_interior = float(gray_crop[comp_mask_full].std()) <= 24.0
             if is_flat_interior:
                 continue  # 배경과 색이 같고 내부에 디테일도 없음 -- 빈 테두리 등으로 보고 제외
         x0 = int(xs.min())
@@ -956,7 +995,7 @@ def _detect_boxes_from_gray(
                 obbox_area = ow * oh
                 if obbox_area <= 0 or oarea < min_area or (oarea / obbox_area) < min_fill_ratio:
                     continue
-                ox0, oy0 = int(st[cv2.CC_STAT_LEFT]), int(st[cv2.CC_STAT_TOP])
+                ox0, oy0 = int(st[cv2.CC_STAT_LEFT]), int(st[cv2.CC_STAT_TOP])   # 잘린 영역 좌표
                 ox1, oy1 = ox0 + ow, oy0 + oh
                 # 가는 잡음만 지운 것이지 실제 캐릭터 몸통은 아니므로, 최종
                 # bbox는 (오프닝으로 깎여나가지 않은) 원본 마스크 기준으로 이
@@ -971,6 +1010,8 @@ def _detect_boxes_from_gray(
                 cys, cxs = np.where(core_mask)
                 if cxs.size == 0:
                     continue
+                cys = cys + cy0
+                cxs = cxs + cx0
                 # 접촉 판정(아래 min_contact_ratio 루프)에는 core_mask를 쓰면
                 # 안 된다 -- core_mask는 "bbox로 자른 것일 뿐"이라 서로 다른
                 # 조각의 오프닝-후 bbox가 겹치면(실측: 세트5, 꽃 장식과 큰
@@ -996,17 +1037,20 @@ def _detect_boxes_from_gray(
                 tight_box_labels.append(int(lbl))
                 tight_box_areas.append(area)
                 tight_box_masks.append(None)
+                tight_box_crops.append((cy0, cx0, comp_mask_full))
             else:
-                for cx0, cy0, cx1, cy1, carea, touch_mask in candidates:
-                    tight_boxes.append((cx0, cy0, cx1, cy1))
+                for bx0, by0, bx1, by1, carea, touch_mask in candidates:
+                    tight_boxes.append((bx0, by0, bx1, by1))
                     tight_box_labels.append(int(lbl))
                     tight_box_areas.append(carea)
                     tight_box_masks.append(touch_mask)
+                    tight_box_crops.append((cy0, cx0, touch_mask))
             continue
         tight_boxes.append((x0, y0, x1, y1))
         tight_box_labels.append(int(lbl))
         tight_box_areas.append(area)
         tight_box_masks.append(None)
+        tight_box_crops.append((cy0, cx0, comp_mask_full))
 
     # 2026-09-13(2차, "칼선이 붙어 있고" 피드백): 원래 서로 다른(별개의)
     # 워터쉐드 이전 블롭에서 나온 조각은 애초에 절대 합치지 않는다(위
@@ -1064,17 +1108,35 @@ def _detect_boxes_from_gray(
     _touch_mask_cache: dict = {}
 
     def _touch_mask(idx):
-        cached = _touch_mask_cache.get(idx)
-        if cached is not None:
-            return cached
-        # tight_box_masks[idx]가 있으면(오프닝으로 한 원래 블롭에서 여러
-        # 진짜 요소를 갈라낸 경우) 그 조각 자신의 마스크를, 없으면(기존
-        # 동작 그대로) markers==lbl을 쓴다 -- 위 tight_boxes 작성부 주석
-        # 참고.
-        explicit = tight_box_masks[idx]
-        result = explicit if explicit is not None else (markers == tight_box_labels[idx])
-        _touch_mask_cache[idx] = result
-        return result
+        """(y0, x0, 잘린 마스크). tight_box_masks[idx]가 있으면(오프닝으로 한 원래 블롭에서 여러 진짜 요소를
+        갈라낸 경우) 그 조각 자신의 마스크, 없으면 markers==lbl -- 둘 다 라벨 둘레만 잘라 둔 것(2026-10-25 속도)."""
+        return tight_box_crops[idx]
+
+    def _overlap_count(a, b):
+        """잘린 두 마스크 (y0, x0, m)가 겹치는 픽셀 수(시트 전체로 계산한 것과 같음)."""
+        ay, ax, am = a
+        by, bx, bm = b
+        y0, x0 = max(ay, by), max(ax, bx)
+        y1, x1 = min(ay + am.shape[0], by + bm.shape[0]), min(ax + am.shape[1], bx + bm.shape[1])
+        if y1 <= y0 or x1 <= x0:
+            return 0
+        return int((am[y0 - ay:y1 - ay, x0 - ax:x1 - ax] & bm[y0 - by:y1 - by, x0 - bx:x1 - bx]).sum())
+
+    _dil_cache: dict = {}
+
+    def _dilated(idx, iters):
+        """잘린 마스크를 iters번 팽창(3x3). 팽창이 닿는 만큼 넓힌 영역에서 계산(시트 밖으로는 안 넓힘)."""
+        key = (idx, iters)
+        if key in _dil_cache:
+            return _dil_cache[key]
+        oy, ox, m = _touch_mask(idx)
+        y0, x0 = max(0, oy - iters), max(0, ox - iters)
+        y1, x1 = min(h, oy + m.shape[0] + iters), min(w, ox + m.shape[1] + iters)
+        buf = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        buf[oy - y0:oy - y0 + m.shape[0], ox - x0:ox - x0 + m.shape[1]] = m
+        res = (y0, x0, cv2.dilate(buf, dilate_kernel, iterations=iters) > 0)
+        _dil_cache[key] = res
+        return res
 
     # 2026-09-15(7차, 실측으로 발견 -- "고양이+초록 장식이 계속 하나로
     # 흡수됨"): 위 min_contact_ratio 하나만으로는 "크기가 많이 다른 두
@@ -1121,9 +1183,9 @@ def _detect_boxes_from_gray(
             return None
         if idx in _pre_sever_origin_cache:
             return _pre_sever_origin_cache[idx]
-        mask = _touch_mask(idx)
+        oy, ox, mask = _touch_mask(idx)
         ys, xs = np.where(mask)
-        result = None if ys.size == 0 else int(pre_sever_labels[ys[0], xs[0]])
+        result = None if ys.size == 0 else int(pre_sever_labels[oy + ys[0], ox + xs[0]])
         _pre_sever_origin_cache[idx] = result
         return result
 
@@ -1138,7 +1200,7 @@ def _detect_boxes_from_gray(
 
     def _fill_ratio_by_idx(idx):
         if idx not in _fill_ratio_cache:
-            _fill_ratio_cache[idx] = _fill_ratio(_touch_mask(idx))
+            _fill_ratio_cache[idx] = _fill_ratio(_touch_mask(idx)[2])
         return _fill_ratio_cache[idx]
 
     max_aspect_ratio_for_bridge = 3.0
@@ -1155,19 +1217,15 @@ def _detect_boxes_from_gray(
 
     def _aspect_ratio_by_idx(idx):
         if idx not in _aspect_ratio_cache:
-            _aspect_ratio_cache[idx] = _aspect_ratio(_touch_mask(idx))
+            _aspect_ratio_cache[idx] = _aspect_ratio(_touch_mask(idx)[2])
         return _aspect_ratio_cache[idx]
 
     for idx_i in range(n_tight):
         lbl_i = tight_box_labels[idx_i]
         origin_i = marker_origin.get(lbl_i, lbl_i)
-        touch_i = _touch_mask(idx_i)
-        dil_i = cv2.dilate(touch_i.astype(np.uint8), dilate_kernel, iterations=1)
         bridge_origin_i = _pre_sever_origin(idx_i) if sever_changed else None
-        bridge_dil_i = None
         fill_i = None
         if bridge_origin_i is not None:
-            bridge_dil_i = cv2.dilate(touch_i.astype(np.uint8), dilate_kernel, iterations=bridge_dilate_iters)
             fill_i = _fill_ratio_by_idx(idx_i)
         for idx_j in range(idx_i + 1, n_tight):
             lbl_j = tight_box_labels[idx_j]
@@ -1179,7 +1237,7 @@ def _detect_boxes_from_gray(
             if marker_origin.get(lbl_j, lbl_j) == origin_i:
                 if not size_ok:
                     continue  # 크기가 너무 많이 다름 -- 진짜 허리 분리가 아니라 "작은 개체가 옆에 닿은 것"
-                contact_len = int((dil_i.astype(bool) & _touch_mask(idx_j)).sum())
+                contact_len = _overlap_count(_dilated(idx_i, 1), _touch_mask(idx_j))
                 min_dim = min(area_i, area_j) ** 0.5
                 if min_dim > 0 and (contact_len / min_dim) >= min_contact_ratio:
                     _union(idx_i, idx_j)
@@ -1191,7 +1249,6 @@ def _detect_boxes_from_gray(
                 continue
             if _pre_sever_origin(idx_j) != bridge_origin_i:
                 continue  # 절단 이전에도 이미 서로 다른 블롭이었음 -- 절단과 무관
-            touch_j = _touch_mask(idx_j)
             # 장식용 배경선처럼 길쭉하고 속이 빈 모양이 우연히 진짜 캐릭터와
             # 가까워서 걸리는 경우를 걸러낸다(실제 파일 실측으로 발견 --
             # 그런 모양은 자기 bbox 채움 비율이 1~25% 수준으로 뚜렷하게 낮음,
@@ -1213,8 +1270,7 @@ def _detect_boxes_from_gray(
             # 계산) 고정으로 팽창시켜 다시 닿는지 본다 -- 이 폭을 넘어서는
             # (즉 절단과 무관하게 원래 멀리 떨어져 있던) 서로 다른 캐릭터는
             # 아무리 늘려도 안 닿으므로 자연히 후보에서 빠진다.
-            bridge_dil_j = cv2.dilate(touch_j.astype(np.uint8), dilate_kernel, iterations=bridge_dilate_iters)
-            bridge_contact = int((bridge_dil_i.astype(bool) & bridge_dil_j.astype(bool)).sum())
+            bridge_contact = _overlap_count(_dilated(idx_i, bridge_dilate_iters), _dilated(idx_j, bridge_dilate_iters))
             min_dim = min(area_i, area_j) ** 0.5
             if min_dim > 0 and (bridge_contact / min_dim) >= min_contact_ratio:
                 _union(idx_i, idx_j)

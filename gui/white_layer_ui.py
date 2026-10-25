@@ -393,11 +393,30 @@ class WhiteLayerMixin:
             bands = []
             if job != "MASKING_TAPE":        # 마스킹테이프는 가로로 긴 그림 자체가 띠라서 빼지 않는다
                 mask, bands = wl.remove_label_bands(mask, dpi)
-            if not np.asarray(mask).any():
+            # 2026-10-25: 색 바탕 판 위에 흰 테두리 스티커가 여러 개 놓인 판(패널)은 판이 아니라 판 위 스티커마다
+            # 흰 테두리 바깥선으로 자른다(그림 모양 기준으로 그냥 자르면 판 하나에 칼선 하나가 생겼다).
+            panel_stk = None
+            if kind != "sticker" and job != "MASKING_TAPE" and np.asarray(mask).any():
+                from PIL import Image as _Im
+
+                with _Im.open(path) as _im0:
+                    _rgb0 = wl._rgb8(_im0)
+                if _rgb0.shape[:2] == np.asarray(mask).shape:
+                    panel_stk, _panels = wl.panel_sticker_mask(_rgb0, mask, dpi)
+                    if panel_stk is not None:
+                        mask = np.asarray(mask, bool) & ~_panels
+            if not np.asarray(mask).any() and panel_stk is None:
                 return False
             separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)
             n_close = 0
-            if kind == "sticker":
+            if not np.asarray(mask).any():
+                # 판 위 스티커뿐(다른 그림 없음)
+                from shapely.geometry import MultiPolygon as _MP
+
+                off = 0.0
+                cuts, separate = _MP(), _MP()
+                msg = "칼선 {n}개를 만들었습니다."
+            elif kind == "sticker":
                 off = 0.0
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0)
                 separate = wl.cut_from_white_mask(mask, dpi, offset_mm=0.0, merge_gap_mm=0.0)
@@ -446,6 +465,16 @@ class WhiteLayerMixin:
                            "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                     separate = wl.cut_from_white_mask(mask, dpi, offset_mm=off, merge_gap_mm=0.0)
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
+            if panel_stk is not None:
+                from shapely.geometry import MultiPolygon as _MP
+
+                _pc = wl.cut_from_white_mask(panel_stk, dpi, offset_mm=0.0)
+                _ps = wl.cut_from_white_mask(panel_stk, dpi, offset_mm=0.0, merge_gap_mm=0.0)
+                cuts = _MP(list(cuts.geoms) + list(_pc.geoms))
+                if separate is not None:
+                    separate = _MP(list(separate.geoms) + list(_ps.geoms))
+                mask = np.logical_or(np.asarray(mask) > 0, panel_stk)
+                msg += f" 색 바탕 판 위 흰 테두리 스티커 {len(_ps.geoms)}개는 흰 테두리 바깥선으로 잘랐습니다."
             if bands:
                 cuts = wl.keep_away_from_bands(cuts, bands, dpi)
                 if separate is not None:

@@ -236,14 +236,14 @@ def sticker_border_mask(rgb: np.ndarray, dpi: float, min_sticker_mm2: float = 15
     if float(edge.mean()) > 0.3:          # 흰 배경 시트 -- 흰 테두리를 배경과 구분할 수 없음
         return None
     r = max(1, int(round(_mm_to_px(0.3, dpi))))
+    raw_white = white
     white = cv2.morphologyEx(white, cv2.MORPH_OPEN, _disk(r))
     inv = (1 - white).astype(np.uint8)
     n, lab, _, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
-    outside = np.isin(lab, np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    _bl = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    outside = np.isin(lab, _bl[_bl > 0]) & (inv > 0)   # 0 = 흰색(가장자리에 흰색이 닿아도 흰색 전체를 바깥으로 보지 않게)
     filled = (~outside).astype(np.uint8)
     n2, lab2, st2, _ = cv2.connectedComponentsWithStats(filled, connectivity=8)
-    if n2 <= 1:
-        return None
     min_area = _mm_to_px(1.0, dpi) ** 2 * float(min_sticker_mm2)
     nonwhite = np.bincount(lab2[white == 0].ravel(), minlength=n2)
     keep = np.zeros(n2, bool)
@@ -251,9 +251,27 @@ def sticker_border_mask(rgb: np.ndarray, dpi: float, min_sticker_mm2: float = 15
         area = st2[i, cv2.CC_STAT_AREA]
         if area >= min_area and nonwhite[i] >= 0.15 * area:
             keep[i] = True
-    if not keep.any():
-        return None
     m = keep[lab2]
+    # 2026-10-25: 그림 속 가는 선(예: 막대 손잡이)이 흰 테두리 끝까지 닿으면, 가는 흰 선을 깎을 때 테두리 끝도
+    # 함께 깎여 안쪽이 바깥과 이어지고 스티커를 통째로 놓쳤다. 깎기 전 흰색으로 한 번 더 닫힌 곳을 찾아, 두꺼운
+    # 흰 테두리(깎은 뒤 흰색)가 10% 이상 있는 것만 더한다 -- 반짝이 빛줄기로 둘러싸인 배경은 두꺼운 흰색이 없어 빠진다.
+    _n3, lab3 = cv2.connectedComponents((1 - raw_white).astype(np.uint8), connectivity=4)
+    _bl3 = np.unique(np.concatenate([lab3[0], lab3[-1], lab3[:, 0], lab3[:, -1]]))
+    out3 = np.isin(lab3, _bl3[_bl3 > 0]) & (raw_white == 0)
+    n4, lab4, st4, _ = cv2.connectedComponentsWithStats(((~out3) & ~m).astype(np.uint8), connectivity=8)
+    if n4 > 1:
+        nonwhite4 = np.bincount(lab4[raw_white == 0].ravel(), minlength=n4)
+        thick4 = np.bincount(lab4[white > 0].ravel(), minlength=n4)
+        add = np.zeros(n4, bool)
+        for i in range(1, n4):
+            area = st4[i, cv2.CC_STAT_AREA]
+            if area >= min_area and nonwhite4[i] >= 0.15 * area and thick4[i] >= 0.10 * area:
+                add[i] = True
+        if add.any():
+            extra = cv2.morphologyEx(add[lab4].astype(np.uint8), cv2.MORPH_OPEN, _disk(r))
+            m = m | (extra > 0)
+    if not m.any():
+        return None
     if float(m.mean()) > 0.85:            # 거의 전체가 스티커 -- 배경을 못 찾은 것
         return None
     return m
@@ -484,6 +502,46 @@ def keep_away_from_bands(cuts, bands: list, dpi: float, gap_mm: float = DEFAULT_
             if r.geom_type == "Polygon" and not r.is_empty and r.area > 4:
                 out.append(Polygon(r.exterior))
     return MultiPolygon(out)
+
+
+def panel_sticker_mask(rgb: np.ndarray, mask: np.ndarray, dpi: float, min_frac: float = 0.01) -> tuple:
+    """그림 덩어리 중 '색 바탕 판 위에 흰 테두리 스티커 여러 개'가 놓인 판(패널)을 찾아, 판 안 스티커들의 모양
+    (흰 테두리 바깥선까지)을 돌려준다(2026-10-25 확인: 짙은 바탕 판 여러 장으로 된 시트를 그림 모양 기준으로
+    자르면 판 하나에 칼선 하나가 생겼다 -- 판이 아니라 판 위 스티커마다 잘라야 한다).
+    시트의 1% 이상인 덩어리를 잘라, 덩어리 밖은 그 가장자리 색으로 채운 뒤 흰 테두리 스티커(sticker_border_mask)가
+    2개 이상 보이면 판으로 본다. Returns (스티커 마스크, 판 마스크) -- 판이 없으면 (None, None)."""
+    m = np.asarray(mask, np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    h, w = m.shape
+    stickers = np.zeros((h, w), bool)
+    panels = np.zeros((h, w), bool)
+    found = False
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] < min_frac * h * w:
+            continue
+        x, y, bw, bh = st[i, :4]
+        comp = lab[y:y + bh, x:x + bw] == i
+        # 테두리 밖은 0으로 보고 깎아야 사각형 판(영역을 꽉 채움)도 가장자리 띠가 생긴다
+        ring = comp & ~cv2.erode(comp.astype(np.uint8), np.ones((5, 5), np.uint8),
+                                 borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+        if not ring.any():
+            continue
+        crop = np.array(rgb[y:y + bh, x:x + bw, :3])
+        if (~comp).any():
+            crop[~comp] = np.median(crop[ring], axis=0).astype(crop.dtype)
+        sm = sticker_border_mask(crop, dpi)
+        if sm is None or cv2.connectedComponents(sm.astype(np.uint8))[0] - 1 < 2:
+            continue
+        found = True
+        stickers[y:y + bh, x:x + bw] |= (sm.astype(bool) & comp)
+        panels[y:y + bh, x:x + bw] |= comp
+    if not found:
+        return None, None
+    return stickers, panels
+
+
+def has_sticker_panels(rgb: np.ndarray, mask: np.ndarray, dpi: float, min_frac: float = 0.01) -> bool:
+    return panel_sticker_mask(rgb, mask, dpi, min_frac)[0] is not None
 
 
 def has_outline_line(rgb: np.ndarray, comp: np.ndarray, dpi: float, min_depth: float = 35.0,

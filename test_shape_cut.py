@@ -312,3 +312,58 @@ def test_label_band_gets_no_cut_and_stickers_stay_apart():
     band = box(x0, y0, x1, y1)
     for c in cuts.geoms:
         assert c.distance(band) >= wl._mm_to_px(2.0, DPI) - 1           # 띠와 2mm 이상
+
+
+def _lollipop_sheet():
+    """짙은 바탕 위 흰 테두리 스티커 3개. 그중 하나는 그림 속 가는 막대(0.25mm)가 흰 테두리 끝 바로 앞까지 닿는다."""
+    h, w = 600, 900
+    img = np.full((h, w, 3), (30, 40, 80), np.uint8)
+    art = np.zeros((h, w), np.uint8)
+    cv2.circle(art, (180, 300), 90, 1, -1)
+    cv2.rectangle(art, (640, 220), (800, 380), 1, -1)
+    stick = np.zeros((h, w), np.uint8)
+    cv2.circle(stick, (400, 300), 70, 1, -1)
+    ring = cv2.dilate(art | stick, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)))
+    cv2.rectangle(ring, (400, 280), (560, 320), 1, -1)                # 손잡이 흰 테두리
+    img[ring > 0] = (255, 255, 255)
+    img[art > 0] = (200, 60, 60)
+    img[stick > 0] = (240, 200, 40)
+    img[298:301, 400:557] = (240, 200, 40)                            # 가는 막대: 테두리 끝 3px 앞까지
+    return img, ring.astype(bool)
+
+
+def test_sticker_border_mask_thin_line_reaching_border_end():
+    # 2026-10-25: 막대 손잡이처럼 가는 선이 흰 테두리 끝까지 닿은 스티커를 통째로 놓쳤다.
+    img, ring = _lollipop_sheet()
+    m = wl.sticker_border_mask(img, DPI)
+    assert m is not None
+    assert cv2.connectedComponents(m.astype(np.uint8))[0] - 1 == 3
+    assert m[300, 400] and m[300, 540]                               # 막대 스티커와 손잡이
+    assert (m & ~ring).sum() <= 0.01 * m.sum()
+
+
+def test_sticker_border_mask_white_touching_sheet_edge():
+    # 시트 가장자리에 흰색이 닿아 있어도 다른 스티커의 흰 테두리를 잃지 않는다.
+    img, ring = _lollipop_sheet()
+    img[:, :6] = (255, 255, 255)
+    m = wl.sticker_border_mask(img, DPI)
+    assert m is not None
+    assert (ring[:, 10:] & ~m[:, 10:]).sum() <= 0.03 * ring.sum()  # 테두리 바깥선까지 덮음
+
+
+def test_panel_sticker_mask_cuts_each_sticker_not_the_panel():
+    # 2026-10-25: 흰 바탕 시트 위 짙은 색 판(패널) 위에 흰 테두리 스티커들 -- 판이 아니라 스티커마다.
+    img, ring = _lollipop_sheet()
+    sheet = np.full((800, 1100, 3), 255, np.uint8)
+    sheet[100:700, 100:1000] = img
+    mask = np.zeros(sheet.shape[:2], bool)
+    mask[100:700, 100:1000] = True                                    # 그림 모양 기준이면 판 전체가 한 덩어리
+    stk, panels = wl.panel_sticker_mask(sheet, mask, DPI)
+    assert stk is not None and panels[400, 550]
+    assert cv2.connectedComponents(stk.astype(np.uint8))[0] - 1 == 3
+    assert not stk[110, 110]                                          # 판 바탕은 칼선 대상이 아님
+    plain = np.zeros_like(mask)
+    plain[200:400, 200:400] = True                                    # 판이 아닌 보통 그림
+    sheet2 = np.full((800, 1100, 3), 255, np.uint8)
+    sheet2[200:400, 200:400] = (200, 60, 60)
+    assert wl.panel_sticker_mask(sheet2, plain, DPI) == (None, None)

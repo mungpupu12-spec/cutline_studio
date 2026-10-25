@@ -4010,8 +4010,25 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         self._prefetched_rest = {}
         ready = threading.Event()  # 작업을 다 맡겼는지(③이 너무 빨리 눌려도 같은 계산을 두 번 하지 않게)
         self._prefetch_ready = ready
+        # 2026-10-25(멍푸: "도안 인식하는데 시간이 너무 많이 걸려"): 칸 격자가 없는 시트에서 ③이 그림 모양 기준으로
+        # 한 번에 자르는 경우(투명 배경·흰 테두리 스티커·배경을 뺄 수 있는 그림)에는 이 미리 계산을 쓰지 않는다 --
+        # 뒤에서 계속 돌며 ③과 CPU를 나눠 써서 멍푸 PC에서 ③이 오래 걸렸다. 화면 값은 여기(화면 스레드)에서 읽는다.
+        shape_args = None
+        if not self._real_grid_cells_px:
+            try:
+                shape_args = (float(self._wl_image_dpi()), self._ai_source_path, bool(self.use_grabcut.get()))
+            except Exception:  # noqa: BLE001
+                shape_args = None
+
         def _run():
             try:
+                if shape_args is not None:
+                    from core import white_layer as _wl
+
+                    kind, _m = _wl.shape_cut_source(path, shape_args[0], ai_path=shape_args[1],
+                                                    scene=shape_args[2], scene_single=True)
+                    if kind is not None:
+                        return              # ③은 그림 모양 기준으로 -- 미리 계산할 것 없음
                 remaining_flat = [cell_boxes_px[idx] for grp in cell_groups for idx in grp]
                 fine_boxes, fine_groups = detect_repeat_aware_sub_element_boxes_px(path, remaining_flat)
                 with Image.open(path) as _im:
