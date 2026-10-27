@@ -30,6 +30,7 @@ core.multi_design._merge_overlapping_boxes가 이런 겹치는 bbox들을 미리
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("CUTLINE_LICENSE_DEV_BYPASS", "1")
@@ -95,7 +96,7 @@ def _make_scene_sheet(path):
 
 
 def test_cell_with_multiple_elements_is_split():
-    tmp = "/tmp/_sub_element_scene.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_sub_element_scene.png")
     info = _make_scene_sheet(tmp)
 
     boxes_a = detect_sub_element_boxes_px(tmp, info["cell_a"])
@@ -135,7 +136,7 @@ def test_repeat_aware_split_replaces_old_gui_wiring():
     있음을 확인) 칸 A/B 시나리오에서 기대대로 동작하는지만 다시 확인한다."""
     from core.multi_design import detect_repeat_aware_sub_element_boxes_px
 
-    tmp = "/tmp/_sub_element_scene2.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_sub_element_scene2.png")
     info = _make_scene_sheet(tmp)
     cell_boxes = [info["cell_a"], info["cell_b"]]
 
@@ -214,7 +215,7 @@ def test_overlap_merge_fixes_double_cutline_split():
     하나를 겹치는 bbox 2개로 잘못 나누더라도, detect_sub_element_boxes_px가
     최종적으로는 _merge_overlapping_boxes를 거쳐 다시 1개의 bbox로 돌려줘야
     한다(그래야 실루엣 추적도 한 번만 돌아가고, 이중 칼선이 생기지 않음)."""
-    tmp = "/tmp/_falsely_split_character.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_falsely_split_character.png")
     region = _make_falsely_split_character(tmp)
     boxes = detect_sub_element_boxes_px(tmp, region)
     check(

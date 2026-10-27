@@ -3836,7 +3836,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         self.status.set(
             f"도무송으로 표시됨: {n_marked}/{n_total}개 -- 나머지 "
             f"{n_total - n_marked}개는 무테/유테로 자동 처리됩니다. 다 골랐으면 "
-            "'② 표시한 대로 칼선 생성'을 누르세요."
+            "'② 표시한 도무송 칼선 생성'을 누르세요."
         )
 
     def _mixed_hover_at_point(self, cx, cy):
@@ -4082,7 +4082,7 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         self.status.set(
             f"{len(groups)}개 도안을 찾았습니다. 이 중 도무송으로 만들 도안을 클릭해서 표시"
             "(빨간 테두리)하세요 -- 표시 안 한 나머지는 무테/유테로 자동 처리됩니다. 다 "
-            "골랐으면 '② 표시한 대로 칼선 생성'을 누르세요."
+            "골랐으면 '② 표시한 도무송 칼선 생성'을 누르세요."
         )
         # 2026-09-30 속도(멍푸: "칼선 생성 시간이 3초를 넘으면 안 돼"): ① 화면이 다 뜬 뒤, 사용자가
         # 카드 칸을 표시하는 동안 "③ 남은 칼선"에 필요한 무거운 계산(세부 조각 나누기, 요소마다

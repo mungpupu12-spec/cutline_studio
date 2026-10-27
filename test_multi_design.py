@@ -26,7 +26,9 @@ ever touching her actual files:
     ignores corner color entirely so this should not matter.
 """
 
+import os
 import sys
+import tempfile
 sys.path.insert(0, "/root/cutline_studio")
 
 from PIL import Image, ImageDraw
@@ -132,10 +134,10 @@ def _sheet_with_border_marks(path):
 
 
 def main():
-    tmp1 = "/tmp/_multi_design_known.png"
-    tmp2 = "/tmp/_multi_design_joined.png"
-    tmp3 = "/tmp/_multi_design_solid_bg_holes.png"
-    tmp4 = "/tmp/_multi_design_border_marks.png"
+    tmp1 = os.path.join(tempfile.gettempdir(), "_multi_design_known.png")
+    tmp2 = os.path.join(tempfile.gettempdir(), "_multi_design_joined.png")
+    tmp3 = os.path.join(tempfile.gettempdir(), "_multi_design_solid_bg_holes.png")
+    tmp4 = os.path.join(tempfile.gettempdir(), "_multi_design_border_marks.png")
     circles = _sheet_with_known_blobs(tmp1)
     _one_connected_blob(tmp2)
     hole_centers, hole_r = _sheet_solid_bg_with_light_holes(tmp3)
@@ -166,7 +168,7 @@ def main():
     # 서로 거의 맞닿게 배치된 스티커들이 하나로 합쳐져 인식되던 것을
     # 거리 변환+워터쉐드 분리(_split_touching_blobs)로 고침. 가는 목으로만
     # 이어진 두 덩어리는 이제 정확히 그 지점에서 둘로 나뉘어야 한다.
-    tmp5 = "/tmp/_multi_design_thin_neck.png"
+    tmp5 = os.path.join(tempfile.gettempdir(), "_multi_design_thin_neck.png")
     _two_designs_touching_thin_neck(tmp5)
     boxes_thin_neck = detect_design_bboxes_px(tmp5)
     assert len(boxes_thin_neck) == 2, (
@@ -217,7 +219,7 @@ def main():
     # 품질 판단이 아닌 알고리즘 정확성 검사용 합성 이미지).
     import math
 
-    star_path = "/tmp/_multi_design_star.png"
+    star_path = os.path.join(tempfile.gettempdir(), "_multi_design_star.png")
     im_star = Image.new("RGBA", (500, 500), BG)
     d_star = ImageDraw.Draw(im_star)
     cx, cy, r_out, r_in = 250, 250, 200, 80
@@ -236,7 +238,7 @@ def main():
     print(f"[OK] a single concave star-shaped design stays exactly 1 blob (not over-split): {boxes_star}")
 
     # empty/blank image -> no blobs, not an error
-    blank_path = "/tmp/_multi_design_blank.png"
+    blank_path = os.path.join(tempfile.gettempdir(), "_multi_design_blank.png")
     Image.new("RGBA", (200, 200), BG).save(blank_path)
     assert detect_design_bboxes_px(blank_path) == [], "a blank image should detect zero blobs"
     print("[OK] a blank/background-only image correctly detects zero blobs")

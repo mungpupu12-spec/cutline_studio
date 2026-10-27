@@ -23,6 +23,7 @@ generate_style_cutline).
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -59,7 +60,7 @@ def _make_blank_region(path):
 
 
 def test_trace_groups_multiple_elements_and_shrinks_inward():
-    tmp = "/tmp/_borderless_two_blobs.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_borderless_two_blobs.png")
     info = _make_two_separate_blobs(tmp)
 
     content = _trace_content_silhouette_px(tmp, info["rect"])
@@ -87,7 +88,7 @@ def test_trace_groups_multiple_elements_and_shrinks_inward():
 
 
 def test_blank_region_falls_back_to_rect_shrink_safely():
-    tmp = "/tmp/_borderless_blank.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_borderless_blank.png")
     rect = _make_blank_region(tmp)
 
     content = _trace_content_silhouette_px(tmp, rect)
@@ -134,7 +135,7 @@ def test_edge_to_edge_scattered_pattern_falls_back_to_rect_shrink():
     가장자리에 닿아 있으므로("배경까지 채우는 연속 무늬" -- 원래 무테
     정의), _bridge_into_one_shape로 하나로 묶는 데는 성공하더라도 그
     추적 결과를 쓰지 않고 예전처럼 사각형 자체를 안쪽으로 줄여야 한다."""
-    tmp = "/tmp/_borderless_edge_to_edge.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_borderless_edge_to_edge.png")
     rect = _make_edge_to_edge_scattered_pattern(tmp)
 
     content = _trace_content_silhouette_px(tmp, rect)
@@ -145,24 +146,30 @@ def test_edge_to_edge_scattered_pattern_falls_back_to_rect_shrink():
         cx0 <= 1.0 or cy0 <= 1.0 or cx1 >= 399.0 or cy1 >= 199.0,
     )
 
+    # 2026-09-12(57차)부터 "가장자리에 닿았는가"가 아니라 "추적이 실제로 깎아낸 비율"(추적 넓이 / 칸 넓이)로
+    # 판단한다(core.image_style MAX/MIN_TRUSTED_TRACE_RATIO) -- 이 테스트는 12차 기준(가장자리 닿음 = 폴백)으로
+    # 남아 있어 57차 이후 계속 실패했다(2026-10-27 전체 점검에서 확인). 지금 규칙대로: 비율이 상한 이상이면
+    # 사각형을 안쪽으로 줄이는 폴백, 그 사이면 추적한 모양을 쓴다.
+    from core.image_style import MAX_TRUSTED_TRACE_RATIO, MIN_TRUSTED_TRACE_RATIO
+
+    rect_poly = Polygon([(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])])
+    ratio = content.area / rect_poly.area
     notes = []
     line = generate_style_cutline(
         tmp, ImageStyle.BORDERLESS, dpi=150.0, selection_px=rect, margin_mm=1.2, note_sink=notes,
     )
-    check("연속 무늬 폴백 시에도 무테 결과가 빈 도형이 아님", not line.is_empty)
-    check(
-        "halo 없는 추적 결과는 버려지고 '연속 무늬' 폴백 노트가 남음",
-        any("배경까지 채우는 연속 무늬" in n for n in notes),
-    )
-    check(
-        "'실제 선/색 경계를 추적' 노트는 남지 않음(추적 결과를 쓰지 않았으므로)",
-        not any("실제 선/색 경계를 추적한 모양을 기준으로" in n for n in notes),
-    )
-    lx0, ly0, lx1, ly1 = line.bounds
-    check(
-        f"결과가 사각형(0,0,400,200)을 margin_mm=1.2mm만큼 안쪽으로 줄인 것과 일치 (bounds={line.bounds})",
-        6.5 < lx0 < 7.5 and 6.5 < ly0 < 7.5 and 392.5 < lx1 < 393.5 and 192.5 < ly1 < 193.5,
-    )
+    check("무테 결과가 빈 도형이 아님", not line.is_empty)
+    if ratio >= MAX_TRUSTED_TRACE_RATIO:
+        check("추적이 거의 칸 전체 -> '연속 무늬' 폴백 노트", any("배경까지 채우는 연속 무늬" in n for n in notes))
+        lx0, ly0, lx1, ly1 = line.bounds
+        check(
+            f"결과가 사각형을 margin_mm=1.2mm만큼 안쪽으로 줄인 것과 일치 (bounds={line.bounds})",
+            6.5 < lx0 < 7.5 and 6.5 < ly0 < 7.5 and 392.5 < lx1 < 393.5 and 192.5 < ly1 < 193.5,
+        )
+    elif ratio > MIN_TRUSTED_TRACE_RATIO:
+        check(f"추적 비율 {ratio:.2f} -> 추적 모양을 쓰고 폴백 노트 없음",
+              not any("배경까지 채우는 연속 무늬" in n for n in notes))
+        check("결과가 칸 안쪽에 있음", rect_poly.buffer(0.5).contains(line))
 
 
 def test_fallback_safety_warning_still_fires_when_tracing_fails():
@@ -172,7 +179,7 @@ def test_fallback_safety_warning_still_fires_when_tracing_fails():
     보호장치까지 없애버리지 않았는지 확인."""
     import core.image_style as image_style_mod
 
-    tmp = "/tmp/_borderless_force_fallback.png"
+    tmp = os.path.join(tempfile.gettempdir(), "_borderless_force_fallback.png")
     # 실제 내용물(사각형)이 이미지 대부분을 채우는 그림을 만들어서, 아주
     # 좁은 여유만 남기고 선택하면 사각형 축소가 그림을 잘라먹게 한다 --
     # 2026-08-26 케이스와 동일한 조건.

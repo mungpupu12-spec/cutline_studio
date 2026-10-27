@@ -396,6 +396,7 @@ class WhiteLayerMixin:
             # 2026-10-25: 색 바탕 판 위에 흰 테두리 스티커가 여러 개 놓인 판(패널)은 판이 아니라 판 위 스티커마다
             # 흰 테두리 바깥선으로 자른다(그림 모양 기준으로 그냥 자르면 판 하나에 칼선 하나가 생겼다).
             panel_stk = None
+            n_card_fig = 0
             if kind != "sticker" and job != "MASKING_TAPE" and np.asarray(mask).any():
                 from PIL import Image as _Im
 
@@ -405,6 +406,10 @@ class WhiteLayerMixin:
                     panel_stk, _panels = wl.panel_sticker_mask(_rgb0, mask, dpi)
                     if panel_stk is not None:
                         mask = np.asarray(mask, bool) & ~_panels
+                    # 2026-10-27 전체 점검(실제 완성 파일 칼선과 대조): 카드 시트의 칼선은 카드가 아니라 카드 안
+                    # 캐릭터 둘레 -- 꽉 찬 사각형 카드는 카드 안 주인공 그림 모양으로 바꿔 자른다(카드 자체를 자르려면
+                    # 도무송으로 표시).
+                    mask, n_card_fig = wl.replace_cards_with_figures(_rgb0, mask, dpi)
             if not np.asarray(mask).any() and panel_stk is None:
                 return False
             separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)
@@ -465,6 +470,18 @@ class WhiteLayerMixin:
                            "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                     separate = wl.cut_from_white_mask(mask, dpi, offset_mm=off, merge_gap_mm=0.0)
                 cuts = wl.cut_from_white_mask(mask, dpi, offset_mm=off)
+                if job == "LINE_ART":
+                    # 2026-10-27 전체 점검: 꽉 찬 사각형 카드는 바깥으로 넓히면 카드 사이 틈에서 이웃 카드와 이어져
+                    # 여러 장이 한 칼선이 되었다 -- 카드는 카드 테두리로 자른다.
+                    _cards, _rest = wl.split_card_mask(mask, dpi)
+                    if _cards.any():
+                        from shapely.geometry import MultiPolygon as _MP
+
+                        _cc = list(wl.cut_from_white_mask(_cards, dpi, offset_mm=0.0, merge_gap_mm=0.0).geoms)
+                        separate = _MP(list(wl.cut_from_white_mask(_rest, dpi, offset_mm=off,
+                                                                   merge_gap_mm=0.0).geoms) + _cc)
+                        cuts = _MP(wl.merge_close_cuts(list(separate.geoms), dpi))
+                        msg += f" 꽉 찬 사각형 카드 {len(_cc)}장은 카드 테두리로 잘랐습니다."
             if panel_stk is not None:
                 from shapely.geometry import MultiPolygon as _MP
 
@@ -475,6 +492,8 @@ class WhiteLayerMixin:
                     separate = _MP(list(separate.geoms) + list(_ps.geoms))
                 mask = np.logical_or(np.asarray(mask) > 0, panel_stk)
                 msg += f" 색 바탕 판 위 흰 테두리 스티커 {len(_ps.geoms)}개는 흰 테두리 바깥선으로 잘랐습니다."
+            if n_card_fig:
+                msg += f" 카드 {n_card_fig}장은 카드 안 그림 둘레로 잘랐습니다(카드 모양으로 자르려면 도무송으로 표시)."
             if bands:
                 cuts = wl.keep_away_from_bands(cuts, bands, dpi)
                 if separate is not None:

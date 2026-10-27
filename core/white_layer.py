@@ -441,6 +441,10 @@ def find_label_bands(mask: np.ndarray, dpi: float, min_cover: float = 0.9, min_h
     스티커는 한 줄을 그렇게 넓게 채우지 않는다. Returns [(x0, y0, x1, y1), ...] 픽셀."""
     m = np.asarray(mask, bool)
     h, w = m.shape
+    if w > 4 * h:
+        # 2026-10-27 전체 점검: 가로로 아주 긴 그림(테이프 줄·띠 모양 작업 이미지)은 그림 자체가 가로 띠라서,
+        # 테이프 줄 전체를 가격표 띠로 보고 칼선을 하나도 만들지 않았다 -- 이런 그림에서는 띠를 찾지 않는다.
+        return []
     full = np.zeros(h, bool)
     need = min_cover * w
     for yy in np.nonzero(m.sum(1) >= need)[0]:
@@ -628,6 +632,125 @@ def _merge_close(polys: list, gap_px: float) -> list:
     return out
 
 
+def is_card_shape(comp: np.ndarray, dpi: float, min_side_mm: float = 15.0, min_fill: float = 0.95) -> bool:
+    """그림 조각이 꽉 찬 사각형 카드인지(가장 작게 둘러싼 사각형의 95% 이상을 채우고 두 변 모두 15mm 이상).
+    2026-10-27 전체 점검: 꽉 찬 카드(가장자리까지 그림이 채워진 카드)의 가장자리 색이 안쪽보다 어두우면 외곽선으로
+    보고 유테(바깥으로)를 만들어, 카드 사이 틈(2~3mm)에서 이웃 카드 칼선과 이어져 여러 장이 한 칼선이 되었다."""
+    c = np.asarray(comp, np.uint8)
+    cnts, _ = cv2.findContours(c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False
+    cc = max(cnts, key=cv2.contourArea)
+    (_cx, _cy), (rw, rh), _ang = cv2.minAreaRect(cc)
+    if min(rw, rh) < _mm_to_px(min_side_mm, dpi):
+        return False
+    return float(cv2.contourArea(cc)) >= min_fill * float(rw * rh)
+
+
+def card_figure_mask(crop: np.ndarray, dpi: float, min_frac: float = 0.02) -> Optional[np.ndarray]:
+    """꽉 찬 사각형 카드(배경 무늬까지 카드 끝까지 인쇄된 카드) 안의 주인공 그림(캐릭터·말풍선) 모양.
+    2026-10-27 전체 점검(실제 완성 파일 칼선과 대조): 카드 시트의 실제 칼선은 카드가 아니라 카드 안 캐릭터
+    둘레였다(카드 배경 무늬는 칼선 밖). 카드 가장자리 띠를 배경으로 두고 GrabCut으로 가운데 그림을 나눈 뒤,
+    카드 넓이의 2% 이상인 덩어리만(배경 무늬 조각은 버림) 안쪽 구멍을 채워 돌려준다. 못 찾으면 None."""
+    a = np.ascontiguousarray(np.asarray(crop)[..., :3])
+    ch, cw = a.shape[:2]
+    if ch < 40 or cw < 40:
+        return None
+    f = min(1.0, 600.0 / max(ch, cw))
+    sm = cv2.resize(a, (max(8, int(cw * f)), max(8, int(ch * f))), interpolation=cv2.INTER_AREA) if f < 1.0 else a
+    gm = np.full(sm.shape[:2], cv2.GC_PR_FGD, np.uint8)
+    b = max(4, int(0.04 * max(sm.shape[:2])))
+    gm[:b] = cv2.GC_BGD
+    gm[-b:] = cv2.GC_BGD
+    gm[:, :b] = cv2.GC_BGD
+    gm[:, -b:] = cv2.GC_BGD
+    bgm = np.zeros((1, 65), np.float64)
+    fgm = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(cv2.cvtColor(sm, cv2.COLOR_RGB2BGR), gm, None, bgm, fgm, 5, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return None
+    fg = ((gm == cv2.GC_FGD) | (gm == cv2.GC_PR_FGD)).astype(np.uint8)
+    # 그림 둘레 배경 무늬(하트·꽃 조각)가 가는 다리로 이어 붙은 것을 끊는다(0.8mm보다 가는 연결)
+    r_open = max(1, int(round(_mm_to_px(0.8, dpi) * f)))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _disk(r_open))
+    if f < 1.0:
+        fg = (cv2.resize(fg, (cw, ch), interpolation=cv2.INTER_LINEAR) > 0).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        keep[i] = st[i, cv2.CC_STAT_AREA] >= min_frac * ch * cw
+    if not keep.any():
+        return None
+    # 주인공 그림은 한두 덩어리(캐릭터, 말풍선) -- 그림이 여러 개 흩어진 판(씰스티커 판 등)은 카드가 아니다(그대로 둔다)
+    if int(keep.sum()) > 3 or st[keep, cv2.CC_STAT_AREA].sum() < 0.08 * ch * cw:
+        return None
+    out = keep[lab]
+    o = np.ones((ch + 2, cw + 2), np.uint8)
+    o[1:-1, 1:-1] = (~out).astype(np.uint8)
+    cv2.floodFill(o, None, (0, 0), 2)
+    out = o[1:-1, 1:-1] != 2
+    if out.mean() > 0.85:                     # 카드 거의 전체 -- 주인공 그림이 따로 없는 카드(사진 등)
+        return None
+    ys, xs = np.nonzero(out)
+    if (xs.max() - xs.min()) >= 0.8 * cw and (ys.max() - ys.min()) >= 0.8 * ch:
+        # 그림이 카드 끝에서 끝까지 퍼진 장면 카드(창문·선물·나무가 함께 그려진 그림 등) -- 둥근 배지처럼 한 덩어리로
+        # 볼록하지 않으면 카드 모양 그대로 둔다(실제 완성 파일: 장면 카드는 카드 안쪽 사각형 칼선).
+        cnts, _ = cv2.findContours(out.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        area = sum(cv2.contourArea(c) for c in cnts)
+        hull = cv2.contourArea(cv2.convexHull(np.vstack(cnts)))
+        if hull <= 0 or area / hull < 0.9:
+            return None
+    return out
+
+
+def replace_cards_with_figures(rgb: np.ndarray, mask: np.ndarray, dpi: float) -> tuple:
+    """그림 마스크의 꽉 찬 사각형 카드를 카드 안 주인공 그림 모양으로 바꾼다(card_figure_mask). 같은 크기의
+    카드가 반복되면 그림이 같은 카드는 한 번만 계산. Returns (새 마스크, 바꾼 카드 수)."""
+    m = np.asarray(mask, bool).copy()
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    done = 0
+    cache_list = []
+    for i in range(1, n):
+        x, y, bw, bh = (int(v) for v in st[i, :4])
+        comp = lab[y:y + bh, x:x + bw] == i
+        if not is_card_shape(comp.astype(np.uint8), dpi):
+            continue
+        crop = np.asarray(rgb)[y:y + bh, x:x + bw, :3]
+        thumb = cv2.resize(np.ascontiguousarray(crop), (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+        fig = None
+        found = False
+        for (cw0, ch0, th0, fig0) in cache_list:          # 같은 카드 반복이면 한 번 계산한 그림을 그대로
+            if abs(cw0 - bw) <= 4 and abs(ch0 - bh) <= 4 and float(np.abs(th0 - thumb).mean()) < 6.0:
+                found = True
+                if fig0 is not None:
+                    fig = fig0 if fig0.shape == (bh, bw) else cv2.resize(
+                        fig0.astype(np.uint8), (bw, bh), interpolation=cv2.INTER_NEAREST) > 0
+                break
+        if not found:
+            fig = card_figure_mask(crop, dpi)
+            cache_list.append((bw, bh, thumb, fig))
+        if fig is None:
+            continue
+        sub = m[y:y + bh, x:x + bw]
+        sub[comp] = False
+        sub |= fig & comp
+        done += 1
+    return m, done
+
+
+def split_card_mask(mask: np.ndarray, dpi: float) -> tuple:
+    """그림 마스크 -> (꽉 찬 사각형 카드 마스크, 나머지 마스크)."""
+    m = np.asarray(mask, np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    card = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, bw, bh = st[i, :4]
+        card[i] = is_card_shape((lab[y:y + bh, x:x + bw] == i).astype(np.uint8), dpi)
+    cm = card[lab] & (lab > 0)
+    return cm, (m > 0) & ~cm
+
+
 def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: float,
                     gap_mm: float = DEFAULT_MERGE_GAP_MM) -> tuple:
     """그림마다 외곽선이 있으면 유테(그림 바깥으로 margin_mm), 없으면 무테(그림 안쪽으로 margin_mm) 칼선
@@ -644,7 +767,8 @@ def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: fl
         x, y, bw, bh = st[i, :4]
         ya, yb, xa, xb = max(0, y - pad), min(hh, y + bh + pad), max(0, x - pad), min(ww, x + bw + pad)
         comp = (lab[ya:yb, xa:xb] == i).astype(np.uint8)              # 그림 조각 둘레만 잘라서 본다(속도)
-        is_yute[i] = has_outline_line(None, comp, dpi, L=L[ya:yb, xa:xb])
+        # 꽉 찬 사각형 카드는 가장자리 색과 상관없이 무테(카드 안쪽으로) -- is_card_shape 참고
+        is_yute[i] = (not is_card_shape(comp, dpi)) and has_outline_line(None, comp, dpi, L=L[ya:yb, xa:xb])
     ny = int(is_yute[1:].sum())
     nm = n - 1 - ny
     yute = is_yute[lab].astype(np.uint8)
@@ -656,13 +780,18 @@ def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: fl
     if nm:
         mc, skipped = borderless_cut_from_mask(build_white_mask(mute, dpi), dpi, inset_mm=margin_mm)
         polys_sep += list(mc.geoms)
-    merged = list(polys_sep)
-    for _ in range(5):                         # 합친 뒤 또 가까워진 것까지(보통 1~2번이면 끝남)
+    return MultiPolygon(merge_close_cuts(polys_sep, dpi, gap_mm)), MultiPolygon(polys_sep), ny, nm, skipped
+
+
+def merge_close_cuts(polys: list, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) -> list:
+    """gap_mm보다 가까운 칼선을 이어 하나로(합친 뒤 또 가까워진 것까지, 보통 1~2번이면 끝남)."""
+    merged = list(polys)
+    for _ in range(5):
         before = len(merged)
         merged = _merge_close(merged, _mm_to_px(gap_mm, dpi))
         if len(merged) == before:
             break
-    return MultiPolygon(merged), MultiPolygon(polys_sep), ny, nm, skipped
+    return merged
 
 
 def count_close_pairs(cuts, dpi: float, gap_mm: float = DEFAULT_MERGE_GAP_MM) -> int:
@@ -692,6 +821,25 @@ def _rgb8(im) -> np.ndarray:
     return np.asarray(im.convert("RGB"))
 
 
+def drop_guide_lines(mask: np.ndarray, dpi: float, max_thick_mm: float = 0.6, min_span: float = 0.5) -> np.ndarray:
+    """그림 마스크에서 인쇄소 템플릿의 가는 안내선(시트 폭·높이의 절반 이상을 가로지르는 0.6mm보다 가는 선)을 뺀다.
+    2026-10-27 전체 점검: 마스킹테이프 템플릿 파일에서 테이프 위·아래 안내선이 그림으로 잡혀, 안내선이 둘러싼 테이프
+    전체가 칼선 하나가 되고 그림마다 칼선이 생기지 않았다."""
+    m = np.asarray(mask, np.uint8)
+    h, w = m.shape
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    drop = np.zeros(n, bool)
+    lim = _mm_to_px(max_thick_mm, dpi)
+    for i in range(1, n):
+        bw, bh, area = st[i, 2], st[i, 3], st[i, 4]
+        long_side = max(bw, bh)
+        if (bw >= min_span * w or bh >= min_span * h) and area <= lim * long_side * 2.5:
+            drop[i] = True
+    if not drop.any():
+        return np.asarray(mask, bool)
+    return (m > 0) & ~drop[lab]
+
+
 def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None, scene: bool = False,
                      scene_single: bool = False) -> tuple:
     """그림 모양 기준 칼선을 만들 수 있는 마스크와 종류.
@@ -702,7 +850,9 @@ def shape_cut_source(image_path: str, dpi: float, ai_path: Optional[str] = None,
       (None, None): 모두 아님(예전 방식)."""
     art, src = art_mask_for_white(image_path, None, ai_path=ai_path)
     if src in ("ai_alpha", "alpha") and art.any():
-        return src, art
+        art = drop_guide_lines(art, dpi)
+        if art.any():
+            return src, art
     from PIL import Image
 
     with Image.open(image_path) as im:

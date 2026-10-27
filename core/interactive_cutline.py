@@ -457,10 +457,24 @@ def _inscribed_domusong_shape(inner, cutline_type: CutlineType):
     else:  # RECTANGLE
         shape = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
     tol = inner.buffer(0.5)
+    base = shape
     for _ in range(80):
         if tol.contains(shape):
             return shape
         shape = _scale(shape, xfact=0.98, yfact=0.98, origin=(cx, cy))
+    if tol.contains(shape):
+        return shape
+    # 2026-10-27 전체 점검: 영역이 오목하거나(그림 여러 개가 이어진 모양) 가운데가 비어 있으면 bbox 가운데를
+    # 기준으로 줄여서는 끝내 들어가지 않아 "도형을 만들지 못했습니다"로 실패했다 -- 영역 안에서 가장 깊은 점을
+    # 가운데로 옮겨 다시 줄여 본다.
+    from shapely.affinity import translate as _translate
+
+    pole = polylabel(inner, tolerance=1.0)
+    shape = _translate(base, xoff=pole.x - cx, yoff=pole.y - cy)
+    for _ in range(120):
+        if tol.contains(shape):
+            return shape
+        shape = _scale(shape, xfact=0.97, yfact=0.97, origin=(pole.x, pole.y))
     return shape if tol.contains(shape) else Polygon()
 
 

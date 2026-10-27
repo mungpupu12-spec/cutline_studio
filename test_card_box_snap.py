@@ -36,9 +36,21 @@ def test_split_and_shifted_card_boxes_snap_to_card():
         hit = [b for b in out if b[0] <= (x0 + x1) / 2 <= b[2] and b[1] <= (y0 + y1) / 2 <= b[3]]
         assert len(hit) == 1
         assert hit[0] == (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
-    for s in stickers:                                          # 판 위 스티커 칸은 그대로
-        assert s in out
+    # 판 위 스티커 칸은 스티커(흰 테두리 바깥선)마다 하나 -- 판 전체 칸으로 묶지 않는다
+    for s in stickers:
+        near = [b for b in out if abs(b[0] - s[0]) <= 6 and abs(b[1] - s[1]) <= 6
+                and abs(b[2] - s[2]) <= 6 and abs(b[3] - s[3]) <= 6]
+        assert len(near) == 1, (s, out)
     assert len(out) == 2 + len(stickers)
+
+
+def test_panel_with_spanning_boxes_becomes_one_box_per_sticker():
+    # 2026-10-27 전체 점검: 판 위에서 여러 스티커에 걸친 큰 칸이 섞여 도무송 칼선이 서로 겹쳤다.
+    img, cards, stickers = _sheet()
+    spanning = [(40, 520, 700, 720), (300, 500, 1300, 860)]
+    out = _snap_boxes_to_solid_cards(img, list(stickers) + spanning, pad_px=2)
+    assert not any(b in out for b in spanning)
+    assert len(out) == len(stickers)
 
 
 def test_no_change_without_cards():

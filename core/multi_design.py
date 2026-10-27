@@ -1771,28 +1771,67 @@ def is_decorative_frame_cluster(
     return True
 
 
+def _white_border_sticker_boxes(crop: np.ndarray):
+    """판(패널) 위 흰 테두리 스티커들의 칸(잘라낸 판 기준 좌표). 스티커가 2개 미만이면 None
+    (core.white_layer.sticker_border_mask)."""
+    try:
+        from .white_layer import sticker_border_mask
+
+        m = sticker_border_mask(crop, 300.0)
+    except Exception:  # noqa: BLE001
+        return []                                # 판단할 수 없으면 판으로 보고 예전처럼 그대로 둔다
+    if m is None:
+        return None
+    n, _lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    if n - 1 < 2:
+        return None
+    return [(int(st[i, 0]), int(st[i, 1]), int(st[i, 0] + st[i, 2]), int(st[i, 1] + st[i, 3])) for i in range(1, n)]
+
+
+def _has_white_border_stickers(crop: np.ndarray) -> bool:
+    """판(패널) 위에 흰 테두리 스티커가 2개 이상 있는지."""
+    return _white_border_sticker_boxes(crop) is not None
+
+
 def _snap_boxes_to_solid_cards(rgb: np.ndarray, boxes: list, pad_px: int = 2) -> list:
     """2026-10-27(멍푸: "도무송 칼선이 잘 못 인식 되고 있어" -- "도무송인데 모양 따라 잘림", "크기·위치가 틀림"):
     배경을 꽉 채운 사각형 카드(카드 전체가 그림)는 카드 경계가 곧 도안 칸이다. 그런데 찾은 칸이 카드 하나를
     둘로 쪼개거나(실제 시트: 왼쪽 끝 카드가 좁은 조각 + 나머지로) 저대비 번짐 넓히기로 한쪽만 10~20px 밀려,
     도무송 칼선이 카드 안 그림 모양을 따라 작게 생기거나 카드와 어긋났다.
     시트 배경색과 다른 덩어리 중 꽉 찬 사각형(안의 구멍은 채움, 사각형의 93% 이상)이고, 그 안에 중심이 있는
-    칸이 3개 이하이고 그중 하나가 카드의 절반 이상을 덮으면 그 칸들을 카드 경계 칸 하나로 바꾼다. 스티커 여러
-    개가 놓인 판(패널)은 칸이 많거나 칸 하나가 판의 절반에 못 미치므로 그대로 둔다."""
+    칸이 3개 이하이고 그중 하나가 카드의 절반 이상을 덮거나, 카드 안 칸이 여럿이어도 흰 테두리 스티커가 놓인
+    판(패널)이 아니면(카드 안 그림 조각들) 그 칸들을 카드 경계 칸 하나로 바꾼다. 흰 테두리 스티커 여러 개가 놓인
+    판은 그대로 둔다. 카드 칸으로 바꾼 뒤 카드 사이에 걸친 조각 칸(대부분이 카드 안)은 뺀다.
+    시트 배경은 가장자리에서 가장 많은 색 -- 카드가 가장자리까지 닿아 그 색이 카드 색이면 흰 종이색도 시도한다."""
     if not boxes or cv2 is None:
         return boxes
     a = np.asarray(rgb)
     if a.ndim != 3 or a.shape[2] < 3:
         return boxes
     a = a[..., :3]
-    h, w = a.shape[:2]
     border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]]).astype(np.int32)
     q = border // 8
-    keys, inv, cnt = np.unique(q[:, 0] * 1024 + q[:, 1] * 32 + q[:, 2], return_inverse=True, return_counts=True)
+    _keys, inv, cnt = np.unique(q[:, 0] * 1024 + q[:, 1] * 32 + q[:, 2], return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    cands = []
     top = int(np.argmax(cnt))
-    if cnt[top] < 0.4 * len(border):          # 시트 가장자리 색이 한 가지가 아님 -- 배경을 모름
-        return boxes
-    bg = border[inv.ravel() == top].mean(0)
+    if cnt[top] >= 0.4 * len(border):
+        cands.append(border[inv == top].mean(0))
+    for k in np.argsort(-cnt)[:5]:
+        c = border[inv == k].mean(0)
+        if cnt[k] >= 0.1 * len(border) and float(c.min()) >= 235 and int(k) != top:
+            cands.append(c)
+            break
+    boxes = [tuple(b) for b in boxes]
+    for bg in cands:
+        out, n_cards = _snap_boxes_with_bg(a, boxes, bg, pad_px)
+        if n_cards:
+            return out
+    return boxes
+
+
+def _snap_boxes_with_bg(a: np.ndarray, boxes: list, bg, pad_px: int) -> tuple:
+    h, w = a.shape[:2]
     diff = np.zeros((h, w), np.uint8)
     for c in range(3):
         diff |= (np.abs(a[..., c].astype(np.int16) - int(round(bg[c]))) > 12).astype(np.uint8)
@@ -1803,7 +1842,7 @@ def _snap_boxes_to_solid_cards(rgb: np.ndarray, boxes: list, pad_px: int = 2) ->
     _bl = np.unique(np.concatenate([blab[0], blab[-1], blab[:, 0], blab[:, -1]]))
     outer = np.isin(blab, _bl[_bl > 0]) & (diff == 0)
     min_side = 0.04 * min(h, w)
-    boxes = [tuple(b) for b in boxes]
+    cards, panels, sticker_boxes = [], [], []
     for i in range(1, n):
         x, y, bw, bh, area = (int(v) for v in st[i])
         if bw < min_side or bh < min_side or area < 0.002 * h * w:
@@ -1824,16 +1863,37 @@ def _snap_boxes_to_solid_cards(rgb: np.ndarray, boxes: list, pad_px: int = 2) ->
         if not ring.any() or outer[ring].mean() < 0.6:
             continue
         inside = [b for b in boxes if cx0 <= (b[0] + b[2]) / 2.0 <= cx1 and cy0 <= (b[1] + b[3]) / 2.0 <= cy1]
-        if not inside or len(inside) > 3:     # 칸이 여럿 -- 스티커 여러 개가 놓인 판
+        if not inside:
             continue
         best = max((max(0, min(b[2], cx1) - max(b[0], cx0)) * max(0, min(b[3], cy1) - max(b[1], cy0))
                     for b in inside), default=0)
-        if best < 0.5 * bw * bh:
-            continue
+        if len(inside) > 3 or best < 0.5 * bw * bh:
+            # 칸이 여럿이거나 작다 -- 카드 안 그림 조각들(카드 하나로 묶을 것)인지, 흰 테두리 스티커 여러 개가
+            # 놓인 판인지 본다(2026-10-27 전체 점검: 카드 시트의 도무송이 카드마다가 아니라 카드 안 조각마다
+            # 생겼고, 판 위에서는 여러 판·여러 스티커에 걸친 큰 칸이 섞여 도무송 칼선이 서로 겹쳤다).
+            stk = _white_border_sticker_boxes(a[cy0:cy1, cx0:cx1])
+            if stk is not None:
+                if stk:                        # 판: 판 안 칸들을 스티커마다 칸 하나로
+                    panels.append((cx0, cy0, cx1, cy1))
+                    boxes = [b for b in boxes if b not in inside]
+                    sticker_boxes.extend((max(0, cx0 + x0 - pad_px), max(0, cy0 + y0 - pad_px),
+                                          min(w, cx0 + x1 + pad_px), min(h, cy0 + y1 + pad_px))
+                                         for x0, y0, x1, y1 in stk)
+                continue
         card = (max(0, cx0 - pad_px), max(0, cy0 - pad_px), min(w, cx1 + pad_px), min(h, cy1 + pad_px))
-        keep = [b for b in boxes if b not in inside]
-        boxes = keep + [card]
-    return boxes
+        boxes = [b for b in boxes if b not in inside]
+        cards.append(card)
+    if not cards and not panels:
+        return boxes, 0
+    # 카드·판 사이에 걸친 조각 칸(넓이의 70% 이상이 카드·판 안)은 뺀다
+    keep = []
+    for b in boxes:
+        ba = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+        inside_area = sum(max(0, min(b[2], c[2]) - max(b[0], c[0])) * max(0, min(b[3], c[3]) - max(b[1], c[1]))
+                          for c in cards + panels)
+        if inside_area < 0.7 * ba:
+            keep.append(b)
+    return keep + cards + sticker_boxes, len(cards) + len(panels)
 
 
 def _reading_order_sort(boxes: list) -> list:
