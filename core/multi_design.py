@@ -1771,6 +1771,71 @@ def is_decorative_frame_cluster(
     return True
 
 
+def _snap_boxes_to_solid_cards(rgb: np.ndarray, boxes: list, pad_px: int = 2) -> list:
+    """2026-10-27(멍푸: "도무송 칼선이 잘 못 인식 되고 있어" -- "도무송인데 모양 따라 잘림", "크기·위치가 틀림"):
+    배경을 꽉 채운 사각형 카드(카드 전체가 그림)는 카드 경계가 곧 도안 칸이다. 그런데 찾은 칸이 카드 하나를
+    둘로 쪼개거나(실제 시트: 왼쪽 끝 카드가 좁은 조각 + 나머지로) 저대비 번짐 넓히기로 한쪽만 10~20px 밀려,
+    도무송 칼선이 카드 안 그림 모양을 따라 작게 생기거나 카드와 어긋났다.
+    시트 배경색과 다른 덩어리 중 꽉 찬 사각형(안의 구멍은 채움, 사각형의 93% 이상)이고, 그 안에 중심이 있는
+    칸이 3개 이하이고 그중 하나가 카드의 절반 이상을 덮으면 그 칸들을 카드 경계 칸 하나로 바꾼다. 스티커 여러
+    개가 놓인 판(패널)은 칸이 많거나 칸 하나가 판의 절반에 못 미치므로 그대로 둔다."""
+    if not boxes or cv2 is None:
+        return boxes
+    a = np.asarray(rgb)
+    if a.ndim != 3 or a.shape[2] < 3:
+        return boxes
+    a = a[..., :3]
+    h, w = a.shape[:2]
+    border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]]).astype(np.int32)
+    q = border // 8
+    keys, inv, cnt = np.unique(q[:, 0] * 1024 + q[:, 1] * 32 + q[:, 2], return_inverse=True, return_counts=True)
+    top = int(np.argmax(cnt))
+    if cnt[top] < 0.4 * len(border):          # 시트 가장자리 색이 한 가지가 아님 -- 배경을 모름
+        return boxes
+    bg = border[inv.ravel() == top].mean(0)
+    diff = np.zeros((h, w), np.uint8)
+    for c in range(3):
+        diff |= (np.abs(a[..., c].astype(np.int16) - int(round(bg[c]))) > 12).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(diff, connectivity=8)
+    # 시트 바깥 배경(가장자리와 이어진 배경색) -- 카드는 그 위에 놓여 있다. 판 위 흰 테두리 스티커 속 사각형
+    # 그림은 흰 테두리가 판에 둘러싸여 바깥 배경과 이어지지 않으므로 카드로 보지 않는다.
+    _nb, blab = cv2.connectedComponents((1 - diff).astype(np.uint8), connectivity=4)
+    _bl = np.unique(np.concatenate([blab[0], blab[-1], blab[:, 0], blab[:, -1]]))
+    outer = np.isin(blab, _bl[_bl > 0]) & (diff == 0)
+    min_side = 0.04 * min(h, w)
+    boxes = [tuple(b) for b in boxes]
+    for i in range(1, n):
+        x, y, bw, bh, area = (int(v) for v in st[i])
+        if bw < min_side or bh < min_side or area < 0.002 * h * w:
+            continue
+        comp = (lab[y:y + bh, x:x + bw] == i).astype(np.uint8)
+        # 안쪽 구멍(배경색 무늬) 채우기: 가장자리에서 닿는 바깥만 남기고 나머지는 덩어리
+        outside = np.ones((bh + 2, bw + 2), np.uint8)
+        outside[1:-1, 1:-1] = 1 - comp
+        cv2.floodFill(outside, None, (0, 0), 2)
+        filled = int((outside[1:-1, 1:-1] != 2).sum())
+        if filled < 0.93 * bw * bh:
+            continue
+        cx0, cy0, cx1, cy1 = x, y, x + bw, y + bh
+        r = 3                                   # 카드 바로 바깥 둘레가 대부분 시트 바깥 배경인지
+        ring = np.zeros((h, w), bool)
+        ring[max(0, cy0 - r):min(h, cy1 + r), max(0, cx0 - r):min(w, cx1 + r)] = True
+        ring[cy0:cy1, cx0:cx1] = False
+        if not ring.any() or outer[ring].mean() < 0.6:
+            continue
+        inside = [b for b in boxes if cx0 <= (b[0] + b[2]) / 2.0 <= cx1 and cy0 <= (b[1] + b[3]) / 2.0 <= cy1]
+        if not inside or len(inside) > 3:     # 칸이 여럿 -- 스티커 여러 개가 놓인 판
+            continue
+        best = max((max(0, min(b[2], cx1) - max(b[0], cx0)) * max(0, min(b[3], cy1) - max(b[1], cy0))
+                    for b in inside), default=0)
+        if best < 0.5 * bw * bh:
+            continue
+        card = (max(0, cx0 - pad_px), max(0, cy0 - pad_px), min(w, cx1 + pad_px), min(h, cy1 + pad_px))
+        keep = [b for b in boxes if b not in inside]
+        boxes = keep + [card]
+    return boxes
+
+
 def _reading_order_sort(boxes: list) -> list:
     """자연스러운 읽기 순서(위 -> 아래, 왼쪽 -> 오른쪽)로 정렬 -- 세로
     위치를 대략적인 "행" 단위로 묶은 뒤, 같은 행 안에서는 가로 위치로
@@ -1888,6 +1953,8 @@ def detect_design_bboxes_px(
     # 이제 그 최종 박스 하나하나만 저대비 헤일로만큼 살짝 넓힌다(자세한
     # 이유는 _expand_boxes_for_halo/_content_mask_from_gray 문서 참고).
     boxes = _expand_boxes_for_halo(gray, boxes, clip_px=(0, 0, w, h))
+    # 2026-10-27: 꽉 찬 사각형 카드는 카드 경계 칸 하나로(_snap_boxes_to_solid_cards 참고)
+    boxes = _snap_boxes_to_solid_cards(np.asarray(im), boxes, pad_px=pad_px)
     return _reading_order_sort(boxes)
 
 
