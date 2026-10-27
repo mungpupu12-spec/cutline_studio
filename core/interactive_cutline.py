@@ -478,6 +478,51 @@ def _inscribed_domusong_shape(inner, cutline_type: CutlineType):
     return shape if tol.contains(shape) else Polygon()
 
 
+def domusong_region_on_panel(image_path: str, box_px: tuple, bounds_px: Optional[tuple], dpi: float,
+                             inset_mm: float) -> tuple:
+    """도무송으로 표시한 칸이 한 색 판(패널) 위 그림이면, 도무송 기준 영역을 판 쪽으로 넓힌다.
+    2026-10-27(씰스티커 짙은 판 위 그림마다 칸을 나눈 뒤 확인): 도무송은 이미지 외곽에서 블리딩 폭만큼 안쪽에
+    칼선을 넣는데, 판 위 그림의 칸은 그림에 꼭 맞아 칼선이 그림 안쪽으로 작게(작은 동그라미는 점처럼) 생겼다.
+    판은 칸 밖으로도 인쇄가 이어지므로, 칸을 '블리딩 폭 + 칸 긴 변의 25%'만큼(원이 칸 모서리까지 덮게) 넓히되
+    이웃 칸과의 중간(bounds_px)을 넘지 않게. 넓힌 영역이 거의 다(97%) 인쇄된 이미지일 때만 바꾼다 -- 카드처럼
+    칸 밖이 시트 바탕이면 그대로(카드 도무송은 카드 안쪽)."""
+    x0, y0, x1, y1 = (float(v) for v in box_px)
+    grow = mm_to_px(max(float(inset_mm), MIN_DOMUSONG_GAP_MM), dpi) + 0.25 * max(x1 - x0, y1 - y0)
+    ex = [x0 - grow, y0 - grow, x1 + grow, y1 + grow]
+    if bounds_px is not None:
+        bx0, by0, bx1, by1 = (float(v) for v in bounds_px)
+        ex = [max(ex[0], min(bx0, x0)), max(ex[1], min(by0, y0)), min(ex[2], max(bx1, x1)), min(ex[3], max(by1, y1))]
+    try:
+        with Image.open(image_path) as im:
+            w, h = im.size
+    except Exception:  # noqa: BLE001
+        return tuple(box_px)
+    ex = (max(0.0, ex[0]), max(0.0, ex[1]), min(float(w), ex[2]), min(float(h), ex[3]))
+    if (ex[2] - ex[0]) * (ex[3] - ex[1]) <= 1.02 * (x1 - x0) * (y1 - y0):
+        return tuple(box_px)
+    outer = image_outer_region_px(image_path, ex)
+    if outer is None or outer.area < 0.97 * (ex[2] - ex[0]) * (ex[3] - ex[1]):
+        return tuple(box_px)
+    # 넓힐 자리(칸 둘레)가 거의 한 색(판 바탕)일 때만 -- 한 장짜리 그림 안의 부분 칸(귀·얼굴 등)은 둘레가 여러 색이라
+    # 넓히면 이웃 칸 도무송과 겹친다(2026-10-27 확인)
+    import numpy as np
+
+    img = _image_cache.imread(image_path)
+    if img is None:
+        return tuple(box_px)
+    ix0, iy0, ix1, iy1 = (int(round(v)) for v in ex)
+    sub = img[iy0:iy1, ix0:ix1, :3].astype(np.float32)
+    ring = np.ones(sub.shape[:2], bool)
+    ring[max(0, int(y0) - iy0):max(0, int(y1) - iy0), max(0, int(x0) - ix0):max(0, int(x1) - ix0)] = False
+    if int(ring.sum()) < 50:
+        return tuple(box_px)
+    cols = sub[ring]
+    med = np.median(cols, axis=0)
+    if float((((cols - med) ** 2).sum(1) <= 20.0 ** 2).mean()) < 0.85:
+        return tuple(box_px)
+    return ex
+
+
 def generate_domusong_inside_cutline(
     image_path: str,
     region_px: tuple,

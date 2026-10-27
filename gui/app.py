@@ -71,6 +71,7 @@ from core.cutline_core import generate_cutlines, OffsetSpec, px_to_mm
 from core.cutline_types import CutlineType
 from core.image_style import ImageStyle, DEFAULT_STYLE_MARGIN_MM, _measure_content_bbox_px
 from core.interactive_cutline import (
+    domusong_region_on_panel,
     image_outer_region_px,
     generate_borderless_cut_from_silhouette,
     generate_domusong_inside_cutline,
@@ -4458,9 +4459,12 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                     # 2026-09-28: 표시한 칸의 이미지 안쪽에 도형(위 수동 도무송과
                     # 같은 규칙) -- domusong_bounds_px는 더 이상 필요 없지만
                     # (칼선이 이미지 밖으로 안 나감) 계산은 그대로 둔다.
+                    # 2026-10-27: 한 색 판 위 그림 칸은 판 쪽으로 넓혀 그림을 감싸는 도무송(카드는 그대로)
+                    _dom_region = self._selection_px if self._real_grid_cells_px else domusong_region_on_panel(
+                        path, self._selection_px, domusong_bounds_px, self.dpi.get(), offset_mm.bleed_mm)
                     item_result = generate_domusong_inside_cutline(
                         image_path=path,
-                        region_px=self._selection_px,
+                        region_px=_dom_region,
                         cutline_type=cutline_type,
                         dpi=self.dpi.get(),
                         offset_mm=offset_mm,
@@ -4808,9 +4812,15 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 칼선 생성" -- 선택한 영역 안 실제 이미지 외곽을 기준으로, 고른
         # 도형을 이미지 *안쪽*에 넣는다(칼선·블리딩 모두 이미지 안).
         # 수동 드래그와 자동 인식 둘 다 이 경로를 탄다.
+        _dom_region = self._selection_px
+        if bounds_px_override is not None and not self._real_grid_cells_px:
+            # 2026-10-27: 자동 인식한 한 색 판 위 그림 칸은 판 쪽으로 넓혀 그림을 감싸는 도무송(카드는 그대로,
+            # 수동 드래그는 그린 영역 그대로)
+            _dom_region = domusong_region_on_panel(
+                path, self._selection_px, bounds_px_override, self.dpi.get(), offset_mm.bleed_mm)
         result = generate_domusong_inside_cutline(
             image_path=path,
-            region_px=self._selection_px,
+            region_px=_dom_region,
             cutline_type=cutline_type,
             dpi=self.dpi.get(),
             offset_mm=offset_mm,

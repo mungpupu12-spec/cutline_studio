@@ -704,12 +704,89 @@ def card_figure_mask(crop: np.ndarray, dpi: float, min_frac: float = 0.02) -> Op
     return out
 
 
-def replace_cards_with_figures(rgb: np.ndarray, mask: np.ndarray, dpi: float) -> tuple:
-    """그림 마스크의 꽉 찬 사각형 카드를 카드 안 주인공 그림 모양으로 바꾼다(card_figure_mask). 같은 크기의
-    카드가 반복되면 그림이 같은 카드는 한 번만 계산. Returns (새 마스크, 바꾼 카드 수)."""
+def _drop_text_lines(objs: np.ndarray, dpi: float, gap_mm: float = 2.0, max_short_mm: float = 6.0,
+                     min_aspect: float = 5.0, max_piece_mm2: float = 60.0) -> np.ndarray:
+    """판 위 제목 글자 줄(작은 글자 덩어리 3개 이상이 가늘고 길게 한 줄로 늘어선 것)은 스티커가 아니므로 뺀다
+    (가격표·제목 띠를 칼선에서 빼는 것과 같은 이유). 글자 사이 2mm 이하로 이어진 덩어리를 한 줄로 보고, 짧은 변이 6mm 이하이고 길이가 그 5배 이상일 때만 --
+    동그라미 스티커 3개가 늘어선 줄(짧은 변 7mm, 3배 정도)은 그대로 둔다."""
+    m = np.asarray(objs, np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n - 1 < 3:
+        return np.asarray(objs, bool)
+    g = max(1, int(round(_mm_to_px(gap_mm, dpi) / 2.0)))
+    ng, glab = cv2.connectedComponents(cv2.dilate(m, _disk(g)), connectivity=8)
+    px_mm = 25.4 / float(dpi)
+    max_piece = max_piece_mm2 / px_mm ** 2
+    owner = np.zeros(n, np.int32)
+    _u, first = np.unique(lab.ravel(), return_index=True)
+    owner[_u] = glab.ravel()[first]
+    drop = np.zeros(n, bool)
+    for gi in range(1, ng):
+        members = [i for i in range(1, n) if owner[i] == gi]
+        if len(members) < 3 or any(st[i, cv2.CC_STAT_AREA] > max_piece for i in members):
+            continue
+        pts = np.vstack([cv2.findNonZero((lab == i).astype(np.uint8)) for i in members])
+        (_c, (rw, rh), _a) = cv2.minAreaRect(pts)
+        short, long_ = min(rw, rh) * px_mm, max(rw, rh) * px_mm
+        if short <= max_short_mm and long_ >= min_aspect * max(short, 1e-6):
+            drop[members] = True
+    if not drop.any():
+        return np.asarray(objs, bool)
+    return (lab > 0) & ~drop[lab]
+
+
+def panel_figures_mask(crop: np.ndarray, dpi: float, comp: Optional[np.ndarray] = None, min_objects: int = 4,
+                       min_plain: float = 0.85) -> Optional[np.ndarray]:
+    """한 가지 색으로 칠한 판(패널) 위에 그림이 여러 개 놓인 경우, 판 안 그림들의 모양.
+    2026-10-27(멍푸: 씰스티커 짙은 남색 판이 통째로 네모 칼선 -- "칼선 인식이 안 되고 네모 칸을 인지하고 있어"):
+    흰 테두리가 없는 그림 여러 개가 짙은 판 위에 놓이면 판 하나가 꽉 찬 카드로 보여 판 모양(사각형) 칼선이
+    생겼다. 판 가장자리 안쪽 띠(1.5~3mm)가 거의 한 색(85% 이상)이면 그 색을 판 바탕으로 보고 판 안 그림을
+    찾는다(scene_objects_mask -- 그림 안 구멍은 채움). 판 테두리 장식선이 그림으로 잡히지 않게 가장자리 1.5mm는
+    바탕색으로 덮는다. 그림이 min_objects개 이상일 때만 판으로 본다(그림 한두 개인 카드는 카드 방식 그대로).
+    장면 카드(창문·바닥 등 여러 색이 카드 끝까지)는 가장자리가 한 색이 아니므로 None -- 카드 모양 그대로."""
+    if cv2 is None:
+        return None
+    a = np.ascontiguousarray(np.asarray(crop)[..., :3])
+    ch, cw = a.shape[:2]
+    if ch < 40 or cw < 40:
+        return None
+    c8 = np.ones((ch, cw), np.uint8) if comp is None else np.asarray(comp, np.uint8)
+    r1 = max(2, int(round(_mm_to_px(1.5, dpi))))
+    r2 = max(r1 + 2, int(round(_mm_to_px(3.0, dpi))))
+    e1 = cv2.erode(c8, _disk(r1), borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    e2 = cv2.erode(c8, _disk(r2), borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    ring = e1 & ~e2
+    if int(ring.sum()) < 50:
+        return None
+    cols = a[ring].astype(np.float32)
+    med = np.median(cols, axis=0)
+    if float((((cols - med) ** 2).sum(1) <= 20.0 ** 2).mean()) < min_plain:
+        return None
+    sub = a.copy()
+    sub[~e1] = med.astype(sub.dtype)
+    objs = scene_objects_mask(sub, dpi, allow_single=True)
+    if objs is None:
+        return None
+    objs = np.asarray(objs, bool) & e1
+    objs = _drop_text_lines(objs, dpi)
+    n, _lab, st, _ = cv2.connectedComponentsWithStats(objs.astype(np.uint8), connectivity=8)
+    min_px = 4.0 / (25.4 / float(dpi)) ** 2
+    if int((st[1:, cv2.CC_STAT_AREA] >= min_px).sum()) < min_objects:
+        return None
+    return objs
+
+
+def replace_cards_with_figures(rgb: np.ndarray, mask: np.ndarray, dpi: float, info: Optional[dict] = None) -> tuple:
+    """그림 마스크의 꽉 찬 사각형 카드를 카드 안 주인공 그림 모양으로 바꾼다(card_figure_mask). 한 색 판 위에
+    그림이 여러 개 놓인 판(씰스티커 판)은 판 위 그림마다(panel_figures_mask). 같은 크기의 카드가 반복되면 그림이
+    같은 카드는 한 번만 계산. Returns (새 마스크, 바꾼 카드·판 수).
+    info(dict)를 주면 info["n_panels"](그중 판 수)와 info["panel_bg"](판 바탕 자리 -- 그림 둘레 외곽선 판단 때
+    짙은 판 바탕을 외곽선으로 오인하지 않게 흰색으로 볼 곳)를 채운다."""
     m = np.asarray(mask, bool).copy()
     n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
     done = 0
+    n_panels = 0
+    panel_bg = np.zeros(m.shape, bool)
     cache_list = []
     for i in range(1, n):
         x, y, bw, bh = (int(v) for v in st[i, :4])
@@ -719,23 +796,36 @@ def replace_cards_with_figures(rgb: np.ndarray, mask: np.ndarray, dpi: float) ->
         crop = np.asarray(rgb)[y:y + bh, x:x + bw, :3]
         thumb = cv2.resize(np.ascontiguousarray(crop), (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
         fig = None
+        is_panel = False
         found = False
-        for (cw0, ch0, th0, fig0) in cache_list:          # 같은 카드 반복이면 한 번 계산한 그림을 그대로
+        for (cw0, ch0, th0, fig0, pan0) in cache_list:     # 같은 카드 반복이면 한 번 계산한 그림을 그대로
             if abs(cw0 - bw) <= 4 and abs(ch0 - bh) <= 4 and float(np.abs(th0 - thumb).mean()) < 6.0:
                 found = True
+                is_panel = pan0
                 if fig0 is not None:
                     fig = fig0 if fig0.shape == (bh, bw) else cv2.resize(
                         fig0.astype(np.uint8), (bw, bh), interpolation=cv2.INTER_NEAREST) > 0
                 break
         if not found:
             fig = card_figure_mask(crop, dpi)
-            cache_list.append((bw, bh, thumb, fig))
+            if fig is None:                               # 한 색 판 위 그림 여러 개(씰스티커 판)
+                fig = panel_figures_mask(crop, dpi, comp)
+                is_panel = fig is not None
+            cache_list.append((bw, bh, thumb, fig, is_panel))
         if fig is None:
             continue
         sub = m[y:y + bh, x:x + bw]
         sub[comp] = False
         sub |= fig & comp
         done += 1
+        if is_panel:
+            n_panels += 1
+            # 그림 가장자리 2~3px는 판 바탕색과 섞인 색(안티에일리어싱)이라 어두운 선처럼 보인다 -- 그것도 판 바탕으로
+            core = cv2.erode(np.asarray(fig & comp, np.uint8), _disk(max(1, int(round(_mm_to_px(0.25, dpi))))))
+            panel_bg[y:y + bh, x:x + bw] |= comp & (core == 0)
+    if info is not None:
+        info["n_panels"] = n_panels
+        info["panel_bg"] = panel_bg
     return m, done
 
 

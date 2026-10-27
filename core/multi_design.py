@@ -1788,6 +1788,28 @@ def _white_border_sticker_boxes(crop: np.ndarray):
     return [(int(st[i, 0]), int(st[i, 1]), int(st[i, 0] + st[i, 2]), int(st[i, 1] + st[i, 3])) for i in range(1, n)]
 
 
+def _panel_figure_boxes(crop: np.ndarray, dpi: float = 300.0) -> list:
+    """한 색 바탕 판 위 그림들의 칸(잘라낸 판 기준 좌표, core.white_layer.panel_figures_mask). 1mm보다 가까운
+    조각(손·발 등)은 한 칸으로. 판이 아니면 []. 2026-10-27(멍푸: 씰스티커 짙은 판이 통째 네모로 인식)."""
+    try:
+        from .white_layer import panel_figures_mask, _disk, _mm_to_px
+
+        m = panel_figures_mask(crop, dpi)
+    except Exception:  # noqa: BLE001
+        return []
+    if m is None:
+        return []
+    m8 = np.asarray(m, np.uint8)
+    r = max(1, int(round(_mm_to_px(0.5, dpi))))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(m8, _disk(r)), connectivity=8)
+    out = []
+    for i in range(1, n):
+        ys, xs = np.nonzero((lab == i) & (m8 > 0))
+        if len(xs):
+            out.append((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+    return out
+
+
 def _has_white_border_stickers(crop: np.ndarray) -> bool:
     """판(패널) 위에 흰 테두리 스티커가 2개 이상 있는지."""
     return _white_border_sticker_boxes(crop) is not None
@@ -1872,6 +1894,9 @@ def _snap_boxes_with_bg(a: np.ndarray, boxes: list, bg, pad_px: int) -> tuple:
             # 놓인 판인지 본다(2026-10-27 전체 점검: 카드 시트의 도무송이 카드마다가 아니라 카드 안 조각마다
             # 생겼고, 판 위에서는 여러 판·여러 스티커에 걸친 큰 칸이 섞여 도무송 칼선이 서로 겹쳤다).
             stk = _white_border_sticker_boxes(a[cy0:cy1, cx0:cx1])
+            if stk is None:
+                # 2026-10-27: 흰 테두리 없이 한 색 판 위에 그림 여러 개(씰스티커 짙은 판) -- 판 위 그림마다 칸 하나
+                stk = _panel_figure_boxes(a[cy0:cy1, cx0:cx1]) or None
             if stk is not None:
                 if stk:                        # 판: 판 안 칸들을 스티커마다 칸 하나로
                     panels.append((cx0, cy0, cx1, cy1))

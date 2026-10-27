@@ -397,6 +397,7 @@ class WhiteLayerMixin:
             # 흰 테두리 바깥선으로 자른다(그림 모양 기준으로 그냥 자르면 판 하나에 칼선 하나가 생겼다).
             panel_stk = None
             n_card_fig = 0
+            _fig_info = {}
             if kind != "sticker" and job != "MASKING_TAPE" and np.asarray(mask).any():
                 from PIL import Image as _Im
 
@@ -409,7 +410,9 @@ class WhiteLayerMixin:
                     # 2026-10-27 전체 점검(실제 완성 파일 칼선과 대조): 카드 시트의 칼선은 카드가 아니라 카드 안
                     # 캐릭터 둘레 -- 꽉 찬 사각형 카드는 카드 안 주인공 그림 모양으로 바꿔 자른다(카드 자체를 자르려면
                     # 도무송으로 표시).
-                    mask, n_card_fig = wl.replace_cards_with_figures(_rgb0, mask, dpi)
+                    mask, n_card_fig = wl.replace_cards_with_figures(_rgb0, mask, dpi, info=_fig_info)
+            n_fig_panels = int(_fig_info.get("n_panels", 0))
+            n_card_fig -= n_fig_panels
             if not np.asarray(mask).any() and panel_stk is None:
                 return False
             separate = None          # 가까운 칼선을 합치지 않은 결과(고를 수 있을 때만)
@@ -444,6 +447,11 @@ class WhiteLayerMixin:
                         rgb = wl._rgb8(_im)
                 if rgb.shape[:2] != mask.shape:
                     return False
+                _pbg = _fig_info.get("panel_bg")
+                if _pbg is not None and _pbg.shape == rgb.shape[:2] and _pbg.any():
+                    # 짙은 판 바탕이 그림 둘레에 붙어 외곽선(유테)으로 잘못 보이지 않게 판 바탕은 흰색으로 본다
+                    rgb = np.array(rgb[:, :, :3])
+                    rgb[_pbg] = 255
                 cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off)
                 mask = wl.build_white_mask(mask, dpi)
                 msg = (f"칼선 {{n}}개를 만들었습니다(외곽선 있는 그림 {ny}개는 유테 -- 바깥 {off:.1f}mm, "
@@ -494,6 +502,8 @@ class WhiteLayerMixin:
                 msg += f" 색 바탕 판 위 흰 테두리 스티커 {len(_ps.geoms)}개는 흰 테두리 바깥선으로 잘랐습니다."
             if n_card_fig:
                 msg += f" 카드 {n_card_fig}장은 카드 안 그림 둘레로 잘랐습니다(카드 모양으로 자르려면 도무송으로 표시)."
+            if n_fig_panels:
+                msg += f" 한 색 바탕 판 {n_fig_panels}장은 판 위 그림마다 잘랐습니다(제목 글자 줄은 뺌)."
             if bands:
                 cuts = wl.keep_away_from_bands(cuts, bands, dpi)
                 if separate is not None:
