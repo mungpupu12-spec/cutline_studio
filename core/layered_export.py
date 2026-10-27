@@ -112,6 +112,24 @@ def strip_ai_private_data(doc) -> int:
     return n
 
 
+def hide_existing_layers(doc, names: list) -> int:
+    """사본에 이미 같은 이름의 레이어(작가가 넣어 둔 칼선 등)가 있으면 칼선이 두 겹이 된다(2026-10-27 멍푸: "ai 파일
+    여니까 이중 칼선이야"). 지우지 않고 이름 뒤에 "(원본)"을 붙여 끈다. 끈 레이어 수."""
+    import fitz
+
+    off = []
+    for xref, info in (doc.get_ocgs() or {}).items():
+        if info.get("name") in names:
+            doc.xref_set_key(xref, "Name", fitz.get_pdf_str(info["name"] + "(원본)"))
+            off.append(xref)
+    if off:
+        try:
+            doc.set_layer(-1, off=off)
+        except Exception:  # noqa: BLE001
+            pass
+    return len(off)
+
+
 def export_ai_copy_with_cut(ai_path: str, out_path: str, result, placement: dict, white_geom=None,
                             page_index: int = 0, strip_private: bool = True) -> dict:
     """AI 원본의 사본에 칼선(+화이트) 레이어를 더한다. 원본 파일은 읽기만 한다."""
@@ -127,6 +145,8 @@ def export_ai_copy_with_cut(ai_path: str, out_path: str, result, placement: dict
         ppp = float(placement.get("pt_per_px") or 1.0)
         tiles = placement.get("tiles") or [(placement.get("x0_pt", 0.0), placement.get("y0_pt", 0.0))]
         stats = {"tiles": len(tiles), "cut_rings": 0, "white_rings": 0}
+        stats["hidden_layers"] = hide_existing_layers(
+            doc, [CUT_LAYER] + ([WHITE_LAYER] if white_geom is not None and not white_geom.is_empty else []))
         ocg_w = doc.add_ocg(WHITE_LAYER, on=True) if white_geom is not None and not white_geom.is_empty else None
         ocg_c = doc.add_ocg(CUT_LAYER, on=True)
         cut = cut_geom_of(result)

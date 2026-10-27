@@ -6388,16 +6388,24 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                     lines.append(f"같은 그림이 {n_tiles}번 놓여 있어, 놓인 자리마다 칼선을 넣었습니다.")
                 if white is not None:
                     lines.append("화이트는 '화이트레이어' 레이어(맨 아래)에 넣었습니다.")
+                _parts = r.split()
+                if len(_parts) >= 4 and _parts[3].isdigit() and int(_parts[3]) > 0:
+                    lines.append("원본에 이미 있던 같은 이름의 레이어는 칼선이 두 겹이 되지 않게 이름 뒤에 '(원본)'을 붙여 "
+                                 "숨기고 잠갔습니다(지우지 않았습니다).")
                 return lines
             try:
                 os.remove(out_path)        # 레이어를 못 넣은 단순 복사본은 남기지 않는다
             except OSError:
                 pass
             pdf = os.path.splitext(out_path)[0] + ".pdf"
-            lx.export_ai_copy_with_cut(ai_src, pdf, res, placement, white_geom=white, strip_private=True)
+            _st = lx.export_ai_copy_with_cut(ai_src, pdf, res, placement, white_geom=white, strip_private=True)
             why = "일러스트레이터를 찾지 못해" if r.startswith("NOAPP") else f"일러스트레이터에서 오류가 나서({r[4:80]})"
-            return [pdf, f"{why} AI 대신 PDF로 저장했습니다. 대지 그대로에 '칼선' 레이어가 들어 있습니다.",
-                    "일러스트레이터에서 열면 레이어가 하나로 합쳐져 보일 수 있습니다."]
+            lines = [pdf, f"{why} AI 대신 PDF로 저장했습니다. 대지 그대로에 '칼선' 레이어가 들어 있습니다.",
+                     "일러스트레이터에서 열면 레이어가 하나로 합쳐져 보일 수 있습니다."]
+            if (_st or {}).get("hidden_layers"):
+                lines.append("원본에 이미 있던 같은 이름의 레이어는 칼선이 두 겹이 되지 않게 이름 뒤에 '(원본)'을 붙여 "
+                             "껐습니다(지우지 않았습니다).")
+            return lines
         r = lx.save_layered_pdf_via_illustrator(img, out_path, res, img_dpi, white_geom=white)
         if not r.startswith("OK"):
             lx.export_layered_pdf(img, res, out_path, img_dpi, white_geom=white)

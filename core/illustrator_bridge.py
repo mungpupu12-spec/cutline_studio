@@ -30,6 +30,19 @@ function layerNamed(doc, name) {
     for (var i = 0; i < doc.layers.length; i++) { if (doc.layers[i].name == name) return doc.layers[i]; }
     var L = doc.layers.add(); L.name = name; return L;
 }
+// 2026-10-27(멍푸: "컷라인 스튜디오에선 칼선이 잘 만들어졌는데 ai 파일 여니까 이중 칼선이야"): 원본에 이미 같은 이름의
+// 레이어(예: 작가가 그린 칼선 -- 그림으로 들어 있는 경우도 있음)가 있으면 거기에 더하면 칼선이 두 겹이 된다. 원래
+// 레이어는 지우지 않고 이름 뒤에 "(원본)"을 붙여 숨기고 잠근 뒤, 새 레이어에 넣는다. 숨긴 원래 레이어 수를 센다.
+var N_HIDDEN = 0;
+function freshLayer(doc, name) {
+    for (var i = 0; i < doc.layers.length; i++) {
+        var L = doc.layers[i];
+        if (L.name == name && (L.pageItems.length + L.layers.length) > 0) {
+            L.locked = false; L.name = name + "(원본)"; L.visible = false; L.locked = true; N_HIDDEN++;
+        }
+    }
+    return layerNamed(doc, name);
+}
 function cmyk(c, m, y, k) { var x = new CMYKColor(); x.cyan = c; x.magenta = m; x.yellow = y; x.black = k; return x; }
 function toDoc(ab, ring) {
     var out = [];
@@ -82,13 +95,13 @@ try {
     var ab = doc.artboards[0].artboardRect;
     var nw = 0, nc = 0;
     if (D.white.length) {
-        var W = layerNamed(doc, D.white_layer); W.locked = false; W.visible = true;
+        var W = freshLayer(doc, D.white_layer); W.locked = false; W.visible = true;
         W.zOrder(ZOrderMethod.SENDTOBACK); nw = drawWhite(W, ab, D.white);
     }
-    var C = layerNamed(doc, D.cut_layer); C.locked = false; C.visible = true;
+    var C = freshLayer(doc, D.cut_layer); C.locked = false; C.visible = true;
     C.zOrder(ZOrderMethod.BRINGTOFRONT); nc = drawCut(C, ab, D.cut);
     doc.save(); doc.close(SaveOptions.DONOTSAVECHANGES);
-    done("OK " + nc + " " + nw);
+    done("OK " + nc + " " + nw + " " + N_HIDDEN);
 } catch (e) { done("ERR " + e + " (line " + e.line + ")"); }
 """
 
