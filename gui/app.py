@@ -1995,6 +1995,21 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 2026-09-29: 버튼 줄을 먼저 배치하고 제목은 남는 자리에 -- 폭이 좁으면 버튼
         # 대신 제목이 줄어든다(버튼이 잘려 눌리지 않던 문제).
         preview_title.pack(side="left", fill="x", expand=True)
+        # 2026-11-01(상세페이지용 프로그램 화면에서 발견): 창 폭이 좁으면 제목이 "미리보ㄱ"처럼 글자 중간이 잘려
+        # 보였다. 제목이 다 들어갈 자리가 없으면 잘린 글자 대신 제목을 비워 두고, 자리가 나면 다시 보인다.
+        def _fit_preview_title(_e=None, _title=preview_title, _row=preview_header_row, _btns=zoom_row):
+            try:
+                need = getattr(self, "_preview_title_need", 0)
+                if not need and _title.cget("text"):
+                    need = self._preview_title_need = _title.winfo_reqwidth()
+                avail = _row.winfo_width() - _btns.winfo_width()
+                want = "미리보기" if avail >= need else ""
+                if _title.cget("text") != want:
+                    _title.configure(text=want)
+            except Exception:  # noqa: BLE001 -- 제목 표시만의 문제라 무시
+                pass
+
+        preview_header_row.bind("<Configure>", _fit_preview_title, add="+")
 
         canvas_wrap = ctk.CTkFrame(right_col, fg_color=CANVAS_BG, corner_radius=18,
                                    border_width=1, border_color=BORDER)

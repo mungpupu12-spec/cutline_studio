@@ -2406,6 +2406,7 @@ def detect_elements_by_background_flood_px(
     _img=None,
     known_bg_lab=None,
     bg_colors_out=None,
+    white_bridges_out=None,
 ):
     """결과를 기억하는 겉 함수(2026-09-30 속도 조사: 무테 요소 하나마다 자기가 든 칸 전체를
     다시 배경 채우기 하고 있었음 -- 같은 칸의 요소 34개가 같은 계산을 34번, 자동 인식에서 약
@@ -2427,23 +2428,71 @@ def detect_elements_by_background_flood_px(
         with _BG_FLOOD_LOCK:
             hit = _BG_FLOOD_CACHE.get(key)
         if hit is not None:
-            objs, colors = hit
+            objs, colors, bridges = hit
             if bg_colors_out is not None:
                 bg_colors_out.extend(colors)
+            if white_bridges_out is not None:
+                white_bridges_out.extend(bridges)
             return list(objs)
     colors: list = []
+    bridges: list = []
     objs = _detect_elements_by_background_flood_px_uncached(
         image_path, cell_px, grad_threshold=grad_threshold, flood_delta=flood_delta,
         min_area_ratio=min_area_ratio, _img=_img, known_bg_lab=known_bg_lab, bg_colors_out=colors,
+        white_bridges_out=bridges,
     )
     if bg_colors_out is not None:
         bg_colors_out.extend(colors)
+    if white_bridges_out is not None:
+        white_bridges_out.extend(bridges)
     if key is not None:
         with _BG_FLOOD_LOCK:
             if len(_BG_FLOOD_CACHE) > 1024:
                 _BG_FLOOD_CACHE.clear()
-            _BG_FLOOD_CACHE[key] = (tuple(objs), tuple(colors))
+            _BG_FLOOD_CACHE[key] = (tuple(objs), tuple(colors), tuple(bridges))
     return list(objs)
+
+
+_WHITE_L = 250.0   # OpenCV 8비트 Lab 밝기(255 = 흰색)
+_WHITE_AB = 3.5    # a·b가 128에서 이만큼 안이면 색이 거의 없음
+
+
+def _is_pure_white_lab(c) -> bool:
+    return float(c[0]) >= _WHITE_L and abs(float(c[1]) - 128.0) <= _WHITE_AB and abs(float(c[2]) - 128.0) <= _WHITE_AB
+
+
+def _restore_white_bridges(bg, lab, bg_centers, area, restored_out=None):
+    """배경 채우기가 흰 옷처럼 그림 속 흰 부분까지 들어간 것을 되돌린다.
+
+    2026-11-01(멍푸: 리무버블 스티커 AI 시트 -- 연회색 바닥 위 강아지의 흰 셔츠가 배경이 돼 칼선이
+    머리·팔·치마로 쪼개졌다): 크림색 벽 -> 연분홍 흰 띠 -> 흰 셔츠로 이웃 색 차이가 채우기 허용치보다
+    작게 이어져 셔츠까지 배경으로 채워졌다. 칸 배경으로 인정한 색 중에 순백이 없는데, 채워진 자리 중
+    순백 덩어리가 그림 덩어리 2개 이상에 맞닿아 있으면(그림 조각을 잇는 다리) 그림으로 되돌린다.
+    하늘의 흰 구름처럼 그림 하나에만 닿거나 아무 데도 안 닿은 흰 자리는 그대로 배경."""
+    if any(_is_pure_white_lab(c) for c in bg_centers):
+        return bg
+    white = (bg & (lab[:, :, 0] >= _WHITE_L) & (np.abs(lab[:, :, 1] - 128.0) <= _WHITE_AB)
+             & (np.abs(lab[:, :, 2] - 128.0) <= _WHITE_AB))
+    if not white.any():
+        return bg
+    n, wlab, wst, _ = cv2.connectedComponentsWithStats(white.astype(np.uint8), 8)
+    others = cv2.morphologyEx((~bg).astype(np.uint8), cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    m, olab, ost, _ = cv2.connectedComponentsWithStats(others, 8)
+    big = {k for k in range(1, m) if ost[k, cv2.CC_STAT_AREA] >= 0.002 * area}
+    if len(big) < 2:
+        return bg
+    out = bg.copy()
+    ker = np.ones((9, 9), np.uint8)
+    for k in range(1, n):
+        if wst[k, cv2.CC_STAT_AREA] < 0.001 * area:
+            continue
+        comp = wlab == k
+        rim = (cv2.dilate(comp.astype(np.uint8), ker) > 0) & ~comp
+        if len(set(np.unique(olab[rim]).tolist()) & big) >= 2:
+            out[comp] = False
+            if restored_out is not None:
+                restored_out.append(comp)
+    return out
 
 
 def _detect_elements_by_background_flood_px_uncached(
@@ -2455,6 +2504,7 @@ def _detect_elements_by_background_flood_px_uncached(
     _img=None,
     known_bg_lab=None,
     bg_colors_out=None,
+    white_bridges_out=None,
 ):
     """2026-09-28 무테 "보조 탐지기"(멍푸: "1개로 해결되지 않으면 1차, 2차 ...
     보조 보완 프로그램", "테스트 칼선 보면서 대조해"). 칸 안의 요소를 선(Canny)
@@ -2619,6 +2669,18 @@ def _detect_elements_by_background_flood_px_uncached(
     bg = mask[1:-1, 1:-1] == 255
     if not bg.any():
         return []  # 배경을 못 찾음 -- 판단 보류(보조 탐지기라 아무것도 안 더함)
+    used_bg = [centers[k] for k in good if share[k] >= 0.03 and (k not in span_checked or k in span_accepted)]
+    used_bg += [np.asarray(b, np.float32) for b in (known_bg_lab or [])]
+    restored: list = []
+    bg = _restore_white_bridges(bg, lab, used_bg, w * h, restored_out=restored)
+    if white_bridges_out is not None:
+        for comp in restored:
+            cc, _ = cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cc:
+                if len(c) >= 3:
+                    p = _Polygon([(float(q[0][0]) + x0, float(q[0][1]) + y0) for q in c]).buffer(0)
+                    if not p.is_empty:
+                        white_bridges_out.append(p)
     # 경계(기울기 장벽) 픽셀 자체는 채우기가 못 들어가므로, 배경끼리 만나는
     # 줄무늬 경계선이 가는 "요소"로 남아 요소들을 서로 이어버린다. 배경 바로
     # 옆의 장벽 픽셀은 배경으로 돌리고(요소 가장자리도 몇 px 깎임), 나중에
@@ -2655,6 +2717,28 @@ def _detect_elements_by_background_flood_px_uncached(
     return polys
 
 
+def _merge_boxes_across_white_bridges(sub_boxes, objs, bridges, touch_px: float = 12.0):
+    """흰 다리(_restore_white_bridges가 그림으로 되돌린 흰 셔츠 등)에 함께 닿은 같은 덩어리의 조각
+    박스를 하나로 합친다. 2026-11-01: 흰 셔츠에 끊겨 머리·팔·치마가 따로 잡히던 강아지(멍푸 리무버블
+    시트) -- 셔츠는 머리 밑, 양팔 옆, 치마 위에 모두 닿는다. 흰 다리가 없는 칸에서는 아무것도 바꾸지 않는다."""
+    from shapely.geometry import box as _box
+
+    boxes = [tuple(b) for b in sub_boxes]
+    for br in bridges:
+        near = br.buffer(touch_px)
+        for obj in objs:
+            if not obj.intersects(br):
+                continue
+            idx = [k for k, b in enumerate(boxes)
+                   if _box(*b).intersects(near) and obj.intersection(_box(*b)).area >= 0.25 * _box(*b).area]
+            if len(idx) < 2:
+                continue
+            sel = [boxes[k] for k in idx]
+            u = (min(b[0] for b in sel), min(b[1] for b in sel), max(b[2] for b in sel), max(b[3] for b in sel))
+            boxes = [b for k, b in enumerate(boxes) if k not in idx] + [u]
+    return boxes
+
+
 def merge_boxes_of_one_art_piece_px(image_path: str, cell_px: tuple, sub_boxes: list,
                                     neck_mm: float = 1.5, dpi: float = 300.0):
     """한 덩어리 그림이 색 경계로 두 박스로 쪼개진 것을 다시 합친다.
@@ -2670,10 +2754,13 @@ def merge_boxes_of_one_art_piece_px(image_path: str, cell_px: tuple, sub_boxes: 
 
     if len(sub_boxes) < 2:
         return sub_boxes
-    objs = detect_elements_by_background_flood_px(image_path, cell_px)
+    bridges: list = []
+    objs = detect_elements_by_background_flood_px(image_path, cell_px, white_bridges_out=bridges)
     if not objs:
         return sub_boxes
     r = neck_mm * dpi / 25.4
+    if bridges:
+        sub_boxes = _merge_boxes_across_white_bridges(sub_boxes, objs, bridges)
     boxes = [tuple(b) for b in sub_boxes]
     changed = True
     while changed:
