@@ -4,6 +4,7 @@
   - 칼선이 2mm보다 가까우면 합칠지 따로 자를지 묻는다."""
 import os
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -71,6 +72,15 @@ def test_shape_cut_source_kinds():
     assert kind == "alpha" and m[100, 100] and not m[5, 5]
 
 
+def _pump(app, sec=1.0):
+    """화면 쪽 after(0) 콜백(미리보기·상태 줄)을 다 처리할 때까지 잠깐 돌린다 -- 다음 칼선 만들기가 같은
+    미리보기 파일을 다시 쓰기 전에(느린 PC에서 콜백이 밀려 상태 줄이 안 바뀌는 일, 2026-11-01 PC 테스트)."""
+    t = time.time()
+    while time.time() - t < sec:
+        app.update()
+        time.sleep(0.02)
+
+
 def test_gui_shape_cut_line_art_transparent_and_sticker():
     from gui.app import CutLineApp
 
@@ -90,15 +100,34 @@ def test_gui_shape_cut_line_art_transparent_and_sticker():
     try:
         app._show_note_dialog = lambda *a, **k: None
         app.input_path.set(p)
-        app.job_type.set("BORDERLESS")                    # 무테 + 투명 배경: 그림 안쪽으로 유테/무테 간격만큼
+        # 무테 + 투명 배경 스티커 한 장: 그림 외곽선 위(2026-11-01 멍푸: "이건 칼선이 무테지만 외곽에 있어야해")
+        app.job_type.set("BORDERLESS")
         assert app._shape_cut_auto(p)
+        _pump(app)
         cut = app._accumulated[-1].offsets["cut"]
         assert len(cut.geoms) == 1
         inset_mm = (101 - (cut.area / np.pi) ** 0.5) / DPI * 25.4
+        assert abs(inset_mm) < 0.2, inset_mm
+        app._accumulated.clear()
+        # 무테 + 투명 배경 그림 여러 장: 예전처럼 그림 안쪽으로 유테/무테 간격만큼
+        rgba2 = np.zeros((400, 700, 4), np.uint8)
+        for cx in (200, 500):
+            cv2.circle(rgba2, (cx, 200), 100, (150, 200, 230, 255), -1)
+            cv2.circle(rgba2, (cx, 200), 100, (30, 30, 30, 255), 4)
+        p2 = os.path.join(d, "t2.png")
+        Image.fromarray(rgba2).save(p2)
+        app.input_path.set(p2)
+        assert app._shape_cut_auto(p2)
+        _pump(app)
+        cut = app._accumulated[-1].offsets["cut"]
+        assert len(cut.geoms) == 2
+        inset_mm = (101 - (cut.geoms[0].area / np.pi) ** 0.5) / DPI * 25.4
         assert abs(inset_mm - float(app.style_margin_mm.get())) < 0.2, inset_mm
         app._accumulated.clear()
+        app.input_path.set(p)
         app.job_type.set("LINE_ART")
         assert app._shape_cut_auto(p)
+        _pump(app)
         item = app._accumulated[-1]
         cut = item.offsets["cut"]
         assert len(cut.geoms) == 1
@@ -112,8 +141,7 @@ def test_gui_shape_cut_line_art_transparent_and_sticker():
         app._show_note_dialog = lambda *a, **k: dialogs.append(a)
         assert app._shape_cut_auto(ps)                    # 흰 테두리 스티커는 무테도
         assert len(app._accumulated[-1].offsets["cut"].geoms) == 2
-        for _ in range(5):
-            app.update()
+        _pump(app)
         # 스티커 칼선(간격 0)이 유테/무테 간격 칸을 덮어쓰지 않고, 안내 창도 띄우지 않는다(실제 PC에서 생긴 문제)
         assert abs(float(app.style_margin_mm.get()) - 1.2) < 1e-9 and not dialogs
         assert "흰 테두리 스티커 2개" in app.status.get()

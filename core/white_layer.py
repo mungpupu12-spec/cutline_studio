@@ -841,12 +841,31 @@ def split_card_mask(mask: np.ndarray, dpi: float) -> tuple:
     return cm, (m > 0) & ~cm
 
 
+def is_single_piece(mask: np.ndarray, min_frac: float = 0.01) -> bool:
+    """그림이 한 덩어리(스티커 한 장)인지. 가장 큰 덩어리의 min_frac보다 작은 점·티끌은 세지 않는다."""
+    m = np.asarray(mask, np.uint8)
+    n, _lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n < 2:
+        return False
+    areas = st[1:, cv2.CC_STAT_AREA]
+    return int((areas >= min_frac * areas.max()).sum()) == 1
+
+
+def outline_cut_from_mask(art_mask: np.ndarray, dpi: float) -> MultiPolygon:
+    """그림 외곽선 위 칼선(띄우지도 줄이지도 않음, 그림 안 구멍은 채워 바깥 외곽에만 하나).
+    2026-11-01(멍푸: 투명 배경 푸딩 스티커 한 장 -- "이건 칼선이 무테지만 외곽에 있어야해"): 무테 규칙(그림 안쪽
+    1.2mm)대로 자르면 흰 테두리째 그려 둔 스티커의 체리 꼭지·강아지 귀·유리컵 테두리가 잘려 나갔다(그림의 약
+    10%가 칼선 밖). 투명 배경 스티커 한 장은 무테여도 그림 외곽선 위로 자른다."""
+    return cut_from_white_mask(build_white_mask(art_mask, dpi), dpi, offset_mm=0.0, merge_gap_mm=0.0)
+
+
 def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: float,
-                    gap_mm: float = DEFAULT_MERGE_GAP_MM) -> tuple:
+                    gap_mm: float = DEFAULT_MERGE_GAP_MM, outline_mute: bool = False) -> tuple:
     """그림마다 외곽선이 있으면 유테(그림 바깥으로 margin_mm), 없으면 무테(그림 안쪽으로 margin_mm) 칼선
     (2026-10-24 멍푸: "무테/유테+도무송"에서 칼선이 조각나고 최소 간격을 지키지 않음 -- 그림 안 구멍은 채워
     그림 바깥 외곽에만 칼선 하나). Returns (합친 칼선, 따로 둔 칼선, 유테 수, 무테 수, 건너뛴 가는 그림 수).
-    합친 칼선: gap_mm보다 가까운 칼선은 하나로 이어 최소 간격을 지킨다. 따로 둔 칼선: 이어 붙이지 않은 것."""
+    합친 칼선: gap_mm보다 가까운 칼선은 하나로 이어 최소 간격을 지킨다. 따로 둔 칼선: 이어 붙이지 않은 것.
+    outline_mute=True(투명 배경 스티커 한 장)면 무테는 안쪽이 아니라 그림 외곽선 위(outline_cut_from_mask)."""
     m = np.asarray(mask, np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     is_yute = np.zeros(n, bool)
@@ -867,7 +886,9 @@ def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: fl
     if ny:
         polys_sep += list(cut_from_white_mask(build_white_mask(yute, dpi), dpi, offset_mm=margin_mm,
                                               merge_gap_mm=0.0).geoms)
-    if nm:
+    if nm and outline_mute:
+        polys_sep += list(outline_cut_from_mask(mute, dpi).geoms)
+    elif nm:
         mc, skipped = borderless_cut_from_mask(build_white_mask(mute, dpi), dpi, inset_mm=margin_mm)
         polys_sep += list(mc.geoms)
     return MultiPolygon(merge_close_cuts(polys_sep, dpi, gap_mm)), MultiPolygon(polys_sep), ny, nm, skipped

@@ -452,18 +452,28 @@ class WhiteLayerMixin:
                     # 짙은 판 바탕이 그림 둘레에 붙어 외곽선(유테)으로 잘못 보이지 않게 판 바탕은 흰색으로 본다
                     rgb = np.array(rgb[:, :, :3])
                     rgb[_pbg] = 255
-                cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off)
+                # 2026-11-01(멍푸: 투명 배경 푸딩 스티커 한 장 -- "이건 칼선이 무테지만 외곽에 있어야해"): 투명 배경
+                # 스티커 한 장은 무테도 그림 외곽선 위로(안쪽으로 줄이면 흰 테두리째 그린 끝부분이 잘림).
+                one = kind in ("alpha", "ai_alpha") and wl.is_single_piece(mask)
+                cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off, outline_mute=one)
                 mask = wl.build_white_mask(mask, dpi)
+                mute_where = "그림 외곽선 위(투명 배경 스티커 한 장)" if one else f"안쪽 {off:.1f}mm"
                 msg = (f"칼선 {{n}}개를 만들었습니다(외곽선 있는 그림 {ny}개는 유테 -- 바깥 {off:.1f}mm, "
-                       f"없는 그림 {nm}개는 무테 -- 안쪽 {off:.1f}mm). 간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
+                       f"없는 그림 {nm}개는 무테 -- {mute_where}). 간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                 if n_thin:
                     msg += f" 너무 가는 그림 {n_thin}개는 안쪽으로 자를 수 없어 칼선을 만들지 않았습니다."
             elif job == "BORDERLESS":
                 off = max(0.5, float(self.style_margin_mm.get()))
                 mask = wl.build_white_mask(mask, dpi)
-                cuts, n_thin = wl.borderless_cut_from_mask(mask, dpi, inset_mm=off)
-                msg = (f"무테 칼선 {{n}}개를 만들었습니다(그림 안쪽 {off:.1f}mm). "
-                       "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
+                if kind in ("alpha", "ai_alpha") and wl.is_single_piece(mask):
+                    # 2026-11-01: 투명 배경 스티커 한 장은 무테도 그림 외곽선 위로(위 AUTO_STYLE 참고)
+                    off = 0.0
+                    cuts, n_thin = wl.outline_cut_from_mask(mask, dpi), 0
+                    msg = "무테 칼선 {n}개를 만들었습니다(투명 배경 스티커 한 장이라 그림 외곽선 위)."
+                else:
+                    cuts, n_thin = wl.borderless_cut_from_mask(mask, dpi, inset_mm=off)
+                    msg = (f"무테 칼선 {{n}}개를 만들었습니다(그림 안쪽 {off:.1f}mm). "
+                           "간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                 if n_thin:
                     msg += f" 너무 가는 그림 {n_thin}개는 안쪽으로 자를 수 없어 칼선을 만들지 않았습니다."
             else:
