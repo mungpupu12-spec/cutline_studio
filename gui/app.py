@@ -99,7 +99,7 @@ from core.svg_export import export_svg
 from core.png_export import export_cut_png
 from core.cut_check import check_cut_spacing, summarize_cut_spacing
 from core.preview import render_preview
-from core.accumulate import combine_results
+from core.accumulate import combine_results, count_cut_lines
 from core import license_client as lic
 from core import glass_theme
 from gui.path_editor import PathEditorMixin
@@ -606,6 +606,10 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 무테/유테(BORDERLESS/LINE_ART)일 때만 쓰는 간격 값 -- 무테는
         # 셀 안쪽으로, 유테는 실루엣 바깥쪽으로 이 값(mm)만큼 적용.
         self.style_margin_mm = tk.DoubleVar(value=DEFAULT_STYLE_MARGIN_MM)
+        # 2026-11-01(멍푸: "칼선에 여유 공간 만드는것도 추가해줘", 외곽선 칼선을 바깥으로 띄우기, 기본 2mm):
+        # 투명 배경 스티커 한 장의 외곽선 칼선을 그림 외곽선에서 이 값(mm)만큼 바깥으로 띄운다. 0이면 외곽선 위.
+        from core.white_layer import DEFAULT_OUTLINE_MARGIN_MM
+        self.outline_margin_mm = tk.DoubleVar(value=DEFAULT_OUTLINE_MARGIN_MM)
 
         # 도무송(DOMUSONG)일 때만 쓰는 세부 옵션: 5개 도형 중 선택. 완칼
         # (FULL_CUT) 잡타입은 이 값을 쓰지 않고 항상 실제 실루엣을 따라간다.
@@ -2320,12 +2324,17 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
         # 고르므로(위 sec3), 여기 있던 별도의 유테/무테 하위 선택 콤보박스는
         # 없앰 -- 간격(mm) 값 하나만 남김.
         sec5 = self._section(
-            left_col, "유테/무테 간격", "무테, 유테, 키스컷에 적용합니다. 기본은 1.2mm입니다."
+            left_col, "유테/무테 간격", "칼선 간격은 무테, 유테, 키스컷에 적용합니다(기본 1.2mm). 여유 공간은 투명 스티커 한 장에 적용합니다(기본 2mm)."
         )
         # 2026-09-29: 단위 칸의 "(기본 1.2)"가 카드 밖으로 잘려 보였음 -> 설명 줄로 옮김
         self._make_number_field(
             sec5, "칼선 간격", self.style_margin_mm, unit="mm",
             from_=0.1, to=20.0, increment=0.1, tip=FIELD_TIPS["style_margin"],
+        )
+        # 2026-11-01: 투명 배경 스티커 한 장(외곽선 칼선)의 여유 공간 -- 그림 둘레 흰 여백
+        self._make_number_field(
+            sec5, "여유 공간 (투명 스티커 한 장)", self.outline_margin_mm, unit="mm",
+            from_=0.0, to=20.0, increment=0.5, tip=FIELD_TIPS["outline_margin"],
         )
 
         # 2026-08-27 피드백: "도무송은 무조건 선택이 아니라 선택할 수 있는
@@ -5099,10 +5108,10 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             self._render_preview()
 
         n_items = len(self._accumulated)
-        n_shapes = len(self._last_result.design.geoms)
+        n_shapes = count_cut_lines(self._last_result)  # 2026-11-01: 그림 조각 수가 아니라 칼선 수
         self.accum_status.set(f"{n_items}개 영역이 쌓였습니다. (칼선 {n_shapes}개)")
         status_text = (
-            f"완료. 누적 {n_items}개 영역, 도안 {n_shapes}개 파트. 내보내기 준비됨.\n"
+            f"완료. 누적 {n_items}개 영역, 도안 {len(self._last_result.design.geoms)}개 파트. 내보내기 준비됨.\n"
             f"계속 드래그해서 영역을 추가하려면 '원본 다시 보기'를 누르세요."
         )
 

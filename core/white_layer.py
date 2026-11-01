@@ -35,6 +35,7 @@ DEFAULT_FILL_HOLES_MM = 2.3     # 이보다 좁은 구멍(안에 들어가는 �
 DEFAULT_CHOKE_MM = 0.0          # 화이트를 그림보다 안쪽으로 줄이는 양
 DEFAULT_CUT_OFFSET_MM = 1.3     # 화이트 기준 칼선: 화이트 외곽에서 띄우는 거리
 DEFAULT_MERGE_GAP_MM = 2.0      # 칼선끼리 이보다 가까우면 하나로 합침(저장 전 점검 기준과 같음)
+DEFAULT_OUTLINE_MARGIN_MM = 2.0  # 투명 스티커 한 장의 외곽선 칼선 여유 공간(그림 외곽선에서 바깥으로)
 ALPHA_THRESHOLD = 64            # 그림 알파 약 25%(좋은 예 화이트와 가장 잘 맞음)
 
 
@@ -851,21 +852,26 @@ def is_single_piece(mask: np.ndarray, min_frac: float = 0.01) -> bool:
     return int((areas >= min_frac * areas.max()).sum()) == 1
 
 
-def outline_cut_from_mask(art_mask: np.ndarray, dpi: float) -> MultiPolygon:
-    """그림 외곽선 위 칼선(띄우지도 줄이지도 않음, 그림 안 구멍은 채워 바깥 외곽에만 하나).
+def outline_cut_from_mask(art_mask: np.ndarray, dpi: float, margin_mm: float = 0.0) -> MultiPolygon:
+    """그림 외곽선 칼선(그림 안 구멍은 채워 바깥 외곽에만 하나). margin_mm만큼 바깥으로 고르게 띄운다(0이면 외곽선 위).
     2026-11-01(멍푸: 투명 배경 푸딩 스티커 한 장 -- "이건 칼선이 무테지만 외곽에 있어야해"): 무테 규칙(그림 안쪽
     1.2mm)대로 자르면 흰 테두리째 그려 둔 스티커의 체리 꼭지·강아지 귀·유리컵 테두리가 잘려 나갔다(그림의 약
-    10%가 칼선 밖). 투명 배경 스티커 한 장은 무테여도 그림 외곽선 위로 자른다."""
-    return cut_from_white_mask(build_white_mask(art_mask, dpi), dpi, offset_mm=0.0, merge_gap_mm=0.0)
+    10%가 칼선 밖). 투명 배경 스티커 한 장은 무테여도 그림 외곽선으로 자른다.
+    같은 날("칼선에 여유 공간 만드는것도 추가해줘", 기본 2mm): 화면의 '여유 공간' 값만큼 바깥으로 띄워 그림 둘레에
+    여백을 둔다(재단이 밀려도 그림이 잘리지 않게). 가는 꼭지 끝은 둥글게 감싼다."""
+    off = max(0.0, float(margin_mm or 0.0))
+    return cut_from_white_mask(build_white_mask(art_mask, dpi), dpi, offset_mm=off, merge_gap_mm=0.0)
 
 
 def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: float,
-                    gap_mm: float = DEFAULT_MERGE_GAP_MM, outline_mute: bool = False) -> tuple:
+                    gap_mm: float = DEFAULT_MERGE_GAP_MM, outline_mute: bool = False,
+                    outline_margin_mm: float = 0.0) -> tuple:
     """그림마다 외곽선이 있으면 유테(그림 바깥으로 margin_mm), 없으면 무테(그림 안쪽으로 margin_mm) 칼선
     (2026-10-24 멍푸: "무테/유테+도무송"에서 칼선이 조각나고 최소 간격을 지키지 않음 -- 그림 안 구멍은 채워
     그림 바깥 외곽에만 칼선 하나). Returns (합친 칼선, 따로 둔 칼선, 유테 수, 무테 수, 건너뛴 가는 그림 수).
     합친 칼선: gap_mm보다 가까운 칼선은 하나로 이어 최소 간격을 지킨다. 따로 둔 칼선: 이어 붙이지 않은 것.
-    outline_mute=True(투명 배경 스티커 한 장)면 무테는 안쪽이 아니라 그림 외곽선 위(outline_cut_from_mask)."""
+    outline_mute=True(투명 배경 스티커 한 장)면 무테는 안쪽이 아니라 그림 외곽선에서 outline_margin_mm 바깥
+    (outline_cut_from_mask)."""
     m = np.asarray(mask, np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     is_yute = np.zeros(n, bool)
@@ -887,7 +893,7 @@ def auto_style_cuts(rgb: np.ndarray, mask: np.ndarray, dpi: float, margin_mm: fl
         polys_sep += list(cut_from_white_mask(build_white_mask(yute, dpi), dpi, offset_mm=margin_mm,
                                               merge_gap_mm=0.0).geoms)
     if nm and outline_mute:
-        polys_sep += list(outline_cut_from_mask(mute, dpi).geoms)
+        polys_sep += list(outline_cut_from_mask(mute, dpi, outline_margin_mm).geoms)
     elif nm:
         mc, skipped = borderless_cut_from_mask(build_white_mask(mute, dpi), dpi, inset_mm=margin_mm)
         polys_sep += list(mc.geoms)

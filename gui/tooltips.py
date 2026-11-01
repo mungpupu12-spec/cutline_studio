@@ -64,6 +64,7 @@ FIELD_TIPS = {
     "cut": "칼선까지의 거리입니다",
     "bleed": "블리딩까지의 거리입니다",
     "style_margin": "그림과 칼선 사이 거리입니다",
+    "outline_margin": "외곽선 밖 여백 크기입니다",
     "white_on": "저장할 때 화이트를 넣습니다",
     "white_choke": "화이트를 안쪽으로 줄입니다",
     "white_cut": "화이트와 칼선의 거리입니다",

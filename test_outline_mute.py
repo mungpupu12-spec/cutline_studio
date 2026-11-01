@@ -56,3 +56,20 @@ def test_default_mute_is_still_inside():
     assert nm == 1
     assert (inside & ~m).sum() == 0                       # 예전 무테: 항상 그림 안쪽
     assert (m & ~inside).sum() / m.sum() > 0.03
+
+
+def test_outline_margin_moves_cut_outward():
+    # 2026-11-01("칼선에 여유 공간 만드는것도 추가해줘", 기본 2mm): 외곽선 칼선을 그림에서 바깥으로 고르게 띄운다
+    m = _sticker()
+    rgb = np.full(m.shape + (3,), 255, np.uint8)
+    rgb[m] = (230, 170, 90)
+    cuts, _sep, _ny, nm, _ = wl.auto_style_cuts(rgb, m, DPI, 1.2, outline_mute=True, outline_margin_mm=2.0)
+    assert nm == 1 and len(cuts.geoms) == 1
+    inside = _fill(cuts, m.shape)
+    assert (m & ~inside).sum() == 0                       # 그림은 전부 칼선 안
+    px2 = 2.0 / 25.4 * DPI
+    dist = cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5)
+    edge = inside & ~cv2.erode(inside.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    d = dist[edge]
+    assert abs(float(np.median(d)) - px2) < 2.0, (np.median(d), px2)   # 칼선이 그림에서 약 2mm
+    assert wl.DEFAULT_OUTLINE_MARGIN_MM == 2.0

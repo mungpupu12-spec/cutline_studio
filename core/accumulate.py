@@ -145,3 +145,19 @@ def combine_results(
         offset_mm=representative_offset_mm,
         adjustments=adjustments,
     )
+
+
+def count_cut_lines(result) -> int:
+    """누적 카드의 "(칼선 N개)"에 쓰는 실제 칼선 수.
+
+    2026-11-01(데모 녹화 중 발견): 키스컷 마스킹테이프에서 상태 줄은 "키스컷 칼선 20개"인데 누적 카드는
+    "(칼선 34개)"로 달랐다 -- 누적 카드가 칼선이 아니라 그림 조각 수(design)를 세고 있었다. 가까운 조각을
+    하나로 묶는 키스컷처럼 그림 조각 수와 칼선 수가 다른 작업이 있으므로, 'cut' 칼선이 있으면 그것을 센다.
+    """
+    cut = (getattr(result, "offsets", None) or {}).get("cut")
+    if cut is not None and not cut.is_empty:
+        return len(getattr(cut, "geoms", [cut]))
+    design = getattr(result, "design", None)
+    if design is None or design.is_empty:
+        return 0
+    return len(getattr(design, "geoms", [design]))

@@ -107,7 +107,16 @@ def test_gui_shape_cut_line_art_transparent_and_sticker():
         cut = app._accumulated[-1].offsets["cut"]
         assert len(cut.geoms) == 1
         inset_mm = (101 - (cut.area / np.pi) ** 0.5) / DPI * 25.4
+        # 같은 날("칼선에 여유 공간 만드는것도 추가해줘", 기본 2mm): 외곽선에서 여유 공간만큼 바깥
+        assert abs(inset_mm + float(app.outline_margin_mm.get())) < 0.2, inset_mm
+        app._accumulated.clear()
+        app.outline_margin_mm.set(0.0)                     # 여유 공간 0 -> 외곽선 위
+        assert app._shape_cut_auto(p)
+        _pump(app)
+        cut = app._accumulated[-1].offsets["cut"]
+        inset_mm = (101 - (cut.area / np.pi) ** 0.5) / DPI * 25.4
         assert abs(inset_mm) < 0.2, inset_mm
+        app.outline_margin_mm.set(2.0)
         app._accumulated.clear()
         # 무테 + 투명 배경 그림 여러 장: 예전처럼 그림 안쪽으로 유테/무테 간격만큼
         rgba2 = np.zeros((400, 700, 4), np.uint8)

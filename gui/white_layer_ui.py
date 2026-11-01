@@ -351,6 +351,13 @@ class WhiteLayerMixin:
     SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS")
     SHAPE_CUT_STICKER_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS", "AUTO_STYLE")
 
+    def _outline_margin(self) -> float:
+        """투명 배경 스티커 한 장 외곽선 칼선의 여유 공간(mm, 0 이상). 값을 못 읽으면 기본값."""
+        try:
+            return max(0.0, float(self.outline_margin_mm.get()))
+        except Exception:  # noqa: BLE001
+            return wl.DEFAULT_OUTLINE_MARGIN_MM
+
     def _shape_cut_auto(self, path, job=None, exclude_boxes=None, on_done=None) -> bool:
         """그림 모양 기준으로 칼선을 한 번에 만든다. 못 쓰는 그림이면 False(예전 방식으로). 작업 스레드에서 불린다.
 
@@ -454,10 +461,14 @@ class WhiteLayerMixin:
                     rgb[_pbg] = 255
                 # 2026-11-01(멍푸: 투명 배경 푸딩 스티커 한 장 -- "이건 칼선이 무테지만 외곽에 있어야해"): 투명 배경
                 # 스티커 한 장은 무테도 그림 외곽선 위로(안쪽으로 줄이면 흰 테두리째 그린 끝부분이 잘림).
+                # 같은 날("칼선에 여유 공간 만드는것도 추가해줘"): 외곽선에서 '여유 공간' 값만큼 바깥으로.
                 one = kind in ("alpha", "ai_alpha") and wl.is_single_piece(mask)
-                cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off, outline_mute=one)
+                room = self._outline_margin()
+                cuts, separate, ny, nm, n_thin = wl.auto_style_cuts(rgb, mask, dpi, off, outline_mute=one,
+                                                                    outline_margin_mm=room)
                 mask = wl.build_white_mask(mask, dpi)
-                mute_where = "그림 외곽선 위(투명 배경 스티커 한 장)" if one else f"안쪽 {off:.1f}mm"
+                mute_where = (f"투명 배경 스티커 한 장이라 그림 외곽선에서 여유 공간 {room:g}mm" if one
+                              else f"안쪽 {off:.1f}mm")
                 msg = (f"칼선 {{n}}개를 만들었습니다(외곽선 있는 그림 {ny}개는 유테 -- 바깥 {off:.1f}mm, "
                        f"없는 그림 {nm}개는 무테 -- {mute_where}). 간격은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                 if n_thin:
@@ -468,8 +479,10 @@ class WhiteLayerMixin:
                 if kind in ("alpha", "ai_alpha") and wl.is_single_piece(mask):
                     # 2026-11-01: 투명 배경 스티커 한 장은 무테도 그림 외곽선 위로(위 AUTO_STYLE 참고)
                     off = 0.0
-                    cuts, n_thin = wl.outline_cut_from_mask(mask, dpi), 0
-                    msg = "무테 칼선 {n}개를 만들었습니다(투명 배경 스티커 한 장이라 그림 외곽선 위)."
+                    room = self._outline_margin()
+                    cuts, n_thin = wl.outline_cut_from_mask(mask, dpi, room), 0
+                    msg = ("무테 칼선 {n}개를 만들었습니다(투명 배경 스티커 한 장이라 그림 외곽선에서 "
+                           f"여유 공간 {room:g}mm). 여유 공간은 '유테/무테 간격'에서 바꿀 수 있습니다.")
                 else:
                     cuts, n_thin = wl.borderless_cut_from_mask(mask, dpi, inset_mm=off)
                     msg = (f"무테 칼선 {{n}}개를 만들었습니다(그림 안쪽 {off:.1f}mm). "
