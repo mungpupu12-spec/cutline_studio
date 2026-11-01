@@ -351,6 +351,72 @@ class WhiteLayerMixin:
     SHAPE_CUT_ALPHA_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS")
     SHAPE_CUT_STICKER_JOBS = ("MASKING_TAPE", "LINE_ART", "BORDERLESS", "AUTO_STYLE")
 
+    def _ask_background_choice(self, n_deco: int, n_panel: int) -> bool:
+        """배경 요소를 찾았을 때 고르는 창. True = 칼선 미생성(장식선은 빼고, 배경 판은 빼고 그림만)."""
+        lines = []
+        if n_deco:
+            lines.append(f"모서리 꺾쇠 같은 가는 장식선 {n_deco}개")
+        if n_panel:
+            lines.append(f"그림 뒤에 놓인 배경 판 {n_panel}개(의자 등받이처럼 그림에 가려진 한 색 판)")
+        lines += ["칼선 미생성: 장식선은 자르지 않고, 배경 판은 빼고 그림 모양대로 자릅니다.",
+                  "칼선 생성: 배경 요소까지 모두 자릅니다."]
+
+        def ask():
+            return bool(self._show_confirm_dialog("배경 요소가 있습니다", lines,
+                                                  yes_text="칼선 미생성", no_text="칼선 생성"))
+
+        if threading.current_thread() is threading.main_thread():
+            return ask()
+        box, ev = {"v": False}, threading.Event()
+
+        def run():
+            try:
+                box["v"] = ask()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            finally:
+                ev.set()
+
+        self.after(0, run)
+        ev.wait()
+        return box["v"]
+
+    def _skip_background_elements(self, path, items) -> str:
+        """2026-11-01(멍푸: "배경요소는 칼선으로 지정하는거 선택할 수 있게 창을 띄워서 생성/미생성으로 구분지어"):
+        모서리 장식선·그림 뒤 배경 판(core.background_elements)을 찾으면 생성/미생성을 묻고, 미생성이면 items를
+        고친다. 상태 줄에 붙일 문구(없으면 "")."""
+        from core import background_elements as be
+        from PIL import Image as _Image
+
+        try:
+            if not items:
+                return ""
+            with _Image.open(path) as im:
+                if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+                    rgba = im.convert("RGBA")
+                    bg = _Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    bg.alpha_composite(rgba)
+                    rgb = np.asarray(bg.convert("RGB"))
+                else:
+                    rgb = wl._rgb8(im)
+            if rgb.shape[0] != items[0].height_px or rgb.shape[1] != items[0].width_px:
+                return ""
+            found = be.find(items, rgb, self._wl_image_dpi())
+        except Exception:  # noqa: BLE001 -- 찾기에 실패해도 칼선은 그대로
+            traceback.print_exc()
+            return ""
+        if not found:
+            return ""
+        n_deco, n_panel = be.counts(found)
+        if not self._ask_background_choice(n_deco, n_panel):
+            return f" 배경 요소 {n_deco + n_panel}개도 칼선을 만들었습니다."
+        be.apply(items, found)
+        if n_deco and n_panel:
+            return f" 장식선 {n_deco}개는 칼선을 만들지 않았고, 배경 판 {n_panel}개는 판을 빼고 그림만 잘랐습니다."
+        if n_deco:
+            return f" 장식선 {n_deco}개는 칼선을 만들지 않았습니다."
+        return f" 배경 판 {n_panel}개는 판을 빼고 그림만 잘랐습니다."
+
     def _outline_margin(self) -> float:
         """투명 배경 스티커 한 장 외곽선 칼선의 여유 공간(mm, 0 이상). 값을 못 읽으면 기본값."""
         try:
@@ -549,6 +615,10 @@ class WhiteLayerMixin:
                     dpi=float(self.dpi.get()), width_px=w, height_px=h, design=design,
                     offsets={"cut": chosen}, offset_mm=OffsetSpec(off, off, off),
                 )
+                if job != "MASKING_TAPE":
+                    # 2026-11-01: 모서리 장식선·그림 뒤 배경 판은 칼선 생성/미생성을 고른다
+                    note += self._skip_background_elements(path, [item])
+                    chosen = item.offsets.get("cut")
                 # 안내 문구는 adjustments(자동 조정)가 아니라 상태 줄에 -- adjustments에 넣으면 _show_preview가
                 # "자동 조정 안내" 창을 띄우고 이 칼선의 간격(스티커는 0)을 유테/무테 간격 칸에 덮어써서, 다음
                 # 그림의 유테 간격이 0이 됐다(2026-10-12 멍푸 PC에서 확인: 스티커판 다음 투명판 유테가 0.1mm).

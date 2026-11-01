@@ -5856,6 +5856,10 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
                 )
             except Exception:  # noqa: BLE001 -- 보조 탐지 실패해도 기존 결과는 그대로
                 traceback.print_exc()
+        self._bg_note = ""
+        if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE", "LINE_ART"):
+            # 2026-11-01: 모서리 장식선·그림 뒤 배경 판은 칼선 생성/미생성을 고른다(white_layer_ui 참고)
+            self._bg_note = self._skip_background_elements(path, self._accumulated[run_start_index:])
         if self.job_type.get() in ("BORDERLESS", "AUTO_STYLE", "LINE_ART", "MASKING_TAPE"):
             # 2026-09-29: 무테만이 아니라 무테+유테 자동·유테·키스컷에서도 칼선끼리
             # 교차·이중 칼선이 실제 파일에서 나왔다(저장 전 점검으로 발견, 키스컷 롤은
@@ -6321,7 +6325,8 @@ class CutLineApp(HelpGuideMixin, WhiteLayerMixin, PathEditorMixin, ctk.CTk):
             c = it.offsets.get("cut") if it is not None else None
             if c is not None and not c.is_empty:
                 n_parts += len(getattr(c, "geoms", [c]))
-        summary = f"자동 인식 완료: 칼선 {n_parts or added}개가 만들어졌습니다."
+        summary = f"자동 인식 완료: 칼선 {n_parts or added}개가 만들어졌습니다." + (getattr(self, "_bg_note", "") or "")
+        self._bg_note = ""
         if errors:
             summary += f" (실패 {len(errors)}개)"
         msg = summary
