@@ -7,13 +7,19 @@
 결과: dist\\컷라인스튜디오_베타_설치_<날짜>.exe
 --edition sales(판매용_설치파일_만들기.bat): dist\\컷라인스튜디오_설치_<날짜>.exe -- 프로그램은 같고,
 설치 창 문구·안내 파일·"앱 및 기능" 이름만 판매용(라이선스 키 입력 안내)으로 바뀐다(2026-10-02).
+
+2026-11-02(저장 공간이 부족한 고객 PC): 묶기 전에 쓰지 않는 라이브러리 파일을 빼고
+(installer/slim_app.py), 줄인 프로그램을 --selfcheck로 실행해 소스와 같은 결과가 나오는지
+확인한다. 다르거나 점검이 실패하면 설치 파일을 만들지 않는다. --no-slim이면 예전처럼 통째로 묶는다.
 """
 import datetime
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +68,34 @@ def _edition():
     return "beta"
 
 
+def _check_slim_app(src_res):
+    """줄인 프로그램(빌드 폴더의 exe)을 --selfcheck로 실행해 소스 결과와 비교. 문제 목록을 돌려준다."""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from core.build_selfcheck import comparable, problems
+    out = os.path.join(tempfile.gettempdir(), f"cutline_frozen_check_{os.getpid()}.json")
+    try:
+        subprocess.run([os.path.join(APP_DIR, EXE_NAME), "--selfcheck", out], cwd=APP_DIR, timeout=900)
+        with open(out, encoding="utf-8") as f:
+            res = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        return [f"점검 실행 실패: {type(e).__name__}: {e}"]
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    if "fatal" in res:
+        return ["점검 실패: " + res["fatal"][-500:]]
+    bad = problems(res)
+    if src_res and "fatal" not in src_res and comparable(res) != comparable(src_res):
+        bad.append("소스와 결과가 다름: " + json.dumps(comparable(res), ensure_ascii=False)[:600]
+                   + " / 소스: " + json.dumps(comparable(src_res), ensure_ascii=False)[:600])
+    print("    점검:", res["libs"].get("split_touching"), "| 시험 시트 도안",
+          res.get("test_sheet", {}).get("boxes"), "| 소스와 같음:", not bad)
+    return bad
+
+
 def main():
     sales = _edition() == "sales"
     if "--build" in sys.argv and not _build_app():
@@ -70,6 +104,17 @@ def main():
     if not os.path.isfile(os.path.join(APP_DIR, EXE_NAME)):
         print("[오류] 빌드된 프로그램이 없습니다:", os.path.join(APP_DIR, EXE_NAME))
         return 1
+    if "--no-slim" not in sys.argv:
+        print("0/3 쓰지 않는 라이브러리 파일을 빼고 점검하는 중...")
+        sys.path.insert(0, HERE)
+        from slim_app import slim
+        _removed, src_res = slim(APP_DIR, ROOT)
+        bad = _check_slim_app(src_res)
+        if bad:
+            print("[오류] 줄인 프로그램 점검에 실패했습니다. 설치 파일을 만들지 않습니다.")
+            for b in bad:
+                print("   ", b)
+            return 1
     today = datetime.date.today()
     version = f"1.0.{today:%Y%m%d}" if sales else f"beta-{today:%Y%m%d}"
     if os.path.isdir(WORK):

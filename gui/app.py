@@ -6747,4 +6747,9 @@ if __name__ == "__main__":
     import multiprocessing as _mp
 
     _mp.freeze_support()
+    # 2026-11-02: 설치 파일 점검용(installer/make_installer.py) -- 창 없이 라이브러리·도안 인식만 확인하고 끝냄
+    if "--selfcheck" in sys.argv:
+        from core.build_selfcheck import run_cli as _selfcheck
+
+        sys.exit(_selfcheck(sys.argv[sys.argv.index("--selfcheck") + 1:]))
     main()
